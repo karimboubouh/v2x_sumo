@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-03-27 12:44:33.340923 by Eclipse SUMO randomTrips.py v0.0.0
+<configuration>
+    <net-file value="/Users/karimboubouh/Workspace/R/sumo/scenarios/abu_dhabi_corniche/network.net.xml"/>
+    <output-trip-file value="/Users/karimboubouh/Workspace/R/sumo/scenarios/abu_dhabi_corniche/trips.xml"/>
+    <route-file value="/Users/karimboubouh/Workspace/R/sumo/scenarios/abu_dhabi_corniche/routes.rou.xml"/>
+    <period value="60.0"/>
+</configuration>
+-->
+
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <trip id="0" depart="0.00" from="297218053#0" to="-141196509#1"/>
+    <trip id="1" depart="60.00" from="-480469176#11" to="-479605010#5"/>
+    <trip id="2" depart="120.00" from="682772432#0" to="-24167843"/>
+    <trip id="3" depart="180.00" from="-473415179#0" to="24177209#7"/>
+    <trip id="4" depart="240.00" from="-141196510" to="-473183163#0"/>
+    <trip id="5" depart="300.00" from="434371440#2" to="24177241#0"/>
+    <trip id="6" depart="360.00" from="-473415184#1" to="24177945#1"/>
+    <trip id="7" depart="420.00" from="480737247#2" to="-1198278940"/>
+    <trip id="8" depart="480.00" from="480737245#0" to="473189251#2"/>
+    <trip id="9" depart="540.00" from="-24177206#2" to="-24177213#0"/>
+    <trip id="10" depart="600.00" from="483123826#4" to="24177989"/>
+    <trip id="11" depart="660.00" from="480737245#2" to="479605010#1"/>
+    <trip id="12" depart="720.00" from="24177218#3" to="682791231#0-AddedOnRampEdge"/>
+    <trip id="13" depart="780.00" from="141030514#0" to="24177243"/>
+    <trip id="14" depart="840.00" from="482775625#4" to="265402240"/>
+    <trip id="15" depart="900.00" from="59988636#6" to="24177938"/>
+    <trip id="16" depart="960.00" from="-479535697#2" to="-480863230#1"/>
+    <trip id="17" depart="1020.00" from="-24177214#0" to="-480517463#7"/>
+    <trip id="18" depart="1080.00" from="282224354" to="141030514#1"/>
+    <trip id="19" depart="1140.00" from="1394145974#0" to="-473415184#0"/>
+    <trip id="20" depart="1200.00" from="-480453536#9" to="682785833#4"/>
+    <trip id="21" depart="1260.00" from="416297653#4" to="24177993#1"/>
+    <trip id="22" depart="1320.00" from="-24177970#4" to="479605010#1"/>
+    <trip id="23" depart="1380.00" from="24177241#0" to="473176593#2"/>
+    <trip id="24" depart="1440.00" from="483122242" to="480460955#2"/>
+    <trip id="25" depart="1500.00" from="-479535697#4" to="-170066333#0"/>
+    <trip id="26" depart="1560.00" from="-524461796#1" to="-480469176#9"/>
+    <trip id="27" depart="1620.00" from="-473183163#4" to="682785835#0-AddedOnRampEdge"/>
+    <trip id="28" depart="1680.00" from="682784162#2" to="24161737#1"/>
+    <trip id="29" depart="1740.00" from="-480453536#5" to="-480453536#14"/>
+    <trip id="30" depart="1800.00" from="24177242#1" to="-480469176#3"/>
+    <trip id="31" depart="1860.00" from="24177935#3" to="682777337"/>
+    <trip id="32" depart="1920.00" from="90658080" to="24177213#0"/>
+    <trip id="33" depart="1980.00" from="-24177227#1" to="282224350"/>
+    <trip id="34" depart="2040.00" from="-24161721#1" to="170066334#1"/>
+    <trip id="35" depart="2100.00" from="682791230#2" to="59988636#6"/>
+    <trip id="36" depart="2160.00" from="-136962285" to="479537287#0"/>
+    <trip id="37" depart="2220.00" from="473174453#0" to="24177230#3"/>
+    <trip id="38" depart="2280.00" from="-24177227#3" to="24161714"/>
+    <trip id="39" depart="2340.00" from="24161718#0" to="682786732#8"/>
+    <trip id="40" depart="2400.00" from="24177198#0" to="-282221665#3"/>
+    <trip id="41" depart="2460.00" from="682784162#1" to="59988640#5"/>
+    <trip id="42" depart="2520.00" from="24177970#3" to="-24177946"/>
+    <trip id="43" depart="2580.00" from="480453536#11" to="24177232"/>
+    <trip id="44" depart="2640.00" from="480460955#2" to="24177227#2"/>
+    <trip id="45" depart="2700.00" from="-1038979907" to="-89642596#8"/>
+    <trip id="46" depart="2760.00" from="-141176773#1" to="682785831#5"/>
+    <trip id="47" depart="2820.00" from="636064654#1" to="482775625#6"/>
+    <trip id="48" depart="2880.00" from="-480903233#0" to="-24161718#3"/>
+    <trip id="49" depart="2940.00" from="636064654#0" to="682785837#2"/>
+    <trip id="50" depart="3000.00" from="-24161730#1" to="480453536#12"/>
+    <trip id="51" depart="3060.00" from="480453536#14" to="-24177930#0"/>
+    <trip id="52" depart="3120.00" from="-480453536#5" to="59988640#8"/>
+    <trip id="53" depart="3180.00" from="24177219#0" to="479605010#1"/>
+    <trip id="54" depart="3240.00" from="-473173102#1" to="-66019302#4"/>
+    <trip id="55" depart="3300.00" from="90658034" to="437419407#2"/>
+    <trip id="56" depart="3360.00" from="24161402#1" to="24177216#0"/>
+    <trip id="57" depart="3420.00" from="-24177241#0" to="-479605010#7"/>
+    <trip id="58" depart="3480.00" from="-89642596#7" to="24177945#0"/>
+    <trip id="59" depart="3540.00" from="-479535697#5" to="-479605010#2"/>
+</routes>
