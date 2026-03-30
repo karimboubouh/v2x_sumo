@@ -70,6 +70,7 @@ TIME_TO_TELEPORT = 10  # Seconds before a stuck vehicle is teleported (-1 = disa
 # Communication parameters (V2V)
 # ---------------------------------------------------------------------------
 COMM_RANGE = 500.0  # Maximum communication range in meters
+MAX_NEIGHBORS = 5   # Maximum V2V connections per vehicle (top-N by signal quality)
 COMM_POWER_DBM = -30.0  # Transmit power (reference at 1m)
 PATH_LOSS_EXPONENT = 2.5  # Urban environment
 NOISE_FLOOR_DBM = -90.0  # Receiver noise floor

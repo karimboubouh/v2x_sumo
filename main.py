@@ -29,16 +29,23 @@ def main():
     logger.log(f"Scenario: {scenario_info['name']} ({args.scenario})")
     logger.log(f"Vehicles: {args.num_vehicles}")
     logger.log(f"Comm range: {args.comm_range}m")
-    logger.log(f"Speed: {args.speed}x {'(real-time)' if args.speed == 1.0 else '(unlimited)' if args.speed == 0 else ''}")
+    logger.log(
+        f"Speed: {args.speed}x {'(real-time)' if args.speed == 1.0 else '(unlimited)' if args.speed == 0 else ''}"
+    )
     if args.force_speed:
         logger.log(f"Force speed: {args.force_speed:.0f} km/h ({args.force_speed / 3.6:.1f} m/s)")
     else:
         logger.log("Force speed: off (SUMO default car-following model)")
-    logger.log(f"FL demo: {'on' if args.fl_demo else 'off'}")
+    if args.dl:
+        logger.log(f"DPL: {args.dl_algorithm} | {args.dl_dataset} | {args.dl_model}")
+    else:
+        logger.log("DPL: off")
+    logger.log(f"DPL demo: {'on' if args.dl_demo else 'off'}")
 
     sumo = SumoManager(args.scenario, args.num_vehicles, args.force_speed)
     comm = CommManager(comm_range=args.comm_range)
     dashboard = None
+    dl_env = None
     running = True
 
     # Speed multiplier: 1.0 = real-time, 2.0 = 2x faster, 0 = unlimited
@@ -64,9 +71,35 @@ def main():
         dashboard.initialize()
         logger.log("Dashboard ready. Press ESC or Q to quit.", "success")
 
-        fl_payload = FLPayload() if args.fl_demo else None
-        fl_interval = 10.0
-        last_fl_time = 0.0
+        # ── DL initialization (only when --dl is passed) ──────────────
+        dl_env = None
+        if args.dl:
+            from dl.config import DL_CFG
+            from dl.data import partition_dataset
+            from dl.env import DLEnvironment
+
+            DL_CFG["ALGORITHM"] = args.dl_algorithm
+            DL_CFG["DATASET"] = args.dl_dataset
+            DL_CFG["MODEL_ARCH"] = args.dl_model
+
+            logger.log(f"Partitioning {args.dl_dataset} (non-IID) for {args.num_vehicles} vehicles...", "info")
+            sumo_ids = [f"mv_{i}" for i in range(args.num_vehicles)]
+            train_loaders, test_loader = partition_dataset(
+                DL_CFG["DATASET"],
+                args.num_vehicles,
+                alpha=DL_CFG["DATA_ALPHA"],
+                batch_size=DL_CFG["BATCH_SIZE"],
+            )
+            logger.log("Initializing DPL environment...", "info")
+            dl_env = DLEnvironment(train_loaders, net_bounds, sumo_ids)
+            logger.log(
+                f"DPL ready: {args.dl_algorithm} | {args.dl_dataset}/{args.dl_model} | {args.num_vehicles} vehicles",
+                "success",
+            )
+
+        dl_payload = FLPayload() if args.dl_demo else None
+        dl_interval = 10.0
+        last_dl_time = 0.0
         step_count = 0
         vehicle_states = {}
         sim_time = 0.0
@@ -90,6 +123,16 @@ def main():
                     sim_time = sumo.get_sim_time()
                     new_messages += comm.update(vehicle_states, sim_time)
                     step_count += 1
+                    # DL step (if enabled)
+                    if dl_env is not None and vehicle_states:
+                        dl_info = dl_env.step(vehicle_states)
+                        if dl_info["new_tr_data"]:
+                            logger.log(
+                                f"DL Round {dl_info['tr_round']} | "
+                                f"Loss: {dl_info['avg_loss']:.4f} | "
+                                f"Acc: {dl_info['avg_acc']:.2%}",
+                                "result",
+                            )
                 else:
                     sim_accumulator += dt * speed_mult
                     # Cap to prevent spiral-of-death after lag spikes
@@ -101,18 +144,29 @@ def main():
                         new_messages += comm.update(vehicle_states, sim_time)
                         step_count += 1
 
-                        # FL weight exchange demo
-                        if fl_payload and sim_time - last_fl_time >= fl_interval:
-                            last_fl_time = sim_time
+                        # DL step (if enabled)
+                        if dl_env is not None and vehicle_states:
+                            dl_info = dl_env.step(vehicle_states)
+                            if dl_info["new_tr_data"]:
+                                logger.log(
+                                    f"DL Round {dl_info['tr_round']} | "
+                                    f"Loss: {dl_info['avg_loss']:.4f} | "
+                                    f"Acc: {dl_info['avg_acc']:.2%}",
+                                    "result",
+                                )
+
+                        # DL weight exchange demo
+                        if dl_payload and sim_time - last_dl_time >= dl_interval:
+                            last_dl_time = sim_time
                             veh_ids = list(vehicle_states.keys())
                             if len(veh_ids) >= 2:
                                 sender = random.choice(veh_ids)
                                 neighbors = comm.get_neighbors(sender)
                                 if neighbors:
                                     receiver = random.choice(neighbors)
-                                    weights = fl_payload.dummy_weights()
-                                    payload = fl_payload.serialize_weights(weights)
-                                    comm.send_message(sender, receiver, "fl_weights", payload, sim_time)
+                                    weights = dl_payload.dummy_weights()
+                                    payload = dl_payload.serialize_weights(weights)
+                                    comm.send_message(sender, receiver, "dl_weights", payload, sim_time)
 
                 active_links = comm.get_active_links()
 
@@ -138,9 +192,12 @@ def main():
     except Exception as e:
         logger.log(str(e), "error")
         import traceback
+
         traceback.print_exc()
     finally:
         logger.log("Cleaning up...", "info")
+        if dl_env is not None:
+            dl_env.executor.shutdown(wait=False)
         if dashboard:
             dashboard.cleanup()
         sumo.stop()

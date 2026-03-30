@@ -2,28 +2,29 @@
 
 try:
     import config as _config
+
     _default_level = getattr(_config, "LOG_LEVEL", "info")
 except Exception:
     _default_level = "info"
 
-_RESET   = "\033[0m"
+_RESET = "\033[0m"
 _REVERSE = "\033[7m"
 
 # severity order: debug < info < success < result < warning < error
 _LEVELS = {
-    "debug":   {"severity": 0, "color": "\033[36m", "label": "DEBUG  "},
-    "info":    {"severity": 1, "color": "\033[34m", "label": "INFO   "},
+    "debug": {"severity": 0, "color": "\033[36m", "label": "DEBUG  "},
+    "info": {"severity": 1, "color": "\033[34m", "label": "INFO   "},
     "success": {"severity": 2, "color": "\033[32m", "label": "SUCCESS"},
-    "result":  {"severity": 3, "color": "\033[35m", "label": "RESULT "},
+    "result": {"severity": 3, "color": "\033[35m", "label": "RESULT "},
     "warning": {"severity": 4, "color": "\033[33m", "label": "WARNING"},
-    "error":   {"severity": 5, "color": "\033[31m", "label": "ERROR  "},
+    "error": {"severity": 5, "color": "\033[31m", "label": "ERROR  "},
 }
 
 # "[SUCCESS] " = 10 chars — same width for all labels (7-char padded label)
 _INDENT = 10
 
 _min_severity = _LEVELS.get(_default_level, _LEVELS["info"])["severity"]
-_last_type    = "info"
+_last_type = "info"
 
 
 def set_level(level: str):

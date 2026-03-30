@@ -26,9 +26,9 @@ def parse_args():
         help=f"Communication range in meters (default: {config.COMM_RANGE})",
     )
     parser.add_argument(
-        "--fl-demo",
+        "--dl-demo",
         action="store_true",
-        help="Enable periodic FL weight exchange messages",
+        help="Enable periodic DL weight exchange messages",
     )
     parser.add_argument(
         "--speed", "-x",
@@ -50,5 +50,32 @@ def parse_args():
         choices=["debug", "info", "success", "result", "warning", "error"],
         metavar="LEVEL",
         help="Minimum log level to display: debug|info|success|result|warning|error (default: %(default)s)",
+    )
+    # ── Decentralized Personalized Learning ────────────────────────────────
+    parser.add_argument(
+        "--dl",
+        action="store_true",
+        help="Enable decentralized personalized learning",
+    )
+    parser.add_argument(
+        "--dl-algorithm",
+        default="FedAvg",
+        choices=["FedAvg", "D-PSGD", "DPFL"],
+        dest="dl_algorithm",
+        help="DPL algorithm (default: FedAvg)",
+    )
+    parser.add_argument(
+        "--dl-dataset",
+        default="MNIST",
+        choices=["MNIST", "CIFAR10", "CIFAR100"],
+        dest="dl_dataset",
+        help="DPL training dataset (default: MNIST)",
+    )
+    parser.add_argument(
+        "--dl-model",
+        default="DNN",
+        choices=["DNN", "CNN", "LSTM", "Transformer", "ResNet"],
+        dest="dl_model",
+        help="DPL model architecture (default: DNN)",
     )
     return parser.parse_args()

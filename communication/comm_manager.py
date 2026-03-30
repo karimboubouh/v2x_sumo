@@ -14,6 +14,7 @@ class CommManager:
     def __init__(
         self,
         comm_range=None,
+        max_neighbors=None,
         power_dbm=None,
         path_loss_exp=None,
         noise_floor_dbm=None,
@@ -22,6 +23,7 @@ class CommManager:
         message_ttl=None,
     ):
         self.comm_range = comm_range or config.COMM_RANGE
+        self.max_neighbors = max_neighbors if max_neighbors is not None else config.MAX_NEIGHBORS
         self.power_dbm = power_dbm or config.COMM_POWER_DBM
         self.path_loss_exp = path_loss_exp or config.PATH_LOSS_EXPONENT
         self.noise_floor_dbm = noise_floor_dbm or config.NOISE_FLOOR_DBM
@@ -82,11 +84,15 @@ class CommManager:
         return dict(self._stats)
 
     def _compute_links(self, vehicle_states):
-        """Compute pairwise links between all vehicles."""
+        """Compute pairwise links between all vehicles, capped at max_neighbors each."""
         self._active_links = []
         self._neighbors = defaultdict(list)
 
         veh_ids = list(vehicle_states.keys())
+
+        # Pass 1: compute all candidate links within COMM_RANGE
+        all_links = []
+        per_vehicle = defaultdict(list)
         for i in range(len(veh_ids)):
             for j in range(i + 1, len(veh_ids)):
                 id_a = veh_ids[i]
@@ -107,9 +113,23 @@ class CommManager:
                 )
 
                 if link and link.is_active:
-                    self._active_links.append(link)
-                    self._neighbors[id_a].append(id_b)
-                    self._neighbors[id_b].append(id_a)
+                    all_links.append(link)
+                    per_vehicle[id_a].append(link)
+                    per_vehicle[id_b].append(link)
+
+        # Pass 2: each vehicle keeps its top-max_neighbors links by quality
+        accepted = set()
+        for links in per_vehicle.values():
+            top = sorted(links, key=lambda lnk: lnk.quality, reverse=True)[:self.max_neighbors]
+            for lnk in top:
+                accepted.add(frozenset({lnk.sender_id, lnk.receiver_id}))
+
+        # Build final active_links and neighbors from the accepted set (union semantics)
+        for link in all_links:
+            if frozenset({link.sender_id, link.receiver_id}) in accepted:
+                self._active_links.append(link)
+                self._neighbors[link.sender_id].append(link.receiver_id)
+                self._neighbors[link.receiver_id].append(link.sender_id)
 
     def _generate_beacons(self, vehicle_states, sim_time):
         """Generate periodic hello beacons from each vehicle."""
