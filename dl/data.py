@@ -1,7 +1,7 @@
 """
 fl/data.py — Dataset Loading & Non-IID Partitioning
 =====================================================
-Downloads MNIST / CIFAR10 / CIFAR100 and splits them into
+Downloads MNIST / FEMNIST / CIFAR10 / CIFAR100 and splits them into
 per-vehicle non-IID shards using a Dirichlet distribution.
 
 Adapted from v2x_sim/fl_data.py.
@@ -20,6 +20,10 @@ _TRANSFORMS = {
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)),
     ]),
+    "FEMNIST": transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ]),
     "CIFAR10": transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465),
@@ -32,8 +36,21 @@ _TRANSFORMS = {
     ]),
 }
 
+
+def _build_femnist(root: str, train: bool, download: bool, transform):
+    """Use torchvision EMNIST byclass split as the FEMNIST-compatible source."""
+    return datasets.EMNIST(
+        root=root,
+        split="byclass",
+        train=train,
+        download=download,
+        transform=transform,
+    )
+
+
 _BUILDERS = {
     "MNIST": datasets.MNIST,
+    "FEMNIST": _build_femnist,
     "CIFAR10": datasets.CIFAR10,
     "CIFAR100": datasets.CIFAR100,
 }
@@ -99,4 +116,4 @@ def partition_dataset(dataset_name: str, n_vehicles: int,
 
 def get_n_classes(dataset_name: str) -> int:
     """Return the number of output classes for a dataset."""
-    return {"MNIST": 10, "CIFAR10": 10, "CIFAR100": 100}[dataset_name]
+    return {"MNIST": 10, "FEMNIST": 62, "CIFAR10": 10, "CIFAR100": 100}[dataset_name]

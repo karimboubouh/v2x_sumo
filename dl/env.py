@@ -1,5 +1,5 @@
 """
-dl/env.py — FL Environment for SUMO V2V Dashboard.
+dl/env.py — DPL environment for the SUMO V2V Dashboard.
 
 Manages Vehicle objects, neighbor discovery, algorithm dispatch,
 and background training. Position updates come from SUMO TraCI
@@ -9,34 +9,37 @@ Adapted from v2x_sim/env.py.
 """
 
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 import numpy as np
+import torch
 
 from algorithms import build_algorithm, LINK_SIDELINK, LINK_INTERNET
-from dl.config import DL_CFG as CFG
-from dl.helpers import sl_tx_cost_norm
+from config import DL_CFG as CFG
+from dl.helpers import eval_vehicles, inet_tx_energy_j, sl_tx_cost_norm, sl_tx_energy_j
 from dl.vehicle import Vehicle
 
 
 class DLEnvironment:
     """
-    Orchestrates decentralized FL training for SUMO vehicles.
+    Orchestrates decentralized personalized learning training for SUMO vehicles.
 
     Public attributes
     -----------------
     vehicles    : list of Vehicle
-    tr_round    : min completed training rounds across all vehicles
+    tr_round    : max completed training rounds across all vehicles
     global_loss : avg current_loss across all vehicles
     global_acc  : avg current_acc across all vehicles
 
     Public methods
     --------------
-    step(vehicle_states) -> dict : one FL step (update pos + select + aggregate + train)
+    step(vehicle_states, sim_time) -> dict : one DPL step
     is_done() -> bool            : True when termination condition is met
     """
 
-    def __init__(self, train_loaders: list, network_bounds: tuple, sumo_ids: list):
+    def __init__(self, train_loaders: list, network_bounds: tuple, sumo_ids: list,
+                 test_loader=None, event_stream=None):
         """
         Args:
             train_loaders: one DataLoader per vehicle (Dirichlet-partitioned)
@@ -45,11 +48,28 @@ class DLEnvironment:
         """
         self.step_n = 0
         self.tr_round = 0
+        self._event_stream = event_stream
+        self._last_sim_time = 0.0
+        self._wall_started = time.perf_counter()
+        self._round_wall_mark = self._wall_started
+        self.last_round_time = 0.0
+        self.test_loader = test_loader
+        self.test_loss = None
+        self.test_acc = None
+        self.init_test_loss = None
+        self.init_test_acc = None
+        self._eval_future = None
+        self._eval_running_round = 0
+        self._last_eval_round = 0
+        self._last_eval_requested_round = 0
+        self._eval_request_times = {}
+        self.train_history = []
+        self.test_history = []
 
         # Create all vehicles
         n = len(sumo_ids)
         self.vehicles = [
-            Vehicle(i, sumo_ids[i], train_loaders[i], network_bounds)
+            Vehicle(i, sumo_ids[i], train_loaders[i], network_bounds, event_stream=event_stream)
             for i in range(n)
         ]
 
@@ -58,6 +78,7 @@ class DLEnvironment:
 
         # Thread pool for background training
         self.executor = ThreadPoolExecutor(max_workers=CFG["N_TRAIN_WORKERS"])
+        self.eval_executor = ThreadPoolExecutor(max_workers=1) if test_loader is not None else None
 
         # Build algorithm and inject into vehicles
         self.algo = build_algorithm(CFG)
@@ -65,21 +86,43 @@ class DLEnvironment:
             v._algo = self.algo
         self.algo.setup(self.vehicles)
 
-        self.global_loss = float("inf")
-        self.global_acc = 0.0
+        # ── Baseline metrics (before any training) ───────────────────────────
+        # Evaluate each vehicle's random-init model on one batch using a
+        # temporary iterator so _inf_iter is not advanced.
+        for v in self.vehicles:
+            v.model.eval()
+            with torch.no_grad():
+                images, labels = next(iter(v.train_loader))
+                logits = v.model(images)
+                v.current_loss = v.criterion(logits, labels).item()
+                v.current_acc = (
+                    (logits.argmax(1) == labels).sum().item() / len(labels)
+                )
+        self.global_loss = float(np.mean([v.current_loss for v in self.vehicles]))
+        self.global_acc = float(np.mean([v.current_acc for v in self.vehicles]))
+        _init_test = ""
+        if self.test_loader is not None:
+            self.init_test_loss, self.init_test_acc = eval_vehicles(self.vehicles, self.test_loader)
+            _init_test = f" | test_loss={self.init_test_loss:.4f} | test_acc={self.init_test_acc:.2%}"
+        print(
+            f" -> Initial model (before training) — loss={self.global_loss:.4f} | "
+            f"acc={self.global_acc:.2%}{_init_test}",
+            file=sys.stderr,
+        )
 
-        # Initial synchronous training round
+        # ── Initial synchronous DPL training round ────────────────────────────
         futs = []
         for v in self.vehicles:
+            v.prepare_training_round(0.0, [])
             v.training_done.clear()
             futs.append(self.executor.submit(v.train_local))
         futures_wait(futs)
         self._refresh_metrics()
-        print(
-            f" -> Initial FL round done — loss={self.global_loss:.4f} | "
-            f"acc={self.global_acc:.2%}",
-            file=sys.stderr,
-        )
+        self._record_train_metrics()
+        now = time.perf_counter()
+        self.last_round_time = now - self._round_wall_mark
+        self._round_wall_mark = now
+        self._maybe_schedule_eval(0.0, stop_reason=self.get_stop_reason())
 
     # ── Topology ──────────────────────────────────────────────────────────────
 
@@ -167,54 +210,353 @@ class DLEnvironment:
     # ── Metrics ───────────────────────────────────────────────────────────────
 
     def _refresh_metrics(self):
-        """Recompute global_loss, global_acc, and tr_round from all vehicles."""
+        """Recompute global_loss, global_acc, and tr_round from all vehicles.
+
+        tr_round uses max so the status bar advances whenever *any* vehicle
+        completes a new round, rather than being pinned to the slowest vehicle.
+        """
         valid = [v.current_loss for v in self.vehicles
                  if np.isfinite(v.current_loss)]
         self.global_loss = float(np.mean(valid)) if valid else 0.0
         self.global_acc = float(np.mean([v.current_acc for v in self.vehicles]))
-        self.tr_round = min(v.tr_rounds for v in self.vehicles)
+        self.tr_round = max(v.tr_rounds for v in self.vehicles)
+
+    def _collect_energy_totals(self) -> dict:
+        """Return cumulative energy totals summed across all vehicles."""
+        computation = 0.0
+        sidelink = 0.0
+        internet = 0.0
+
+        for vehicle in self.vehicles:
+            snapshot = vehicle.get_energy_snapshot()
+            computation += snapshot["computation_energy_j"]
+            sidelink += snapshot["sidelink_tx_energy_j"]
+            internet += snapshot["internet_tx_energy_j"]
+
+        return {
+            "computation_energy_j": computation,
+            "sidelink_tx_energy_j": sidelink,
+            "internet_tx_energy_j": internet,
+            "total_tx_energy_j": sidelink + internet,
+        }
+
+    def _record_train_metrics(self) -> None:
+        """Append one global training history point per completed shared round."""
+        if self.train_history and self.train_history[-1]["round"] == self.tr_round:
+            return
+
+        elapsed = max(time.perf_counter() - self._wall_started, 0.0)
+        energies = self._collect_energy_totals()
+        self.train_history.append({
+            "round": self.tr_round,
+            "time": elapsed,
+            "loss": self.global_loss,
+            "acc": self.global_acc,
+            **energies,
+        })
+
+    def _evaluate_models(self, eval_round: int) -> tuple[int, float, float]:
+        """Run global test evaluation from thread-safe model weight snapshots."""
+        test_loss, test_acc = eval_vehicles(self.vehicles, self.test_loader)
+        return eval_round, test_loss, test_acc
+
+    def _poll_eval_future(self, sim_time: float | None = None) -> None:
+        """Commit completed async test metrics back onto the environment."""
+        if self._eval_future is None or not self._eval_future.done():
+            return
+
+        try:
+            eval_round, test_loss, test_acc = self._eval_future.result()
+            self.test_loss = test_loss
+            self.test_acc = test_acc
+            self._last_eval_round = eval_round
+            eval_time = self._eval_request_times.pop(
+                eval_round,
+                max(time.perf_counter() - self._wall_started, 0.0),
+            )
+            if (
+                not self.test_history
+                or self.test_history[-1]["round"] != eval_round
+            ):
+                self.test_history.append({
+                    "round": eval_round,
+                    "time": eval_time,
+                    "loss": test_loss,
+                    "acc": test_acc,
+                })
+            if sim_time is not None:
+                self._emit_event(
+                    sim_time,
+                    "status",
+                    f"DPL test metrics at round {eval_round}: "
+                    f"loss={test_loss:.4f}, acc={test_acc:.2%}",
+                )
+        except Exception as exc:
+            if sim_time is not None:
+                self._emit_event(sim_time, "warning", f"DPL evaluation failed: {exc}")
+        finally:
+            self._eval_future = None
+            self._eval_running_round = 0
+
+    def _maybe_schedule_eval(self, sim_time: float, stop_reason: str | None = None) -> None:
+        """Launch async evaluation every EVAL_ROUNDS and once on final stop."""
+        if self.test_loader is None or self.eval_executor is None or self._eval_future is not None:
+            return
+
+        eval_every = max(int(CFG.get("EVAL_ROUNDS", 5)), 1)
+        # Gate cooldown on _last_eval_round (when the last eval *completed*),
+        # not _last_eval_requested_round (when it was queued).  Without this,
+        # a slow eval that runs for >EVAL_ROUNDS would be re-scheduled the
+        # instant it finishes, keeping the status bar permanently in
+        # "test evaluating" mode.
+        should_eval = (
+            self.tr_round > self._last_eval_round
+            and self.tr_round > 0
+            and (
+                self.tr_round - self._last_eval_round >= eval_every
+                or stop_reason is not None
+            )
+        )
+        if not should_eval:
+            return
+
+        self._eval_running_round = self.tr_round
+        self._last_eval_requested_round = self.tr_round
+        self._eval_request_times[self.tr_round] = max(
+            time.perf_counter() - self._wall_started,
+            0.0,
+        )
+        self._eval_future = self.eval_executor.submit(
+            self._evaluate_models,
+            self.tr_round,
+        )
+        self._emit_event(
+            sim_time,
+            "status",
+            f"running test evaluation at round {self.tr_round}",
+        )
+
+    def get_progress_snapshot(self) -> dict:
+        """Return a render-safe DPL progress summary for the dashboard."""
+        self._poll_eval_future(self._last_sim_time)
+
+        max_rounds = max(int(CFG["MAX_TR_ROUNDS"]), 1)
+        elapsed = max(time.perf_counter() - self._wall_started, 0.0)
+        avg_round_time = elapsed / max(self.tr_round, 1)
+        rounds_remaining = max(max_rounds - self.tr_round, 0)
+        active_trainers = sum(not v.training_done.is_set() for v in self.vehicles)
+        done_vehicles = sum(self._vehicle_is_done(v) for v in self.vehicles)
+        stop_reason = self.get_stop_reason()
+        energies = self._collect_energy_totals()
+
+        return {
+            "enabled": True,
+            "round": self.tr_round,
+            "max_rounds": max_rounds,
+            "progress": min(self.tr_round / max_rounds, 1.0),
+            "round_time": self.last_round_time or avg_round_time,
+            "avg_round_time": avg_round_time,
+            "elapsed_time": elapsed,
+            "remaining_time": avg_round_time * rounds_remaining,
+            "rounds_remaining": rounds_remaining,
+            "train_loss": self.global_loss,
+            "train_acc": self.global_acc,
+            "test_loss": self.test_loss,
+            "test_acc": self.test_acc,
+            "test_round": self._last_eval_round,
+            "init_test_loss": self.init_test_loss,
+            "init_test_acc": self.init_test_acc,
+            "eval_every": max(int(CFG.get("EVAL_ROUNDS", 5)), 1),
+            "test_running": self._eval_future is not None,
+            "test_pending": self.test_loader is not None and self._last_eval_round == 0,
+            "eval_running_round": self._eval_running_round,
+            "active_trainers": active_trainers,
+            "done_vehicles": done_vehicles,
+            "vehicle_count": len(self.vehicles),
+            "target_acc": float(CFG["TARGET_ACCURACY"]),
+            "done": stop_reason is not None,
+            "stop_reason": stop_reason,
+            **energies,
+        }
+
+    def export_experiment(self, metadata: dict | None = None) -> dict:
+        """Build a serializable experiment bundle for saving and replotting."""
+        snapshot = self.get_progress_snapshot()
+        return {
+            "format_version": 1,
+            "config": dict(CFG),
+            "metadata": dict(metadata or {}),
+            "train_history": list(self.train_history),
+            "test_history": list(self.test_history),
+            "summary": {
+                "final_round": self.tr_round,
+                "final_train_loss": self.global_loss,
+                "final_train_acc": self.global_acc,
+                "final_test_loss": self.test_loss,
+                "final_test_acc": self.test_acc,
+                "elapsed_time": snapshot["elapsed_time"],
+                "stop_reason": snapshot["stop_reason"],
+            },
+            "energy_totals": self._collect_energy_totals(),
+            "vehicles": [
+                {
+                    "id": vehicle.id,
+                    "sumo_id": vehicle.sumo_id,
+                    "rounds": vehicle.tr_rounds,
+                    "current_loss": vehicle.current_loss,
+                    "current_acc": vehicle.current_acc,
+                    "loss_hist": list(vehicle.loss_hist),
+                    "acc_hist": list(vehicle.acc_hist),
+                    "round_time_hist": list(vehicle.round_time_hist),
+                    "computation_energy_hist": list(vehicle.computation_energy_hist),
+                    **vehicle.get_energy_snapshot(),
+                }
+                for vehicle in self.vehicles
+            ],
+        }
+
+    def _vehicle_is_done(self, v: Vehicle) -> bool:
+        """True when a vehicle has hit its local training stop condition.
+
+        Modes are mutually exclusive:
+          TARGET_ACCURACY < 1.0  → accuracy mode: stop on accuracy, ignore MAX_TR_ROUNDS
+          TARGET_ACCURACY ≥ 1.0  → rounds mode:   stop on MAX_TR_ROUNDS, ignore accuracy
+          MAX_TR_ROUNDS = 0      → no round cap (only meaningful in rounds mode; in
+                                   accuracy mode MAX_TR_ROUNDS is already ignored)
+        """
+        if CFG["TARGET_ACCURACY"] <= 1.0:
+            return v.current_acc >= CFG["TARGET_ACCURACY"]
+        if CFG["MAX_TR_ROUNDS"] > 0:
+            return v.tr_rounds >= CFG["MAX_TR_ROUNDS"]
+        return False  # both sentinels disabled — never auto-stops
+
+    def get_stop_reason(self) -> str | None:
+        """Human-readable explanation when a DPL stop condition has been met."""
+        if all(self._vehicle_is_done(v) for v in self.vehicles):
+            if CFG["TARGET_ACCURACY"] <= 1.0:
+                return f"all vehicles reached target accuracy ({CFG['TARGET_ACCURACY']:.2%})"
+            return f"all vehicles completed {CFG['MAX_TR_ROUNDS']} training rounds"
+        return None
 
     def is_done(self) -> bool:
         """True when either termination condition is satisfied."""
-        return (
-            self.tr_round >= CFG["MAX_TR_ROUNDS"]
-            or self.global_acc >= CFG["TARGET_ACCURACY"]
-        )
+        return self.get_stop_reason() is not None
+
+    def _link_name(self, link_type: float) -> str:
+        """Human-readable name for the link used between two vehicles."""
+        if link_type == LINK_SIDELINK:
+            return "5G sidelink"
+        return "Internet"
+
+    def _emit_event(self, sim_time: float, category: str, text: str) -> None:
+        """Publish an interaction-log event if a stream is configured."""
+        if self._event_stream is not None:
+            self._event_stream.publish(sim_time, category, text)
+
+    def _publish_connection_changes(
+        self,
+        vehicle: Vehicle,
+        prev_connections: set,
+        prev_link_types: dict,
+        sim_time: float,
+    ) -> None:
+        """Emit connect/disconnect events for DPL collaboration links."""
+        current_connections = set(vehicle.connections)
+        changed = {
+            nid for nid in prev_connections & current_connections
+            if prev_link_types.get(nid) != vehicle.link_types.get(nid)
+        }
+
+        removed = (prev_connections - current_connections) | changed
+        added = (current_connections - prev_connections) | changed
+
+        for nid in sorted(removed):
+            peer = self.vehicles[nid].sumo_id
+            self._emit_event(
+                sim_time,
+                "link",
+                f"vehicle {vehicle.sumo_id} disconnected from vehicle {peer}",
+            )
+
+        for nid in sorted(added):
+            peer = self.vehicles[nid].sumo_id
+            link_name = self._link_name(vehicle.link_types.get(nid, LINK_INTERNET))
+            self._emit_event(
+                sim_time,
+                "link",
+                f"vehicle {vehicle.sumo_id} connected to vehicle {peer} via {link_name}",
+            )
+
+    def _build_peer_transfers(self, vehicle: Vehicle) -> list:
+        """Describe the neighbor weights the next local round will use."""
+        transfers = []
+        for nid in sorted(vehicle.connections):
+            if nid >= len(self.vehicles):
+                continue
+            peer = self.vehicles[nid]
+            link_type = vehicle.link_types.get(nid, LINK_INTERNET)
+            dist = float(np.linalg.norm(vehicle.pos - peer.pos))
+            if link_type == LINK_SIDELINK:
+                tx_energy = float(sl_tx_energy_j(dist))
+            else:
+                tx_energy = float(inet_tx_energy_j())
+            peer.add_transmission_energy(link_type, tx_energy)
+            transfers.append({
+                "peer_id": peer.sumo_id,
+                "size_bytes": peer.shared_weights_bytes,
+                "link_name": self._link_name(link_type),
+                "tx_energy_j": tx_energy,
+            })
+        return transfers
 
     # ── Main simulation step ──────────────────────────────────────────────────
 
-    def step(self, vehicle_states: dict) -> dict:
+    def step(self, vehicle_states: dict, sim_time: float) -> dict:
         """
-        Execute one FL step.
+        Execute one DPL step.
 
         1. Update vehicle positions from SUMO vehicle states.
         2. Discover neighbors (sidelink + internet) for dynamic algorithms.
         3. Run algorithm neighbor selection and model aggregation.
-        4. Submit background training for idle vehicles.
-        5. Refresh global metrics.
+        4. Refresh metrics and evaluate stop conditions.
+        5. Submit background training for eligible idle vehicles.
+        6. Return current metrics and completion status.
 
         Args:
             vehicle_states: dict[str, VehicleState] from SumoManager.step()
+            sim_time: current SUMO simulation time in seconds
 
         Returns:
-            dict with avg_loss, avg_acc, tr_round, new_tr_data, step.
+            dict with avg_loss, avg_acc, tr_round, new_tr_data, step, done,
+            and stop_reason.
         """
         self.step_n += 1
+        self._last_sim_time = float(sim_time)
+        prev_eval_round = self._last_eval_round
+        self._poll_eval_future(sim_time)
         prev_tr_round = self.tr_round
         transitions = {}
 
         # 1. Update positions from SUMO
         for v in self.vehicles:
             if v.sumo_id in vehicle_states:
-                v.update_from_sumo(vehicle_states[v.sumo_id])
+                v.update_from_sumo(vehicle_states[v.sumo_id], sim_time)
 
         # 2. Select neighbors (algorithm decides)
         for v in self.vehicles:
+            prev_connections = set(v.connections)
+            prev_link_types = dict(v.link_types)
             candidates = (
                 self.neighbors_of(v) if self.algo.needs_dynamic_neighbors else []
             )
             v.connections, v.alphas, v.link_types, t = \
                 self.algo.select_neighbors(v, candidates, self)
+            self._publish_connection_changes(
+                v,
+                prev_connections,
+                prev_link_types,
+                sim_time,
+            )
             if t is not None:
                 transitions[v.id] = t
 
@@ -222,17 +564,27 @@ class DLEnvironment:
         for v in self.vehicles:
             self.algo.aggregate(v, self.vehicles)
 
-        # 4. Submit training for idle vehicles
-        for v in self.vehicles:
-            if v.training_done.is_set():
-                v.training_done.clear()
-                self.executor.submit(v.train_local)
+        # 4. Refresh metrics before scheduling more work so training stops cleanly.
+        self._refresh_metrics()
+        if self.tr_round > prev_tr_round:
+            now = time.perf_counter()
+            self.last_round_time = now - self._round_wall_mark
+            self._round_wall_mark = now
+            self._record_train_metrics()
+        stop_reason = self.get_stop_reason()
+        self._maybe_schedule_eval(sim_time, stop_reason=stop_reason)
+
+        if stop_reason is None:
+            for v in self.vehicles:
+                if v.training_done.is_set() and not self._vehicle_is_done(v):
+                    v.prepare_training_round(sim_time, self._build_peer_transfers(v))
+                    v.training_done.clear()
+                    self.executor.submit(v.train_local)
 
         # 5. Rewards (no-op for non-RL algorithms)
         rewards = self.algo.post_step(self.vehicles, transitions, self.step_n)
 
-        # 6. Refresh global metrics
-        self._refresh_metrics()
+        new_test_data = self._last_eval_round > prev_eval_round
 
         return {
             "rewards": rewards,
@@ -240,5 +592,12 @@ class DLEnvironment:
             "avg_acc": self.global_acc,
             "tr_round": self.tr_round,
             "new_tr_data": self.tr_round > prev_tr_round,
+            "new_test_data": new_test_data,
+            "test_acc": self.test_acc if new_test_data else None,
+            "test_loss": self.test_loss if new_test_data else None,
+            "test_round": self._last_eval_round if new_test_data else None,
             "step": self.step_n,
+            "done": stop_reason is not None,
+            "stop_reason": stop_reason,
+            "training_status": self.get_progress_snapshot(),
         }

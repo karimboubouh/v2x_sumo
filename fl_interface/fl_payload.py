@@ -1,15 +1,15 @@
-"""Stub for Federated Learning model weight serialization.
+"""Stub for DL/DPL model weight serialization.
 
-This module provides a placeholder for FL weight exchange.
+This module provides a placeholder for DL weight exchange.
 Replace dummy_weights() with actual model weight extraction
-when integrating with a real FL framework (e.g., PyTorch, TensorFlow).
+when integrating with a real DPL training stack (e.g., PyTorch).
 """
 
 import random
 
 
-class FLPayload:
-    """Handles serialization/deserialization of FL model weights for V2V exchange."""
+class DLPayload:
+    """Handles serialization/deserialization of DL model weights for V2V exchange."""
 
     @staticmethod
     def dummy_weights(num_layers=3, layer_size=10):
@@ -36,7 +36,7 @@ class FLPayload:
             dict payload ready for V2VMessage.
         """
         return {
-            "type": "fl_model_update",
+            "type": "dl_model_update",
             "round": 0,
             "weights": weights,
         }
@@ -51,6 +51,10 @@ class FLPayload:
         Returns:
             dict of {layer_name: list_of_floats} or None.
         """
-        if payload.get("type") == "fl_model_update":
+        if payload.get("type") in {"dl_model_update", "fl_model_update"}:
             return payload.get("weights")
         return None
+
+
+# Backward-compatible alias for older imports.
+FLPayload = DLPayload

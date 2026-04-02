@@ -1,36 +1,10 @@
 """Map view panel: renders road network, vehicles, and V2V links."""
 
 import pygame
-import pygame.freetype
 
 import config
+from dashboard.fonts import get_font
 from dashboard import theme
-
-
-_font_cache = {}
-
-
-def _make_font(size, bold=False, mono=False):
-    """Return a cached pygame.freetype font, trying platform fonts then falling back."""
-    key = (size, bold, mono)
-    if key in _font_cache:
-        return _font_cache[key]
-    names = (
-        ["menlo", "sfmonomedium", "couriernew", "dejavusansmono"]
-        if mono
-        else ["helveticaneue", "helvetica", "sfprodisplay", "arial", "dejavusans"]
-    )
-    for name in names:
-        try:
-            f = pygame.freetype.SysFont(name, size, bold=bold)
-            if f:
-                _font_cache[key] = f
-                return f
-        except Exception:
-            pass
-    f = pygame.freetype.SysFont(None, size, bold=bold)
-    _font_cache[key] = f
-    return f
 
 
 # Distinct colors assigned to vehicles in round-robin order
@@ -157,7 +131,8 @@ class MapView:
         self._road_surface = surf
         self._road_cache_key = cache_key
 
-    def draw(self, surface, vehicle_states, active_links, sim_time, scenario_name, paused=False):
+    def draw(self, surface, vehicle_states, active_links, sim_time, scenario_name,
+             paused=False, overlay_text=None):
         """Draw the map panel."""
         # Roads (cached off-screen surface)
         self._render_road_surface()
@@ -171,9 +146,15 @@ class MapView:
         for _veh_id, state in vehicle_states.items():
             self._draw_vehicle(surface, state)
 
-        # Paused overlay
-        if paused:
-            font = _make_font(int(26 * self.dpi_scale), bold=True)
+        # Center overlay for paused/completed states
+        if overlay_text:
+            font = get_font(int(28 * self.dpi_scale), bold=True)
+            surf, _ = font.render(overlay_text, theme.color("pause_label"))
+            cx = self.rect.x + self.rect.width // 2
+            cy = self.rect.y + self.rect.height // 2
+            surface.blit(surf, surf.get_rect(center=(cx, cy)))
+        elif paused:
+            font = get_font(int(28 * self.dpi_scale), bold=True)
             surf, _ = font.render("⏸  PAUSED", theme.color("pause_label"))
             cx = self.rect.x + self.rect.width // 2
             cy = self.rect.y + self.rect.height // 2
@@ -264,7 +245,7 @@ class MapView:
             lbl_key = (speed_int, font_size)
 
             if lbl_key not in self._speed_label_cache:
-                spd_font = _make_font(font_size)
+                spd_font = get_font(font_size, mono=True)
                 spd_surf, _ = spd_font.render(str(speed_int), (255, 255, 255))
                 pad_x, pad_y = int(4 * self.dpi_scale), int(2 * self.dpi_scale)
                 composite = pygame.Surface(
@@ -304,7 +285,7 @@ class MapView:
         pad = int(8 * d)
 
         # --- Status bar — top-left (location · time · vehicles · avg speed · zoom) ---
-        status_font = _make_font(int(14 * d), bold=False)
+        status_font = get_font(int(15 * d), bold=False)
         status_text = (
             f"Road: {scenario_name}  |  Time: {sim_time:.0f}s"
             f"  |  Vehicles: {vehicle_count}  |  Avg speed: {avg_speed:.0f} km/h"
@@ -314,7 +295,7 @@ class MapView:
         surface.blit(s_surf, (self.rect.x + pad, self.rect.y + pad))
 
         # --- Hints — below status ---
-        hint_font = _make_font(int(12 * d))
+        hint_font = get_font(int(13 * d))
         hints = "Scroll: zoom  ·  Drag: pan  ·  R: reset  ·  Space: pause  ·  F11: fullscreen"
         h_surf, _ = hint_font.render(hints, theme.color("text_secondary"))
         surface.blit(h_surf, (self.rect.x + pad, self.rect.y + pad + s_surf.get_height() + int(3 * d)))

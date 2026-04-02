@@ -1,7 +1,7 @@
 """
 base.py — Abstract base class for all DPL algorithms.
 
-Every algorithm implements hooks called by the FL environment:
+Every algorithm implements hooks called by the DPL environment:
   setup(vehicles)           — one-time init
   select_neighbors(v, ...)  — decide which neighbors to collaborate with
   aggregate(v, vehicles)    — merge neighbor models into v's model

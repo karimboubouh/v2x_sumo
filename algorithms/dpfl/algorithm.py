@@ -1,5 +1,5 @@
 """
-DPFL — Decentralized Personalized Federated Learning.
+DPFL — Decentralized Personalized Learning.
 
 Greedy Graph Construction for optimal collaboration graph.
 Adapted from v2x_sim/algorithms/dpfl/algorithm.py.
@@ -10,15 +10,15 @@ import torch
 import torch.nn.functional as F
 
 from algorithms.base import DLAlgorithm, LINK_INTERNET
-from dl.config import DL_CFG as CFG
+from config import DL_CFG as CFG
 from dl.helpers import clone_state_dict
 
 
 class DPFLAlgorithm(DLAlgorithm):
     """
-    Decentralized Personalized FL via Greedy Graph Construction.
+    Decentralized Personalized Learning via Greedy Graph Construction.
 
-    The collaboration graph is rebuilt every DPFL_UPDATE_EVERY FL rounds
+    The collaboration graph is rebuilt every DPFL_UPDATE_EVERY DPL rounds
     using GGC. Between rebuilds the cached set is used, pruned to
     whatever neighbors are currently in range.
     """
@@ -26,8 +26,9 @@ class DPFLAlgorithm(DLAlgorithm):
     name = "DPFL"
     needs_dynamic_neighbors = True
 
-    def __init__(self, update_every: int = None):
-        self._update_every = update_every or int(CFG.get("DPFL_UPDATE_EVERY", 10))
+    def __init__(self):
+        from algorithms.dpfl.config import DPFL_UPDATE_EVERY
+        self._update_every = DPFL_UPDATE_EVERY
         self._temp_model = None
 
     def setup(self, vehicles: list) -> None:
@@ -56,13 +57,16 @@ class DPFLAlgorithm(DLAlgorithm):
         return connections, alphas, link_types, None
 
     def aggregate(self, v, vehicles: list) -> None:
-        """Uniform-weight FedAvg over the collaboration set."""
+        """Personalized aggregation over the GGC collaboration set.
+        Vehicle retains SELF_WEIGHT of its own model; the remaining
+        (1 - SELF_WEIGHT) is split equally across selected neighbors."""
         accepted = [vehicles[nid] for nid in v.connections if nid < len(vehicles)]
         if not accepted:
             return
 
         nbr_sds = [nbr.get_shared_weights() for nbr in accepted]
-        n = len(nbr_sds) + 1
+        self_w = float(CFG["SELF_WEIGHT"])
+        nbr_w = (1.0 - self_w) / len(nbr_sds)
 
         with v._lock:
             own_sd = v.model.state_dict()
@@ -70,10 +74,10 @@ class DPFLAlgorithm(DLAlgorithm):
             for key in new_sd:
                 if not new_sd[key].is_floating_point():
                     continue
-                agg = own_sd[key].float()
+                agg = self_w * own_sd[key].float()
                 for sd in nbr_sds:
-                    agg = agg + sd[key].float()
-                new_sd[key] = agg / n
+                    agg = agg + nbr_w * sd[key].float()
+                new_sd[key] = agg
             v.model.load_state_dict(new_sd)
 
     def _run_ggc(self, v, candidates: list) -> None:

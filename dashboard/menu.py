@@ -1,28 +1,9 @@
 """In-app menu bar for the SUMO V2V Dashboard."""
 
 import pygame
-import pygame.freetype
 
+from dashboard.fonts import get_font
 from dashboard import theme
-
-_font_cache = {}
-
-
-def _menu_font(size, bold=False):
-    key = (size, bold)
-    if key in _font_cache:
-        return _font_cache[key]
-    for name in ["helveticaneue", "helvetica", "sfprodisplay", "arial", "dejavusans"]:
-        try:
-            f = pygame.freetype.SysFont(name, size, bold=bold)
-            if f:
-                _font_cache[key] = f
-                return f
-        except Exception:
-            pass
-    f = pygame.freetype.SysFont(None, size, bold=bold)
-    _font_cache[key] = f
-    return f
 
 
 # Separator sentinel
@@ -34,8 +15,8 @@ class MenuBar:
 
     def __init__(self, dpi_scale=1.0):
         self.dpi_scale = dpi_scale
-        self._bar_h = int(24 * dpi_scale)
-        self._font_size = int(13 * dpi_scale)
+        self._bar_h = int(26 * dpi_scale)
+        self._font_size = int(14 * dpi_scale)
         self._open_menu = None  # index of open dropdown, or None
 
         # Menu structure
@@ -140,7 +121,7 @@ class MenuBar:
         pygame.draw.rect(surface, bg, (0, 0, width, self._bar_h))
         pygame.draw.line(surface, border_c, (0, self._bar_h - 1), (width, self._bar_h - 1))
 
-        font = _menu_font(self._font_size)
+        font = get_font(self._font_size)
         x = int(12 * d)
         self._label_rects = []
 
@@ -189,8 +170,8 @@ class MenuBar:
         pygame.draw.rect(surface, bg, drop_rect)
         pygame.draw.rect(surface, border_c, drop_rect, 1)
 
-        font = _menu_font(self._font_size)
-        shortcut_font = _menu_font(int(11 * d))
+        font = get_font(self._font_size)
+        shortcut_font = get_font(int(12 * d), mono=True)
         mx, my = pygame.mouse.get_pos()
         y = self._bar_h
 

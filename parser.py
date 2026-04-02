@@ -2,6 +2,7 @@
 
 import argparse
 import config
+from algorithms import get_available_algorithms
 
 
 def parse_args():
@@ -51,6 +52,12 @@ def parse_args():
         metavar="LEVEL",
         help="Minimum log level to display: debug|info|success|result|warning|error (default: %(default)s)",
     )
+    parser.add_argument(
+        "--plot-experiment",
+        metavar="PKL",
+        dest="plot_experiment",
+        help="Load a saved DPL experiment pickle, regenerate the plots, and show them",
+    )
     # ── Decentralized Personalized Learning ────────────────────────────────
     parser.add_argument(
         "--dl",
@@ -59,23 +66,37 @@ def parse_args():
     )
     parser.add_argument(
         "--dl-algorithm",
-        default="FedAvg",
-        choices=["FedAvg", "D-PSGD", "DPFL"],
+        default=config.DL_CFG["ALGORITHM"],
+        choices=get_available_algorithms(),
         dest="dl_algorithm",
-        help="DPL algorithm (default: FedAvg)",
+        help=f"DPL algorithm (default: {config.DL_CFG['ALGORITHM']})",
     )
     parser.add_argument(
         "--dl-dataset",
-        default="MNIST",
-        choices=["MNIST", "CIFAR10", "CIFAR100"],
+        default=config.DL_CFG["DATASET"],
+        choices=["MNIST", "FEMNIST", "CIFAR10", "CIFAR100"],
         dest="dl_dataset",
-        help="DPL training dataset (default: MNIST)",
+        help=f"DPL training dataset (default: {config.DL_CFG['DATASET']})",
     )
     parser.add_argument(
         "--dl-model",
-        default="DNN",
+        default=config.DL_CFG["MODEL_ARCH"],
         choices=["DNN", "CNN", "LSTM", "Transformer", "ResNet"],
         dest="dl_model",
-        help="DPL model architecture (default: DNN)",
+        help=f"DPL model architecture (default: {config.DL_CFG['MODEL_ARCH']})",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=config.DL_CFG["MAX_TR_ROUNDS"],
+        metavar="ROUNDS",
+        help=f"Max rounds per vehicle (default: {config.DL_CFG['MAX_TR_ROUNDS']})",
+    )
+    parser.add_argument(
+        "--target_acc",
+        type=float,
+        default=config.DL_CFG["TARGET_ACCURACY"],
+        metavar="TARGET_ACC",
+        help=f"Target accuracy for automatic stop (default: {config.DL_CFG['TARGET_ACCURACY']})",
     )
     return parser.parse_args()

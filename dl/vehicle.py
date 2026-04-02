@@ -1,8 +1,8 @@
 """
-dl/vehicle.py — Vehicle (Node) class for decentralized federated learning.
+dl/vehicle.py — Vehicle (node) class for decentralized learning.
 
 Each vehicle owns a local ML model, a local dataset partition, and
-participates in decentralized training via neighbor collaboration.
+participates in DPL training via neighbor collaboration.
 
 Position is updated from SUMO TraCI each simulation step (not self-managed).
 
@@ -11,12 +11,14 @@ Adapted from v2x_sim/vehicle.py (road state removed, SUMO integration added).
 
 import math
 import threading
+import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from dl.config import DL_CFG as CFG
+from algorithms.base import LINK_INTERNET, LINK_SIDELINK
+from config import DL_CFG as CFG
 from dl.data import get_n_classes
 from dl.models import build_model
 from dl.helpers import _inf_loader, clone_state_dict
@@ -24,15 +26,15 @@ from dl.helpers import _inf_loader, clone_state_dict
 
 class Vehicle:
     """
-    One participant in the V2X federated learning network.
+    One participant in the V2X decentralized learning network.
 
     SUMO state (updated every step from TraCI via update_from_sumo)
     ---------------------------------------------------------------
     pos        : np.ndarray (x, y) in SUMO metres
     heading    : float in radians
 
-    FL state
-    --------
+    DPL state
+    ---------
     model           : personalized nn.Module
     optimizer       : Adam optimizer
     train_loader    : local training data (non-IID via Dirichlet)
@@ -46,7 +48,8 @@ class Vehicle:
     training_done   : Event: SET = idle, CLEAR = training in progress
     """
 
-    def __init__(self, vid: int, sumo_id: str, train_loader, network_bounds: tuple):
+    def __init__(self, vid: int, sumo_id: str, train_loader, network_bounds: tuple,
+                 event_stream=None):
         """
         Args:
             vid: integer ID (0-based, used for list indexing)
@@ -65,7 +68,7 @@ class Vehicle:
         x_min, y_min, x_max, y_max = network_bounds
         self._network_size = max(x_max - x_min, y_max - y_min, 1.0)
 
-        # FL model
+        # DPL model
         self.model = build_model(CFG["DATASET"], CFG["MODEL_ARCH"])
         self._lock = threading.Lock()
         self.train_loader = train_loader
@@ -79,6 +82,7 @@ class Vehicle:
         _init_sd = self.model.state_dict()
         self._shared_weights = clone_state_dict(_init_sd)
         self._ref_weights = clone_state_dict(_init_sd)
+        self.shared_weights_bytes = self._state_dict_nbytes(_init_sd)
 
         # Neighbor state
         self.connections = set()       # accepted neighbor IDs this step
@@ -88,17 +92,29 @@ class Vehicle:
 
         # Reference to the active DLAlgorithm (injected by DLEnvironment)
         self._algo = None
+        self._event_stream = event_stream
 
         # Metrics histories
         self.tr_rounds = 0
-        self.current_loss = 2.3        # CE for random 10-class model ~ ln(10)
+        init_loss = float(math.log(max(self.n_classes, 1)))
+        self.current_loss = init_loss
         self.current_acc = 0.0
-        self._prev_loss = 2.3
+        self._prev_loss = init_loss
         self.loss_hist = []
         self.acc_hist = []
+        self.round_time_hist = []
+        self.computation_energy_hist = []
+        self.computation_energy_j = 0.0
+        self.sidelink_tx_energy_j = 0.0
+        self.internet_tx_energy_j = 0.0
 
         # Cached flattened first-layer parameters for cosine-similarity
         self._param_vec: np.ndarray | None = None
+        self.last_sim_time = 0.0
+        self._round_started_at = 0.0
+        self._pending_transfers = []
+        self._target_accuracy_announced = False
+        self._training_finished_announced = False
 
         # Threading — starts SET so the vehicle is eligible immediately
         self.training_done = threading.Event()
@@ -106,7 +122,7 @@ class Vehicle:
 
     # ── SUMO integration ──────────────────────────────────────────────────────
 
-    def update_from_sumo(self, vehicle_state) -> None:
+    def update_from_sumo(self, vehicle_state, sim_time=None) -> None:
         """Update position and heading from a SumoManager VehicleState.
 
         Args:
@@ -114,8 +130,15 @@ class Vehicle:
                           angle is SUMO's degrees clockwise from north.
         """
         self.pos = np.array([vehicle_state.x, vehicle_state.y])
+        if sim_time is not None:
+            self.last_sim_time = float(sim_time)
         # Convert SUMO angle (degrees CW from north) to radians
         self.heading = math.radians(vehicle_state.angle)
+
+    def prepare_training_round(self, sim_time: float, peer_transfers: list) -> None:
+        """Store metadata for the next background training submission."""
+        self._round_started_at = float(sim_time)
+        self._pending_transfers = list(peer_transfers)
 
     # ── Feature vector ────────────────────────────────────────────────────────
 
@@ -158,7 +181,9 @@ class Vehicle:
         Runs in a background thread. Wrapped in try/finally to GUARANTEE
         training_done.set() is called even if an exception occurs.
         """
+        round_started = time.perf_counter()
         try:
+            self._publish_transfer_events()
             self._ref_weights = clone_state_dict(self.model.state_dict())
             self.model.train()
             total_loss, total_correct, total_n = 0.0, 0, 0
@@ -186,12 +211,20 @@ class Vehicle:
 
             avg_loss = total_loss / max(total_n, 1)
             avg_acc = total_correct / max(total_n, 1)
+            round_time_s = time.perf_counter() - round_started
+            # Theoretical DVFS computation energy: E = κ · I·|D_k| · L_k · f_k²
+            # total_n = I × |D_k| (actual samples processed this round)
+            kappa = float(CFG["KAPPA"])
+            f_k = float(CFG["CPU_FREQ_HZ"])
+            L_k = float(CFG["CPU_CYCLES_PER_SAMPLE"])
+            computation_energy_j = kappa * total_n * L_k * (f_k ** 2)
 
             with self._lock:
                 self._prev_loss = self.current_loss
                 self.current_loss = avg_loss
                 self.current_acc = avg_acc
                 self.tr_rounds += 1
+                round_n = self.tr_rounds
 
                 self._shared_weights = clone_state_dict(self.model.state_dict())
 
@@ -200,17 +233,120 @@ class Vehicle:
                     p.detach().numpy().flatten()
                     for p in list(self.model.parameters())[:2]
                 ])
+                self.computation_energy_j += computation_energy_j
 
             self.loss_hist.append(avg_loss)
             self.acc_hist.append(avg_acc)
+            self.round_time_hist.append(round_time_s)
+            self.computation_energy_hist.append(computation_energy_j)
+            self._emit_event(
+                "training",
+                f"vehicle {self.sumo_id} completed training round {round_n} "
+                f"(loss={avg_loss:.4f}, acc={avg_acc:.2%}, time={round_time_s:.2f}s)",
+            )
+
+            if (
+                CFG["TARGET_ACCURACY"] <= 1.0
+                and avg_acc >= CFG["TARGET_ACCURACY"]
+                and not self._target_accuracy_announced
+            ):
+                self._target_accuracy_announced = True
+                self._emit_event(
+                    "training",
+                    f"vehicle {self.sumo_id} reached target accuracy "
+                    f"({avg_acc:.2%} >= {CFG['TARGET_ACCURACY']:.2%})",
+                )
+
+            if CFG["TARGET_ACCURACY"] <= 1.0:
+                _finished = avg_acc >= CFG["TARGET_ACCURACY"]
+            elif CFG["MAX_TR_ROUNDS"] > 0:
+                _finished = round_n >= CFG["MAX_TR_ROUNDS"]
+            else:
+                _finished = False
+
+            if _finished and not self._training_finished_announced:
+                self._training_finished_announced = True
+                self._emit_event(
+                    "training",
+                    f"vehicle {self.sumo_id} finished training after {round_n} rounds",
+                )
+
+        except Exception as exc:
+            self._emit_event(
+                "warning",
+                f"vehicle {self.sumo_id} training failed: {exc}",
+            )
+            raise
 
         finally:
+            self._pending_transfers = []
             self.training_done.set()
 
     def get_shared_weights(self) -> dict:
         """Thread-safe copy of the weights broadcast over V2X."""
         with self._lock:
             return clone_state_dict(self._shared_weights)
+
+    def add_transmission_energy(self, link_type: float, energy_j: float) -> None:
+        """Accumulate transmission energy spent sending weights to peers."""
+        with self._lock:
+            if link_type == LINK_SIDELINK:
+                self.sidelink_tx_energy_j += float(energy_j)
+            else:
+                self.internet_tx_energy_j += float(energy_j)
+
+    def get_energy_snapshot(self) -> dict:
+        """Return current cumulative energy totals for serialization/plotting."""
+        with self._lock:
+            return {
+                "computation_energy_j": self.computation_energy_j,
+                "sidelink_tx_energy_j": self.sidelink_tx_energy_j,
+                "internet_tx_energy_j": self.internet_tx_energy_j,
+                "total_tx_energy_j": (
+                    self.sidelink_tx_energy_j + self.internet_tx_energy_j
+                ),
+            }
+
+    def _publish_transfer_events(self) -> None:
+        """Emit send/receive log events for the model updates used this round."""
+        for transfer in self._pending_transfers:
+            size_text = self._format_bytes(transfer["size_bytes"])
+            peer_id = transfer["peer_id"]
+            link_name = transfer["link_name"]
+            self._emit_event(
+                "weight",
+                f"vehicle {peer_id} sent model weights of size {size_text} "
+                f"to vehicle {self.sumo_id} via {link_name}",
+            )
+            self._emit_event(
+                "weight",
+                f"vehicle {self.sumo_id} received model weights from vehicle {peer_id} "
+                f"({size_text}) via {link_name}",
+            )
+
+    def _emit_event(self, category: str, text: str) -> None:
+        """Publish an interaction-log event if a stream is configured."""
+        if self._event_stream is not None:
+            ts = self._round_started_at or self.last_sim_time
+            self._event_stream.publish(ts, category, text)
+
+    def _state_dict_nbytes(self, state_dict: dict) -> int:
+        """Estimate serialized tensor size for human-readable logging."""
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in state_dict.values()
+        )
+
+    def _format_bytes(self, size_bytes: int) -> str:
+        """Format a byte count for the interaction log."""
+        units = ["B", "KB", "MB", "GB"]
+        size = float(size_bytes)
+        for unit in units:
+            if size < 1024.0 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(size)} {unit}"
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
 
     # ── Representation ────────────────────────────────────────────────────────
 

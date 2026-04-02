@@ -1,1 +1,1 @@
-"""Federated Learning subsystem for SUMO V2V Dashboard."""
+"""Decentralized personalized learning subsystem for the SUMO V2V Dashboard."""

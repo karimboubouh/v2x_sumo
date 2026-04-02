@@ -1,5 +1,5 @@
 """
-dl/helpers.py — Utility functions for FL subsystem.
+dl/helpers.py — Utility functions for the DPL subsystem.
 
 Adapted from v2x_sim/helpers.py.
 """
@@ -11,7 +11,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from dl.config import DL_CFG as CFG
+from config import DL_CFG as CFG
+from dl.models import build_model
 
 
 def eval_vehicles(vehicles, test_loader) -> tuple:
@@ -22,19 +23,23 @@ def eval_vehicles(vehicles, test_loader) -> tuple:
     """
     criterion = nn.CrossEntropyLoss()
     totals = {v.id: [0.0, 0, 0] for v in vehicles}
+    models = []
+
+    for v in vehicles:
+        model = build_model(CFG["DATASET"], CFG["MODEL_ARCH"])
+        model.load_state_dict(v.get_shared_weights())
+        model.eval()
+        models.append((v.id, model))
 
     with torch.no_grad():
         for images, labels in test_loader:
             n = len(labels)
-            for v in vehicles:
-                with v._lock:
-                    v.model.eval()
-                    logits = v.model(images)
-                    v.model.train()
+            for vid, model in models:
+                logits = model(images)
                 loss = criterion(logits, labels)
-                totals[v.id][0] += loss.item() * n
-                totals[v.id][1] += int((logits.argmax(1) == labels).sum())
-                totals[v.id][2] += n
+                totals[vid][0] += loss.item() * n
+                totals[vid][1] += int((logits.argmax(1) == labels).sum())
+                totals[vid][2] += n
 
     per_loss = [totals[v.id][0] / max(totals[v.id][2], 1) for v in vehicles]
     per_acc = [totals[v.id][1] / max(totals[v.id][2], 1) for v in vehicles]
@@ -64,7 +69,6 @@ def _get_model_size_bits() -> float:
     """Return payload size in bits = num_float32_params x 32."""
     global _MODEL_SIZE_BITS
     if _MODEL_SIZE_BITS == 0.0:
-        from dl.models import build_model
         model = build_model(CFG["DATASET"], CFG["MODEL_ARCH"])
         n_params = sum(p.numel() for p in model.parameters())
         _MODEL_SIZE_BITS = float(n_params * 32)
@@ -72,20 +76,29 @@ def _get_model_size_bits() -> float:
 
 
 def sl_tx_energy_j(dist_m: float) -> float:
-    """Sidelink (PC5) TX energy in Joules for one model-parameter exchange."""
+    """Sidelink (PC5) TX energy in Joules for one model-parameter exchange.
+
+    Formula: E = p_k × T,  T = γ·S / C_{k,j}
+    where C_{k,j} = B·log2(1+ρ) and γ is the compression ratio.
+    """
     v2x_range = float(CFG["V2X_RANGE"])
     snr_0 = _snr_linear(float(CFG["SL_SNR_AT_MAX_RANGE_DB"]))
     snr_d = snr_0 * (v2x_range / max(float(dist_m), 1.0)) ** 2
     C = float(CFG["SL_BANDWIDTH_HZ"]) * math.log2(1.0 + snr_d)
-    T = _get_model_size_bits() / C
+    gamma = float(CFG.get("COMPRESSION_RATIO", 1.0))
+    T = gamma * _get_model_size_bits() / C
     return float(CFG["SL_TX_POWER_W"]) * T
 
 
 def inet_tx_energy_j() -> float:
-    """Internet (5G Uu) TX energy in Joules for one model-parameter exchange."""
+    """Internet (5G Uu relay) TX energy in Joules for one model-parameter exchange.
+
+    Formula: E = 2 × p_k × T,  T = γ·S / C  (×2 for uplink + downlink relay legs)
+    """
     snr = _snr_linear(float(CFG["INET_SNR_DB"]))
     C = float(CFG["INET_BANDWIDTH_HZ"]) * math.log2(1.0 + snr)
-    T = _get_model_size_bits() / C
+    gamma = float(CFG.get("COMPRESSION_RATIO", 1.0))
+    T = gamma * _get_model_size_bits() / C
     return 2.0 * float(CFG["INET_TX_POWER_W"]) * T
 
 

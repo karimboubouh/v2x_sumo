@@ -1,13 +1,14 @@
 """
-fl/models.py — Neural Network Architectures for Personalized FL
+dl/models.py — Neural network architectures for personalized DPL
 ===============================================================
-Supports five architectures across three datasets.
+Supports five architectures across four datasets.
 
 Factory function:
     model = build_model(dataset, arch)
 
 Input shapes:
     MNIST   -> (1, 28, 28)  — grayscale 10-class
+    FEMNIST -> (1, 28, 28)  — grayscale 62-class
     CIFAR10 -> (3, 32, 32)  — RGB 10-class
     CIFAR100-> (3, 32, 32)  — RGB 100-class
 
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 
 DATASET_META = {
     "MNIST": {"in_ch": 1, "img": 28, "n_cls": 10},
+    "FEMNIST": {"in_ch": 1, "img": 28, "n_cls": 62},
     "CIFAR10": {"in_ch": 3, "img": 32, "n_cls": 10},
     "CIFAR100": {"in_ch": 3, "img": 32, "n_cls": 100},
 }
@@ -32,15 +34,21 @@ DATASET_META = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DNN(nn.Module):
-    """Multi-layer perceptron. Fast variant: 64 -> 64 -> n_cls."""
+    """Multi-layer perceptron: flat → 200 → n_cls.
+
+    200 hidden units is the community standard for MNIST FL/DPL benchmarks
+    (McMahan et al. 2017 FedAvg, Li et al. FedProx, etc.).
+    Dropout(0.2) regularizes against overfitting to non-IID local distributions.
+    """
 
     def __init__(self, in_ch: int, img: int, n_cls: int):
         super().__init__()
         flat = in_ch * img * img
         self.net = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(flat, 64), nn.ReLU(),
-            nn.Linear(64, n_cls),
+            nn.Linear(flat, 200), nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(200, n_cls),
         )
 
     def forward(self, x):

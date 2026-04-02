@@ -1,5 +1,6 @@
 """Communication manager: neighbor discovery, message queuing, and delivery."""
 
+import json
 import random
 from collections import defaultdict
 
@@ -21,6 +22,7 @@ class CommManager:
         snr_threshold_db=None,
         beacon_interval=None,
         message_ttl=None,
+        event_stream=None,
     ):
         self.comm_range = comm_range or config.COMM_RANGE
         self.max_neighbors = max_neighbors if max_neighbors is not None else config.MAX_NEIGHBORS
@@ -32,10 +34,12 @@ class CommManager:
         self.message_ttl = message_ttl or config.MESSAGE_TTL
 
         self._active_links = []       # Current V2V links
+        self._active_pairs = {}       # {sorted_pair: V2VLink}
         self._outgoing_queue = []     # Messages waiting for delivery
         self._last_beacon = {}        # {vehicle_id: last_beacon_time}
         self._neighbors = defaultdict(list)  # {vehicle_id: [neighbor_ids]}
         self._stats = {"sent": 0, "delivered": 0, "dropped": 0}
+        self._event_stream = event_stream
 
     def update(self, vehicle_states, sim_time):
         """Update communication state for the current simulation step.
@@ -45,18 +49,15 @@ class CommManager:
             sim_time: current simulation time in seconds
 
         Returns:
-            list of V2VMessage that were delivered or generated this step
+            list of V2VMessage delivered this step
         """
         # 1. Compute all pairwise links
-        self._compute_links(vehicle_states)
+        self._compute_links(vehicle_states, sim_time)
 
-        # 2. Generate hello beacons
-        beacons = self._generate_beacons(vehicle_states, sim_time)
-
-        # 3. Attempt to deliver queued messages
+        # 2. Attempt to deliver queued messages
         delivered = self._deliver_messages(sim_time)
 
-        return beacons + delivered
+        return delivered
 
     def send_message(self, sender_id, receiver_id, msg_type, payload, sim_time):
         """Queue a message for delivery."""
@@ -69,6 +70,9 @@ class CommManager:
         )
         self._outgoing_queue.append(msg)
         self._stats["sent"] += 1
+        self._publish_payload_event(
+            sim_time, "sent", sender_id, receiver_id, msg_type, payload
+        )
         return msg
 
     def get_active_links(self):
@@ -83,8 +87,9 @@ class CommManager:
         """Return communication statistics."""
         return dict(self._stats)
 
-    def _compute_links(self, vehicle_states):
+    def _compute_links(self, vehicle_states, sim_time):
         """Compute pairwise links between all vehicles, capped at max_neighbors each."""
+        prev_pairs = self._active_pairs
         self._active_links = []
         self._neighbors = defaultdict(list)
 
@@ -125,11 +130,16 @@ class CommManager:
                 accepted.add(frozenset({lnk.sender_id, lnk.receiver_id}))
 
         # Build final active_links and neighbors from the accepted set (union semantics)
+        next_pairs = {}
         for link in all_links:
             if frozenset({link.sender_id, link.receiver_id}) in accepted:
                 self._active_links.append(link)
                 self._neighbors[link.sender_id].append(link.receiver_id)
                 self._neighbors[link.receiver_id].append(link.sender_id)
+                next_pairs[self._pair_key(link.sender_id, link.receiver_id)] = link
+
+        self._publish_link_events(prev_pairs, next_pairs, sim_time)
+        self._active_pairs = next_pairs
 
     def _generate_beacons(self, vehicle_states, sim_time):
         """Generate periodic hello beacons from each vehicle."""
@@ -179,15 +189,102 @@ class CommManager:
                 msg.delivery_time = sim_time
                 delivered.append(msg)
                 self._stats["delivered"] += 1
+                self._publish_payload_event(
+                    sim_time,
+                    "received",
+                    msg.sender_id,
+                    msg.receiver_id,
+                    msg.msg_type,
+                    msg.payload,
+                )
             elif msg.attempts >= self.message_ttl:
                 # TTL expired
                 self._stats["dropped"] += 1
+                self._publish_payload_event(
+                    sim_time,
+                    "dropped",
+                    msg.sender_id,
+                    msg.receiver_id,
+                    msg.msg_type,
+                    msg.payload,
+                )
             else:
                 # Keep in queue for retry
                 remaining.append(msg)
 
         self._outgoing_queue = remaining
         return delivered
+
+    def _pair_key(self, vehicle_a, vehicle_b):
+        """Stable key for an undirected vehicle pair."""
+        return tuple(sorted((vehicle_a, vehicle_b)))
+
+    def _publish_link_events(self, prev_pairs, next_pairs, sim_time):
+        """Emit connect/disconnect events for direct 5G sidelink changes."""
+        if self._event_stream is None:
+            return
+
+        prev_keys = set(prev_pairs)
+        next_keys = set(next_pairs)
+
+        for vehicle_a, vehicle_b in sorted(next_keys - prev_keys):
+            link = next_pairs[(vehicle_a, vehicle_b)]
+            self._event_stream.publish(
+                sim_time,
+                "link",
+                f"vehicle {vehicle_a} connected to vehicle {vehicle_b} via 5G sidelink "
+                f"(d={link.distance:.0f} m, q={link.quality:.2f})",
+            )
+
+        for vehicle_a, vehicle_b in sorted(prev_keys - next_keys):
+            self._event_stream.publish(
+                sim_time,
+                "link",
+                f"vehicle {vehicle_a} disconnected from vehicle {vehicle_b}",
+            )
+
+    def _publish_payload_event(self, sim_time, direction, sender_id, receiver_id, msg_type, payload):
+        """Emit readable payload send/receive/drop events for the dashboard log."""
+        if self._event_stream is None:
+            return
+
+        if msg_type not in {"dl_weights", "fl_weights"}:
+            return
+
+        size_bytes = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        size_text = self._format_bytes(size_bytes)
+
+        if direction == "sent":
+            self._event_stream.publish(
+                sim_time,
+                "weight",
+                f"vehicle {sender_id} sent model weights of size {size_text} "
+                f"to vehicle {receiver_id} via 5G sidelink",
+            )
+        elif direction == "received":
+            self._event_stream.publish(
+                sim_time,
+                "weight",
+                f"vehicle {receiver_id} received model weights from vehicle {sender_id} "
+                f"({size_text}) via 5G sidelink",
+            )
+        elif direction == "dropped":
+            self._event_stream.publish(
+                sim_time,
+                "warning",
+                f"vehicle {sender_id} failed to deliver model weights to vehicle {receiver_id}",
+            )
+
+    def _format_bytes(self, size_bytes):
+        """Format a byte count for human-readable logging."""
+        units = ["B", "KB", "MB", "GB"]
+        size = float(size_bytes)
+        for unit in units:
+            if size < 1024.0 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(size)} {unit}"
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
 
     def _find_link(self, sender_id, receiver_id):
         """Find the link between two vehicles."""

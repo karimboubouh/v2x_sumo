@@ -38,13 +38,26 @@ class DashboardApp:
         self._divider_y = None
         self._divider_dragging = False
         self._dpi_scale = 1.0
+        self._input_scale_x = 1.0
+        self._input_scale_y = 1.0
         self._paused = False
+        self._simulation_done = False
+        self._overlay_text = None
         self._pause_btn_rect = None
         self._theme_version = -1  # track theme changes
 
     @property
     def paused(self):
-        return self._paused
+        return self._paused or self._simulation_done
+
+    def mark_simulation_done(self, overlay_text="SIMULATION DONE"):
+        """Freeze the simulation and display a centered completion message."""
+        self._simulation_done = True
+        self._overlay_text = overlay_text
+
+    def _toggle_pause(self):
+        if not self._simulation_done:
+            self._paused = not self._paused
 
     def initialize(self):
         """Initialize Pygame and create the window."""
@@ -57,13 +70,59 @@ class DashboardApp:
             pygame.RESIZABLE,
         )
         self._clock = pygame.time.Clock()
-
-        physical_w, _ = self._screen.get_size()
-        self._dpi_scale = physical_w / config.WINDOW_WIDTH
+        surface_w, surface_h = self._refresh_display_metrics()
 
         self._menu_bar = MenuBar(self._dpi_scale)
-        self._build_panels(config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
+        self._build_panels(surface_w, surface_h)
         self._initialized = True
+
+    def _refresh_display_metrics(self):
+        """Update drawable/window scale information for HiDPI displays."""
+        surface_w, surface_h = self._screen.get_size()
+        if hasattr(pygame.display, "get_window_size"):
+            try:
+                window_w, window_h = pygame.display.get_window_size()
+            except Exception:
+                window_w, window_h = surface_w, surface_h
+        else:
+            window_w, window_h = surface_w, surface_h
+
+        window_w = max(window_w, 1)
+        window_h = max(window_h, 1)
+        self._input_scale_x = surface_w / window_w
+        self._input_scale_y = surface_h / window_h
+        self._dpi_scale = max(self._input_scale_x, self._input_scale_y, 1.0)
+        return surface_w, surface_h
+
+    def _scale_pos(self, pos):
+        """Convert window-space input coordinates to drawable-surface space."""
+        x, y = pos
+        return (
+            int(round(x * self._input_scale_x)),
+            int(round(y * self._input_scale_y)),
+        )
+
+    def _scale_event(self, event):
+        """Return an input event adjusted for drawable-surface coordinates."""
+        if self._input_scale_x == 1.0 and self._input_scale_y == 1.0:
+            return event
+
+        if event.type not in (
+            pygame.MOUSEBUTTONDOWN,
+            pygame.MOUSEBUTTONUP,
+            pygame.MOUSEMOTION,
+        ):
+            return event
+
+        data = dict(event.dict)
+        if "pos" in data:
+            data["pos"] = self._scale_pos(data["pos"])
+        if "rel" in data:
+            data["rel"] = (
+                int(round(data["rel"][0] * self._input_scale_x)),
+                int(round(data["rel"][1] * self._input_scale_y)),
+            )
+        return pygame.event.Event(event.type, data)
 
     def _build_panels(self, w, h, preserve_view=False):
         """Create/recreate map and log panels for the given window size."""
@@ -80,10 +139,13 @@ class DashboardApp:
         log_h = content_h - self._divider_y
 
         old_zoom = old_pan_x = old_pan_y = None
+        old_log_state = None
         if preserve_view and self._map_view is not None:
             old_zoom = self._map_view._zoom
             old_pan_x = self._map_view._pan_x
             old_pan_y = self._map_view._pan_y
+        if preserve_view and self._log_view is not None:
+            old_log_state = self._log_view.export_state()
 
         map_rect = pygame.Rect(0, menu_h, w, map_h)
         log_rect = pygame.Rect(0, self._divider_y, w, log_h)
@@ -96,6 +158,8 @@ class DashboardApp:
             self._map_view._zoom = old_zoom
             self._map_view._pan_x = old_pan_x
             self._map_view._pan_y = old_pan_y
+        if old_log_state is not None:
+            self._log_view.restore_state(old_log_state)
 
     def _near_divider(self, my):
         return self._divider_y is not None and abs(my - self._divider_y) <= _DIVIDER_HIT_RADIUS
@@ -105,7 +169,7 @@ class DashboardApp:
         if action == "quit":
             return False
         if action == "toggle_pause":
-            self._paused = not self._paused
+            self._toggle_pause()
         elif action == "reset_view" and self._map_view:
             self._map_view.reset_view()
         elif action == "zoom_in" and self._map_view:
@@ -136,19 +200,20 @@ class DashboardApp:
             self._screen = pygame.display.set_mode(
                 (config.WINDOW_WIDTH, config.WINDOW_HEIGHT), pygame.RESIZABLE
             )
-        w, h = self._screen.get_size()
+        w, h = self._refresh_display_metrics()
         self._divider_y = None
         self._build_panels(w, h, preserve_view=True)
 
-    def render(self, vehicle_states, active_links, new_messages, sim_time):
+    def render(self, vehicle_states, active_links, new_messages, sim_time, training_status=None):
         """Render one frame. Returns False if user closed the window."""
         if not self._initialized:
             return False
 
         w, h = self._screen.get_size()
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+        for raw_event in pygame.event.get():
+            event = self._scale_event(raw_event)
+            if raw_event.type == pygame.QUIT:
                 return False
 
             # Menu bar gets first pass on events
@@ -160,53 +225,58 @@ class DashboardApp:
                     w, h = self._screen.get_size()
                     continue
 
-            if event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+            if self._log_view and self._log_view.handle_event(event):
+                continue
+
+            if raw_event.type == pygame.KEYDOWN:
+                if raw_event.key in (pygame.K_ESCAPE, pygame.K_q):
                     return False
-                if event.key == pygame.K_SPACE:
-                    self._paused = not self._paused
-                if event.key == pygame.K_F11:
+                if raw_event.key == pygame.K_SPACE:
+                    self._toggle_pause()
+                if raw_event.key == pygame.K_F11:
                     self._toggle_fullscreen()
                     w, h = self._screen.get_size()
-                if event.key == pygame.K_r and self._map_view:
+                if raw_event.key == pygame.K_r and self._map_view:
                     self._map_view.reset_view()
                 # Keyboard zoom: + / - / = (unshifted +)
-                if event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                if raw_event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     if self._map_view:
                         cx = self._map_view.rect.centerx
                         cy = self._map_view.rect.centery
                         self._map_view.zoom_at(cx, cy, 1.15)
-                if event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                if raw_event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     if self._map_view:
                         cx = self._map_view.rect.centerx
                         cy = self._map_view.rect.centery
                         self._map_view.zoom_at(cx, cy, 1.0 / 1.15)
 
-            if event.type == pygame.VIDEORESIZE:
+            if raw_event.type == pygame.VIDEORESIZE:
                 self._divider_y = None
-                self._build_panels(event.w, event.h, preserve_view=True)
-                w, h = event.w, event.h
+                w, h = self._refresh_display_metrics()
+                self._build_panels(w, h, preserve_view=True)
 
-            if event.type == pygame.MOUSEWHEEL:
-                mx, my = pygame.mouse.get_pos()
+            if raw_event.type == pygame.MOUSEWHEEL:
+                mx, my = self._scale_pos(pygame.mouse.get_pos())
+                if self._log_view and self._log_view.handle_wheel((mx, my), raw_event.y):
+                    continue
                 if self._map_view and self._map_view.rect.collidepoint(mx, my):
-                    factor = 1.15 if event.y > 0 else (1.0 / 1.15)
+                    factor = 1.15 if raw_event.y > 0 else (1.0 / 1.15)
                     self._map_view.zoom_at(mx, my, factor)
 
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if raw_event.type == pygame.MOUSEBUTTONDOWN and raw_event.button == 1:
                 mx, my = event.pos
                 if self._pause_btn_rect and self._pause_btn_rect.collidepoint(mx, my):
-                    self._paused = not self._paused
+                    self._toggle_pause()
                 elif self._near_divider(my):
                     self._divider_dragging = True
                 elif self._map_view and self._map_view.rect.collidepoint(mx, my):
                     self._drag_pos = event.pos
 
-            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if raw_event.type == pygame.MOUSEBUTTONUP and raw_event.button == 1:
                 self._divider_dragging = False
                 self._drag_pos = None
 
-            if event.type == pygame.MOUSEMOTION:
+            if raw_event.type == pygame.MOUSEMOTION:
                 mx, my = event.pos
                 if self._divider_dragging:
                     menu_h = self._menu_bar.height if self._menu_bar else 0
@@ -222,7 +292,7 @@ class DashboardApp:
                     self._drag_pos = event.pos
 
         # Cursor
-        mx, my = pygame.mouse.get_pos()
+        mx, my = self._scale_pos(pygame.mouse.get_pos())
         if self._divider_dragging or self._near_divider(my):
             pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_SIZENS)
         else:
@@ -234,7 +304,9 @@ class DashboardApp:
         # Draw panels
         self._map_view.draw(
             self._screen, vehicle_states, active_links,
-            sim_time, self.scenario_name, paused=self._paused,
+            sim_time, self.scenario_name,
+            paused=self._paused,
+            overlay_text=self._overlay_text,
         )
         if new_messages:
             self._log_view.add_messages(new_messages, active_links)
@@ -246,7 +318,7 @@ class DashboardApp:
 
         # Status bar (bottom)
         if self._status_bar:
-            self._status_bar.draw(self._screen)
+            self._status_bar.draw(self._screen, training_status=training_status)
 
         # Pause button (top-right, below menu)
         self._draw_pause_button(self._screen, w)
@@ -269,14 +341,14 @@ class DashboardApp:
         y = menu_h + margin
         self._pause_btn_rect = pygame.Rect(x, y, size, size)
 
-        bg_color = (80, 60, 60) if self._paused else (60, 60, 80)
+        bg_color = (80, 60, 60) if self.paused else (60, 60, 80)
         pygame.draw.rect(surface, bg_color, self._pause_btn_rect, border_radius=6)
         pygame.draw.rect(surface, (120, 120, 160), self._pause_btn_rect, 1, border_radius=6)
 
         cx, cy = x + size // 2, y + size // 2
         ic = int(10 * self._dpi_scale)
 
-        if self._paused:
+        if self.paused:
             pts = [(cx - ic // 2, cy - ic), (cx - ic // 2, cy + ic), (cx + ic, cy)]
             pygame.draw.polygon(surface, (180, 220, 180), pts)
         else:

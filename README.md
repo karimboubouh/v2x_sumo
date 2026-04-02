@@ -156,7 +156,7 @@ python main.py --scenario abu_dhabi_corniche --speed 0 -v debug
 | `--verbose` | `-v` | `info` | Log level: `debug` `info` `success` `result` `warning` `error` |
 | `--dl` | | off | Enable decentralized personalized learning |
 | `--dl-algorithm` | | `FedAvg` | DPL algorithm: `FedAvg` `D-PSGD` `DPFL` |
-| `--dl-dataset` | | `MNIST` | Training dataset: `MNIST` `CIFAR10` `CIFAR100` |
+| `--dl-dataset` | | `MNIST` | Training dataset: `MNIST` `FEMNIST` `CIFAR10` `CIFAR100` |
 | `--dl-model` | | `DNN` | Model architecture: `DNN` `CNN` `LSTM` `Transformer` `ResNet` |
 | `--dl-demo` | | off | Periodic dummy weight exchange demo over CommManager |
 
@@ -208,7 +208,7 @@ sumo/
 │   └── theme.py                # Dark / light theme definitions
 │
 ├── fl_interface/
-│   └── fl_payload.py           # FL weight serialization (demo stub)
+│   └── fl_payload.py           # DL weight serialization (demo stub)
 │
 └── scenarios/
     ├── dubai_marina/
@@ -245,7 +245,7 @@ Each scenario folder contains:
 
 When `--dl` is passed:
 
-1. **Startup**: The dataset (MNIST / CIFAR-10 / CIFAR-100) is partitioned among vehicles using **Dirichlet non-IID splitting** (controlled by `DATA_ALPHA` in `dl/config.py`). Lower alpha means more heterogeneous data — mimicking vehicles with distinct sensing environments and objectives.
+1. **Startup**: The dataset (MNIST / FEMNIST / CIFAR-10 / CIFAR-100) is partitioned among vehicles using **Dirichlet non-IID splitting** (controlled by `DL_CFG["DATA_ALPHA"]` in `config.py`). Lower alpha means more heterogeneous data — mimicking vehicles with distinct sensing environments and objectives.
 
 2. **Each vehicle** owns a personal `nn.Module`, an optimizer, and its own data partition. Vehicles do **not** share raw data — only model weights. The goal is for each vehicle to converge to a model that best fits *its own* data distribution, not a single global model.
 
@@ -257,7 +257,7 @@ When `--dl` is passed:
 
 4. **Console output** whenever a training round completes:
    ```
-   [RESULT ] FL Round 5 | Loss: 1.2345 | Acc: 56.78%
+   [RESULT ] DPL Round 5 | Loss: 1.2345 | Acc: 56.78%
    ```
 
 ### Link Types
@@ -305,8 +305,11 @@ Best for: heterogeneous non-IID settings where each vehicle has distinct data an
 | Dataset | Input shape | Classes |
 |---|---|---|
 | MNIST | (1, 28, 28) | 10 |
+| FEMNIST | (1, 28, 28) | 62 |
 | CIFAR-10 | (3, 32, 32) | 10 |
 | CIFAR-100 | (3, 32, 32) | 100 |
+
+`FEMNIST` is provided through `torchvision.datasets.EMNIST(split="byclass")`, which is the closest built-in equivalent in this codebase's current PyTorch / torchvision stack.
 
 | Architecture | Description |
 |---|---|
@@ -339,7 +342,7 @@ algorithms/
 # algorithms/my_algo/algorithm.py
 
 from algorithms.base import DLAlgorithm, LINK_SIDELINK, LINK_INTERNET
-from dl.config import DL_CFG as CFG
+from config import DL_CFG as CFG
 from dl.helpers import clone_state_dict
 
 
@@ -560,14 +563,14 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 | `COMM_RANGE` | `500` | V2V communication range in meters |
 | `MAX_NEIGHBORS` | `5` | Max V2V connections per vehicle (top-N by signal quality) |
 | `SIM_STEP_LENGTH` | `1.0` | SUMO step duration (seconds) |
-| `TIME_TO_TELEPORT` | `300` | Seconds before a stuck vehicle is teleported (`-1` to disable) |
+| `TIME_TO_TELEPORT` | `10` | Seconds before a stuck vehicle is teleported (`-1` to disable) |
 | `VEHICLE_FORCE_SPEED` | `None` | Force speed in km/h (`None` = SUMO car-following model) |
 | `TRACI_LOGS` | `False` | Show or hide SUMO's own stderr output |
 | `FPS` | `120` | Dashboard frame rate cap |
-| `STATUS_BAR_HEIGHT` | `24` | Height of the bottom status bar (pixels) |
+| `STATUS_BAR_HEIGHT` | `72` | Height of the bottom status bar (pixels) |
 | `THEME_MODE` | `"system"` | `"dark"`, `"light"`, or `"system"` |
 
-### `dl/config.py` — DPL settings
+### `config.py` → `DL_CFG` — DPL settings
 
 | Constant | Default | Description |
 |---|---|---|
@@ -578,7 +581,7 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 | `INTERNET_QUALITY_THRESHOLD` | `0.45` | Minimum quality score to accept an internet peer |
 | `LOCAL_LR` | `1e-3` | Adam learning rate |
 | `BATCH_SIZE` | `32` | Mini-batch size |
-| `BATCHES_PER_ROUND` | `2` | Mini-batches processed per FL round |
+| `BATCHES_PER_ROUND` | `2` | Mini-batches processed per DPL training round |
 | `DATA_ALPHA` | `0.3` | Dirichlet alpha (lower = more non-IID data) |
 | `MAX_TR_ROUNDS` | `100` | Hard stop after this many training rounds |
 | `TARGET_ACCURACY` | `1.01` | Stop when accuracy exceeds this (`> 1.0` = disabled) |
@@ -622,7 +625,7 @@ Example console output:
 [SUCCESS ] Dashboard ready. Press ESC or Q to quit.
 [INFO    ] Partitioning MNIST for 20 vehicles...
 [SUCCESS ] DPL ready: FedAvg | MNIST/DNN | 20 vehicles
-[RESULT  ] FL Round 1 | Loss: 2.1034 | Acc: 18.75%
-[RESULT  ] FL Round 2 | Loss: 1.8762 | Acc: 31.20%
+[RESULT  ] DPL Round 1 | Loss: 2.1034 | Acc: 18.75%
+[RESULT  ] DPL Round 2 | Loss: 1.8762 | Acc: 31.20%
 [RESULT  ] Step 100 | Time: 100s | Vehicles: 20 | Links: 47 | Msgs sent: 412 delivered: 398
 ```
