@@ -24,6 +24,7 @@ from simulation.sumo_manager import SumoManager
 def main():
     args = parse_args()
     logger.set_level(args.verbose)
+    config.COMM_RANGE = args.comm_range
 
     if args.plot_experiment:
         from dl.experiment import plot_saved_experiment
@@ -106,19 +107,19 @@ def main():
             from dl.data import partition_dataset
             from dl.env import DLEnvironment
 
-            config.DL_CFG["ALGORITHM"] = args.dl_algorithm
-            config.DL_CFG["DATASET"] = args.dl_dataset
-            config.DL_CFG["MODEL_ARCH"] = args.dl_model
-            config.DL_CFG["MAX_TR_ROUNDS"] = args.rounds
-            config.DL_CFG["TARGET_ACCURACY"] = args.target_acc
+            config.ALGORITHM = args.dl_algorithm
+            config.DATASET = args.dl_dataset
+            config.MODEL_ARCH = args.dl_model
+            config.MAX_TR_ROUNDS = args.rounds
+            config.TARGET_ACCURACY = args.target_acc
 
             logger.log(f"Partitioning {args.dl_dataset} (non-IID) for {args.num_vehicles} vehicles...", "info")
             sumo_ids = [f"mv_{i}" for i in range(args.num_vehicles)]
             train_loaders, test_loader = partition_dataset(
-                config.DL_CFG["DATASET"],
+                config.DATASET,
                 args.num_vehicles,
-                alpha=config.DL_CFG["DATA_ALPHA"],
-                batch_size=config.DL_CFG["BATCH_SIZE"],
+                alpha=config.DATA_ALPHA,
+                batch_size=config.BATCH_SIZE,
             )
             logger.log("Initializing DPL environment...", "info")
             dl_env = DLEnvironment(
@@ -142,7 +143,9 @@ def main():
         last_status_step = -1
         vehicle_states = {}
         sim_time = 0.0
-        active_links = []
+        render_links = []
+        log_links = []
+        vehicle_overlays = None
         new_messages = []
 
         # Accumulator: tracks how much sim-time we owe
@@ -179,9 +182,9 @@ def main():
             experiment = dl_env.export_experiment({
                 "scenario": args.scenario,
                 "scenario_name": scenario_info["name"],
-                "algorithm": config.DL_CFG["ALGORITHM"],
-                "dataset": config.DL_CFG["DATASET"],
-                "model": config.DL_CFG["MODEL_ARCH"],
+                "algorithm": config.ALGORITHM,
+                "dataset": config.DATASET,
+                "model": config.MODEL_ARCH,
                 "num_vehicles": args.num_vehicles,
                 "sim_time": sim_time,
                 "args": vars(args),
@@ -279,21 +282,28 @@ def main():
                                     payload = dl_payload.serialize_weights(weights)
                                     comm.send_message(sender, receiver, "dl_weights", payload, sim_time)
 
-                active_links = comm.get_active_links()
+                log_links = comm.get_active_links()
 
             if dl_env is not None:
                 training_status = dl_env.get_progress_snapshot()
+                render_links = dl_env.get_collaboration_links()
+                vehicle_overlays = dl_env.get_vehicle_overlays()
                 if training_status["done"] and not training_status["test_running"]:
                     finalize_experiment_outputs()
+            else:
+                render_links = log_links
+                vehicle_overlays = None
             new_messages += event_stream.drain(max_items=event_drain_batch)
 
             # --- Render (always, at FPS rate — Clock.tick handles pacing) ---
             if not dashboard.render(
                 vehicle_states,
-                active_links,
+                render_links,
                 new_messages,
                 sim_time,
                 training_status=training_status,
+                vehicle_overlays=vehicle_overlays,
+                log_links=log_links,
             ):
                 break
             new_messages = []  # clear after handing to dashboard
@@ -304,7 +314,7 @@ def main():
                 logger.log(
                     f"Step {step_count} | Time: {sim_time:.0f}s | "
                     f"Vehicles: {len(vehicle_states)} | "
-                    f"Links: {len(active_links)} | "
+                    f"Links: {len(render_links)} | "
                     f"Msgs sent: {stats['sent']} delivered: {stats['delivered']}",
                     "result",
                 )

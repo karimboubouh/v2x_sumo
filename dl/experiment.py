@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime, timezone
 
 import config
+import numpy as np
 
 _xdg_cache_home = os.path.join(tempfile.gettempdir(), "sumo-xdg-cache")
 _mpl_cache_dir = os.path.join(tempfile.gettempdir(), "sumo-matplotlib-cache")
@@ -105,6 +106,20 @@ def _prepare_series(history: list, x_key: str, y_key: str) -> tuple[list, list]:
     return [point[x_key] for point in history], [point[y_key] for point in history]
 
 
+def _moving_average(values: list, window: int = 10) -> list:
+    if not values:
+        return []
+
+    arr = np.asarray(values, dtype=np.float32)
+    out = np.empty_like(arr)
+    cumsum = np.cumsum(arr)
+    for idx in range(len(arr)):
+        start = max(0, idx - window + 1)
+        total = cumsum[idx] - (cumsum[start - 1] if start > 0 else 0.0)
+        out[idx] = total / (idx - start + 1)
+    return out.tolist()
+
+
 def plot_experiment(
     experiment: dict,
     output_dir: str,
@@ -124,14 +139,21 @@ def plot_experiment(
     train_rounds, train_acc = _prepare_series(train_history, "round", "acc")
     train_times, _ = _prepare_series(train_history, "time", "acc")
     _, train_loss = _prepare_series(train_history, "round", "loss")
+    train_acc_ma = _moving_average(train_acc, window=10)
+    train_loss_ma = _moving_average(train_loss, window=10)
     test_rounds, test_acc = _prepare_series(test_history, "round", "acc")
     test_times, _ = _prepare_series(test_history, "time", "acc")
     _, test_loss = _prepare_series(test_history, "round", "loss")
+    reward_history = list(experiment.get("reward_history", []))
+    reward_steps, reward_values = _prepare_series(reward_history, "step", "reward")
+    reward_times, _ = _prepare_series(reward_history, "time", "reward")
+    reward_ma = _moving_average(reward_values, window=10)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_rounds, train_acc, label="Train", linewidth=2.0)
+    ax.plot(train_rounds, train_acc, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#16a34a")
+    ax.plot(train_rounds, train_acc_ma, label="Train (10-round MA)", linewidth=2.2, color="#16a34a")
     if test_history:
-        ax.plot(test_rounds, test_acc, label="Test", marker="o", linewidth=1.8)
+        ax.plot(test_rounds, test_acc, label="Test", marker="o", linewidth=1.8, color="#2563eb")
     ax.set_title(f"Accuracy vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Accuracy")
@@ -142,9 +164,10 @@ def plot_experiment(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_times, train_acc, label="Train", linewidth=2.0)
+    ax.plot(train_times, train_acc, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#16a34a")
+    ax.plot(train_times, train_acc_ma, label="Train (10-round MA)", linewidth=2.2, color="#16a34a")
     if test_history:
-        ax.plot(test_times, test_acc, label="Test", marker="o", linewidth=1.8)
+        ax.plot(test_times, test_acc, label="Test", marker="o", linewidth=1.8, color="#2563eb")
     ax.set_title(f"Accuracy vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Accuracy")
@@ -155,9 +178,10 @@ def plot_experiment(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_rounds, train_loss, label="Train", linewidth=2.0)
+    ax.plot(train_rounds, train_loss, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#dc2626")
+    ax.plot(train_rounds, train_loss_ma, label="Train (10-round MA)", linewidth=2.2, color="#dc2626")
     if test_history:
-        ax.plot(test_rounds, test_loss, label="Test", marker="o", linewidth=1.8)
+        ax.plot(test_rounds, test_loss, label="Test", marker="o", linewidth=1.8, color="#2563eb")
     ax.set_title(f"Loss vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Loss")
@@ -168,9 +192,10 @@ def plot_experiment(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_times, train_loss, label="Train", linewidth=2.0)
+    ax.plot(train_times, train_loss, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#dc2626")
+    ax.plot(train_times, train_loss_ma, label="Train (10-round MA)", linewidth=2.2, color="#dc2626")
     if test_history:
-        ax.plot(test_times, test_loss, label="Test", marker="o", linewidth=1.8)
+        ax.plot(test_times, test_loss, label="Test", marker="o", linewidth=1.8, color="#2563eb")
     ax.set_title(f"Loss vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Loss")
@@ -201,6 +226,33 @@ def plot_experiment(
         fig,
         os.path.join(output_dir, "energy_totals.png"),
     )
+
+    if reward_history:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(reward_steps, reward_values, label="Reward (raw)", linewidth=1.6, alpha=0.35, color="#7c3aed")
+        ax.plot(reward_steps, reward_ma, label="Reward (10-step MA)", linewidth=2.2, color="#7c3aed")
+        ax.axhline(0.0, color="#6b7280", linewidth=1.0, linestyle="--")
+        ax.set_title(f"PPO Reward vs Steps\n{title}")
+        ax.set_xlabel("Simulation Step")
+        ax.set_ylabel("Reward")
+        ax.legend()
+        figures["ppo_reward_vs_steps"] = _save_figure(
+            fig,
+            os.path.join(output_dir, "ppo_reward_vs_steps.png"),
+        )
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(reward_times, reward_values, label="Reward (raw)", linewidth=1.6, alpha=0.35, color="#7c3aed")
+        ax.plot(reward_times, reward_ma, label="Reward (10-step MA)", linewidth=2.2, color="#7c3aed")
+        ax.axhline(0.0, color="#6b7280", linewidth=1.0, linestyle="--")
+        ax.set_title(f"PPO Reward vs Time\n{title}")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Reward")
+        ax.legend()
+        figures["ppo_reward_vs_time"] = _save_figure(
+            fig,
+            os.path.join(output_dir, "ppo_reward_vs_time.png"),
+        )
 
     backend = matplotlib.get_backend().lower()
     shown = show and "agg" not in backend

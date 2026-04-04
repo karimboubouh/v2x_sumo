@@ -5,7 +5,8 @@ Dynamic topology, doubly-stochastic mixing matrix.
 Adapted from v2x_sim/algorithms/dsgd/algorithm.py.
 """
 
-from algorithms.base import DLAlgorithm, LINK_INTERNET
+from algorithms.base import DLAlgorithm
+import config
 from dl.helpers import clone_state_dict
 
 
@@ -21,16 +22,18 @@ class DSGDAlgorithm(DLAlgorithm):
     needs_dynamic_neighbors = True
 
     def select_neighbors(self, v, candidates: list, env) -> tuple:
-        """Accept all current internet neighbors."""
+        """Accept candidates (sidelink + internet), capped at MAX_NEIGHBORS."""
+        max_k = int(config.MAX_NEIGHBORS)
         connections = set()
         link_types = {}
         alphas = {}
 
         for other, dist, lt in candidates:
-            if lt == LINK_INTERNET:
-                connections.add(other.id)
-                link_types[other.id] = LINK_INTERNET
-                alphas[other.id] = 1.0  # overwritten in aggregate
+            if len(connections) >= max_k:
+                break
+            connections.add(other.id)
+            link_types[other.id] = lt
+            alphas[other.id] = 1.0  # placeholder — MH weights computed in aggregate()
 
         return connections, alphas, link_types, None
 

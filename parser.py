@@ -66,37 +66,37 @@ def parse_args():
     )
     parser.add_argument(
         "--dl-algorithm",
-        default=config.DL_CFG["ALGORITHM"],
+        default=config.ALGORITHM,
         choices=get_available_algorithms(),
         dest="dl_algorithm",
-        help=f"DPL algorithm (default: {config.DL_CFG['ALGORITHM']})",
+        help=f"DPL algorithm (default: {config.ALGORITHM})",
     )
     parser.add_argument(
         "--dl-dataset",
-        default=config.DL_CFG["DATASET"],
+        default=config.DATASET,
         choices=["MNIST", "FEMNIST", "CIFAR10", "CIFAR100"],
         dest="dl_dataset",
-        help=f"DPL training dataset (default: {config.DL_CFG['DATASET']})",
+        help=f"DPL training dataset (default: {config.DATASET})",
     )
     parser.add_argument(
         "--dl-model",
-        default=config.DL_CFG["MODEL_ARCH"],
+        default=config.MODEL_ARCH,
         choices=["DNN", "CNN", "LSTM", "Transformer", "ResNet"],
         dest="dl_model",
-        help=f"DPL model architecture (default: {config.DL_CFG['MODEL_ARCH']})",
+        help=f"DPL model architecture (default: {config.MODEL_ARCH})",
     )
     parser.add_argument(
         "--rounds",
         type=int,
-        default=config.DL_CFG["MAX_TR_ROUNDS"],
+        default=config.MAX_TR_ROUNDS,
         metavar="ROUNDS",
-        help=f"Max rounds per vehicle (default: {config.DL_CFG['MAX_TR_ROUNDS']})",
+        help=f"Max rounds per vehicle (default: {config.MAX_TR_ROUNDS})",
     )
     parser.add_argument(
         "--target_acc",
         type=float,
-        default=config.DL_CFG["TARGET_ACCURACY"],
+        default=config.TARGET_ACCURACY,
         metavar="TARGET_ACC",
-        help=f"Target accuracy for automatic stop (default: {config.DL_CFG['TARGET_ACCURACY']})",
+        help=f"Target accuracy for automatic stop (default: {config.TARGET_ACCURACY})",
     )
     return parser.parse_args()

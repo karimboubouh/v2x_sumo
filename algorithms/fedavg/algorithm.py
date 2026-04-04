@@ -8,7 +8,8 @@ Adapted from v2x_sim/algorithms/fedavg/algorithm.py.
 import random
 
 from algorithms.base import DLAlgorithm, LINK_INTERNET
-from config import DL_CFG as CFG
+from algorithms.fedavg.config import SELF_WEIGHT
+import config
 from dl.helpers import clone_state_dict
 
 
@@ -24,7 +25,7 @@ class FedAvgAlgorithm(DLAlgorithm):
 
     def setup(self, vehicles: list) -> None:
         """Assign each vehicle MAX_NEIGHBORS randomly chosen peers."""
-        max_n = int(CFG["MAX_NEIGHBORS"])
+        max_n = int(config.MAX_NEIGHBORS)
         for v in vehicles:
             others = [o.id for o in vehicles if o.id != v.id]
             k = min(max_n, len(others))
@@ -48,7 +49,7 @@ class FedAvgAlgorithm(DLAlgorithm):
         if not nbr_sds:
             return
 
-        self_w = float(CFG["SELF_WEIGHT"])
+        self_w = float(SELF_WEIGHT)
         nbr_w = (1.0 - self_w) / len(nbr_sds)
 
         with v._lock:

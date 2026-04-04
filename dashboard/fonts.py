@@ -1,8 +1,13 @@
-"""Shared dashboard font loading using pygame.font and system fonts."""
+"""Shared dashboard font loading with a freetype fallback for sharper text."""
 
 import os
 
 import pygame
+
+try:
+    import pygame.freetype as pygame_freetype
+except Exception:  # pragma: no cover - optional pygame module
+    pygame_freetype = None
 
 _font_cache = {}
 
@@ -43,22 +48,43 @@ _MONO_PATHS = [
 
 
 class DashboardFont:
-    """Small wrapper to provide a freetype-like API over pygame.font.Font."""
+    """Small wrapper to provide a consistent render API across backends."""
 
-    def __init__(self, font):
+    def __init__(self, font, size, *, freetype=False, style=0):
         self._font = font
+        self._size = int(size)
+        self._freetype = bool(freetype)
+        self._style = int(style)
 
     def render(self, text, color):
+        if self._freetype:
+            return self._font.render(
+                str(text),
+                fgcolor=color,
+                size=self._size,
+                style=self._style,
+            )
         surf = self._font.render(str(text), True, color)
         return surf, surf.get_rect()
 
     def render_to(self, surface, pos, text, color):
+        if self._freetype:
+            return self._font.render_to(
+                surface,
+                pos,
+                str(text),
+                fgcolor=color,
+                size=self._size,
+                style=self._style,
+            )
         surf, rect = self.render(text, color)
         surface.blit(surf, pos)
         return rect.move(pos)
 
 
 def _ensure_font_module():
+    if pygame_freetype is not None and not pygame_freetype.get_init():
+        pygame_freetype.init()
     if not pygame.font.get_init():
         pygame.font.init()
 
@@ -95,11 +121,28 @@ def get_font(size, bold=False, mono=False):
     paths = _MONO_PATHS if mono else _SANS_PATHS
     font_path = _pick_font_path(names, paths, bold=bold)
 
-    if font_path is not None:
-        font = pygame.font.Font(font_path, int(size))
-        font.set_bold(bool(bold))
+    if pygame_freetype is not None:
+        if font_path is not None:
+            font = pygame_freetype.Font(font_path, int(size))
+        else:
+            font = pygame_freetype.SysFont(names[0], int(size), bold=bold)
+        if hasattr(font, "antialiased"):
+            font.antialiased = True
+        if hasattr(font, "kerning"):
+            font.kerning = True
+        if hasattr(font, "origin"):
+            font.origin = False
+        if hasattr(font, "pad"):
+            font.pad = False
+        style = pygame_freetype.STYLE_STRONG if bold else pygame_freetype.STYLE_DEFAULT
+        wrapped = DashboardFont(font, size, freetype=True, style=style)
     else:
-        font = pygame.font.SysFont(names[0], int(size), bold=bold)
+        if font_path is not None:
+            font = pygame.font.Font(font_path, int(size))
+            font.set_bold(bool(bold))
+        else:
+            font = pygame.font.SysFont(names[0], int(size), bold=bold)
+        wrapped = DashboardFont(font, size)
 
-    _font_cache[key] = DashboardFont(font)
+    _font_cache[key] = wrapped
     return _font_cache[key]

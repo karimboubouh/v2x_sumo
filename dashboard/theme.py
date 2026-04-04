@@ -1,118 +1,158 @@
-"""Theme manager: dark/light mode with macOS system detection."""
+"""Theme manager — dark / light mode, returns QColor values."""
 
+from __future__ import annotations
 import subprocess
+import sys
+
+from PySide6.QtGui import QColor
 
 import config
 
-_THEMES = {
-    "dark": {
-        "bg": (30, 30, 30),
-        "road": (80, 80, 80),
-        "text": (220, 220, 220),
-        "text_secondary": (120, 120, 140),
-        "separator": (60, 60, 60),
-        "log_bg": (20, 20, 25),
-        "log_hello": (100, 200, 100),
-        "log_data": (100, 150, 255),
-        "log_fl": (255, 180, 50),
-        "log_link": (80, 210, 160),
-        "log_weight": (255, 180, 50),
-        "log_training": (120, 180, 255),
-        "log_status": (210, 210, 210),
-        "log_warning": (255, 120, 120),
-        "link_strong": (0, 200, 80),
-        "link_weak": (200, 60, 60),
-        "vehicle_outline": (255, 255, 255),
-        "menu_bg": (40, 40, 45),
-        "menu_hover": (65, 65, 75),
-        "menu_text": (210, 210, 210),
-        "menu_border": (60, 60, 70),
-        "divider": (70, 70, 90),
-        "pause_label": (255, 220, 60),
-        "status_bg": (25, 25, 30),
-        "status_bar_bg": (50, 50, 60),
-    },
-    "light": {
-        "bg": (240, 240, 245),
-        "road": (170, 170, 185),
-        "text": (30, 30, 35),
-        "text_secondary": (100, 100, 120),
-        "separator": (195, 195, 205),
-        "log_bg": (230, 230, 238),
-        "log_hello": (30, 140, 30),
-        "log_data": (30, 80, 200),
-        "log_fl": (180, 120, 0),
-        "log_link": (0, 120, 90),
-        "log_weight": (180, 120, 0),
-        "log_training": (40, 90, 190),
-        "log_status": (60, 60, 70),
-        "log_warning": (185, 60, 40),
-        "link_strong": (0, 160, 60),
-        "link_weak": (200, 40, 40),
-        "vehicle_outline": (40, 40, 40),
-        "menu_bg": (230, 230, 235),
-        "menu_hover": (210, 210, 220),
-        "menu_text": (30, 30, 35),
-        "menu_border": (195, 195, 205),
-        "divider": (180, 180, 195),
-        "pause_label": (180, 140, 0),
-        "status_bg": (235, 235, 240),
-        "status_bar_bg": (205, 205, 215),
-    },
+# ── Palette definitions ──────────────────────────────────────────────────────
+
+_DARK: dict[str, tuple[int, int, int]] = {
+    "bg":               (16,  18,  26),
+    "bg_alt":           (22,  24,  34),
+    "surface":          (28,  30,  42),
+    "surface_raised":   (38,  40,  56),
+    "border":           (52,  56,  78),
+    "text":             (218, 220, 230),
+    "text_secondary":   (138, 142, 162),
+    "text_dim":         (88,  92,  112),
+    # map
+    "road":             (58,  62,  82),
+    "road_edge":        (38,  42,  60),
+    # link colors
+    "link_strong":      (40,  210, 100),
+    "link_weak":        (210, 70,  70),
+    "link_sidelink":    (60,  160, 255),
+    "link_internet":    (220, 80,  80),
+    # log
+    "log_bg":           (14,  15,  22),
+    "log_hello":        (80,  200, 120),
+    "log_data":         (80,  150, 255),
+    "log_fl":           (255, 188, 58),
+    "log_link":         (58,  200, 200),
+    "log_weight":       (255, 138, 58),
+    "log_training":     (98,  158, 255),
+    "log_warning":      (255, 88,  88),
+    "log_status":       (158, 163, 183),
+    # chrome
+    "separator":        (48,  52,  72),
+    "divider":          (58,  62,  84),
+    "status_bg":        (12,  13,  20),
+    "status_bar_bg":    (32,  34,  48),
+    "progress_fill":    (48,  178, 118),
+    "progress_done":    (98,  158, 255),
+    "progress_bg":      (32,  35,  50),
+    "accent":           (62,  178, 255),
+    "pause_label":      (255, 198, 58),
+    "overlay_bg":       (10,  11,  18),
+    "menu_bg":          (22,  24,  34),
+    "menu_hover":       (42,  44,  60),
+    "menu_text":        (218, 220, 230),
+    "menu_border":      (52,  56,  78),
+    "vehicle_outline":  (255, 255, 255),
 }
 
-_current = None
-_version = 0
+_LIGHT: dict[str, tuple[int, int, int]] = {
+    "bg":               (244, 245, 250),
+    "bg_alt":           (234, 236, 244),
+    "surface":          (255, 255, 255),
+    "surface_raised":   (248, 249, 252),
+    "border":           (198, 202, 218),
+    "text":             (28,  30,  50),
+    "text_secondary":   (88,  93,  118),
+    "text_dim":         (148, 153, 175),
+    "road":             (178, 184, 204),
+    "road_edge":        (205, 208, 222),
+    "link_strong":      (18,  168, 78),
+    "link_weak":        (200, 48,  48),
+    "link_sidelink":    (18,  128, 220),
+    "link_internet":    (200, 50,  50),
+    "log_bg":           (248, 250, 254),
+    "log_hello":        (28,  148, 68),
+    "log_data":         (28,  88,  200),
+    "log_fl":           (178, 118, 18),
+    "log_link":         (18,  138, 138),
+    "log_weight":       (178, 88,  18),
+    "log_training":     (48,  98,  200),
+    "log_warning":      (200, 38,  38),
+    "log_status":       (98,  103, 130),
+    "separator":        (208, 212, 228),
+    "divider":          (193, 197, 218),
+    "status_bg":        (224, 227, 240),
+    "status_bar_bg":    (208, 212, 226),
+    "progress_fill":    (28,  148, 88),
+    "progress_done":    (48,  118, 200),
+    "progress_bg":      (210, 214, 228),
+    "accent":           (28,  138, 220),
+    "pause_label":      (200, 140, 18),
+    "overlay_bg":       (238, 240, 250),
+    "menu_bg":          (244, 245, 250),
+    "menu_hover":       (224, 228, 242),
+    "menu_text":        (28,  30,  50),
+    "menu_border":      (198, 202, 218),
+    "vehicle_outline":  (40,  40,  50),
+}
+
+# ── State ────────────────────────────────────────────────────────────────────
+
+_current: str = "dark"
+_version: int = 0
 
 
-def _detect_system_theme():
-    """Detect macOS dark/light mode. Returns 'dark' or 'light'."""
-    try:
-        result = subprocess.run(
-            ["defaults", "read", "-g", "AppleInterfaceStyle"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0 and "dark" in result.stdout.strip().lower():
-            return "dark"
-    except Exception:
-        pass
+def _detect_system() -> str:
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0 and "dark" in r.stdout.lower():
+                return "dark"
+        except Exception:
+            pass
     return "light"
 
 
-def init(mode=None):
-    """Initialize theme. mode: 'dark', 'light', or 'system' (default from config)."""
+def init(mode: str | None = None) -> None:
     global _current, _version
     if mode is None:
         mode = getattr(config, "THEME_MODE", "system")
-    if mode == "system":
-        _current = _detect_system_theme()
-    else:
-        _current = mode if mode in _THEMES else "dark"
+    _current = _detect_system() if mode == "system" else (mode if mode in ("dark", "light") else "dark")
     _version += 1
 
 
-def get():
-    """Return current theme name ('dark' or 'light')."""
-    if _current is None:
-        init()
+def get() -> str:
     return _current
 
 
-def toggle():
-    """Switch between dark and light. Returns new theme name."""
+def toggle() -> str:
     global _current, _version
-    if _current is None:
-        init()
     _current = "light" if _current == "dark" else "dark"
     _version += 1
     return _current
 
 
-def color(name):
-    """Return a color tuple for the given name in the current theme."""
-    return _THEMES[get()][name]
+def color(name: str) -> QColor:
+    """Return a QColor for the named color in the current theme."""
+    palette = _DARK if _current == "dark" else _LIGHT
+    rgb = palette.get(name, (255, 0, 255))  # magenta = missing key
+    return QColor(*rgb)
 
 
-def version():
-    """Return a monotonically increasing int that changes on every theme switch."""
+def color_alpha(name: str, alpha: int) -> QColor:
+    """Return a QColor with a custom alpha channel (0–255)."""
+    c = QColor(color(name))
+    c.setAlpha(max(0, min(255, alpha)))
+    return c
+
+
+def version() -> int:
     return _version
+
+
+# Legacy shim — some call sites use with_alpha(name, alpha)
+def with_alpha(name: str, alpha: int) -> QColor:
+    return color_alpha(name, alpha)

@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from algorithms.base import LINK_INTERNET, LINK_SIDELINK
-from config import DL_CFG as CFG
+import config
 from dl.data import get_n_classes
 from dl.models import build_model
 from dl.helpers import _inf_loader, clone_state_dict
@@ -63,19 +63,20 @@ class Vehicle:
         # SUMO position — updated each step by update_from_sumo()
         self.pos = np.array([0.0, 0.0])
         self.heading = 0.0
+        self.speed = 0.0
 
         # Network size for feature normalization
         x_min, y_min, x_max, y_max = network_bounds
         self._network_size = max(x_max - x_min, y_max - y_min, 1.0)
 
         # DPL model
-        self.model = build_model(CFG["DATASET"], CFG["MODEL_ARCH"])
+        self.model = build_model(config.DATASET, config.MODEL_ARCH)
         self._lock = threading.Lock()
         self.train_loader = train_loader
         self._inf_iter = _inf_loader(train_loader)
-        self.n_classes = get_n_classes(CFG["DATASET"])
+        self.n_classes = get_n_classes(config.DATASET)
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=CFG["LOCAL_LR"]
+            self.model.parameters(), lr=config.LOCAL_LR
         )
         self.criterion = nn.CrossEntropyLoss()
 
@@ -89,6 +90,7 @@ class Vehicle:
         self.alphas = {}               # {nid: alpha} aggregation weights
         self.link_types = {}           # {nid: LINK_SIDELINK | LINK_INTERNET}
         self.static_neighbors = []     # populated by FedAvg setup()
+        self.is_byzantine = False
 
         # Reference to the active DLAlgorithm (injected by DLEnvironment)
         self._algo = None
@@ -102,6 +104,7 @@ class Vehicle:
         self._prev_loss = init_loss
         self.loss_hist = []
         self.acc_hist = []
+        self.reward_hist = []
         self.round_time_hist = []
         self.computation_energy_hist = []
         self.computation_energy_j = 0.0
@@ -130,6 +133,7 @@ class Vehicle:
                           angle is SUMO's degrees clockwise from north.
         """
         self.pos = np.array([vehicle_state.x, vehicle_state.y])
+        self.speed = float(vehicle_state.speed)
         if sim_time is not None:
             self.last_sim_time = float(sim_time)
         # Convert SUMO angle (degrees CW from north) to radians
@@ -154,22 +158,22 @@ class Vehicle:
 
     def own_features(self) -> np.ndarray:
         """
-        Compact state vector (OWN_DIM=6).
+        Compact state vector (6 features).
         [0] loss / 5
         [1] current_acc
         [2] |connections| / MAX_NEIGHBORS
         [3] pos_x / network_size
         [4] pos_y / network_size
-        [5] 0.0 (reserved)
+        [5] Byzantine flag
         """
         ns = self._network_size
         return np.array([
             float(np.clip(self.current_loss, 0.0, 5.0)) / 5.0,
             float(np.clip(self.current_acc, 0.0, 1.0)),
-            len(self.connections) / max(CFG["MAX_NEIGHBORS"], 1),
+            len(self.connections) / max(config.MAX_NEIGHBORS, 1),
             float(np.clip(self.pos[0] / ns, 0.0, 1.0)),
             float(np.clip(self.pos[1] / ns, 0.0, 1.0)),
-            0.0,
+            float(self.is_byzantine),
         ], dtype=np.float32)
 
     # ── Background training round ─────────────────────────────────────────────
@@ -188,7 +192,7 @@ class Vehicle:
             self.model.train()
             total_loss, total_correct, total_n = 0.0, 0, 0
 
-            for _ in range(CFG["BATCHES_PER_ROUND"]):
+            for _ in range(config.BATCHES_PER_ROUND):
                 images, labels = next(self._inf_iter)
                 self.optimizer.zero_grad()
                 logits = self.model(images)
@@ -214,9 +218,9 @@ class Vehicle:
             round_time_s = time.perf_counter() - round_started
             # Theoretical DVFS computation energy: E = κ · I·|D_k| · L_k · f_k²
             # total_n = I × |D_k| (actual samples processed this round)
-            kappa = float(CFG["KAPPA"])
-            f_k = float(CFG["CPU_FREQ_HZ"])
-            L_k = float(CFG["CPU_CYCLES_PER_SAMPLE"])
+            kappa = float(config.KAPPA)
+            f_k = float(config.CPU_FREQ_HZ)
+            L_k = float(config.CPU_CYCLES_PER_SAMPLE)
             computation_energy_j = kappa * total_n * L_k * (f_k ** 2)
 
             with self._lock:
@@ -246,21 +250,21 @@ class Vehicle:
             )
 
             if (
-                CFG["TARGET_ACCURACY"] <= 1.0
-                and avg_acc >= CFG["TARGET_ACCURACY"]
+                config.TARGET_ACCURACY <= 1.0
+                and avg_acc >= config.TARGET_ACCURACY
                 and not self._target_accuracy_announced
             ):
                 self._target_accuracy_announced = True
                 self._emit_event(
                     "training",
                     f"vehicle {self.sumo_id} reached target accuracy "
-                    f"({avg_acc:.2%} >= {CFG['TARGET_ACCURACY']:.2%})",
+                    f"({avg_acc:.2%} >= {config.TARGET_ACCURACY:.2%})",
                 )
 
-            if CFG["TARGET_ACCURACY"] <= 1.0:
-                _finished = avg_acc >= CFG["TARGET_ACCURACY"]
-            elif CFG["MAX_TR_ROUNDS"] > 0:
-                _finished = round_n >= CFG["MAX_TR_ROUNDS"]
+            if config.TARGET_ACCURACY <= 1.0:
+                _finished = avg_acc >= config.TARGET_ACCURACY
+            elif config.MAX_TR_ROUNDS > 0:
+                _finished = round_n >= config.MAX_TR_ROUNDS
             else:
                 _finished = False
 

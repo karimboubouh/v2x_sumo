@@ -70,8 +70,11 @@ TIME_TO_TELEPORT = 10  # Seconds before a stuck vehicle is teleported (-1 = disa
 # ---------------------------------------------------------------------------
 # Communication parameters (V2V)
 # ---------------------------------------------------------------------------
-COMM_RANGE = 500.0  # Maximum communication range in meters
+COMM_RANGE = 250.0  # 5G sidelink maximum communication range in meters
+INTERNET_RANGE = 2000.0  # Internet maximum communication range in meters
+INTERNET_QUALITY_THRESHOLD = 0.05  # intentionally loose — let GAT_PPO/GGC decide quality
 MAX_NEIGHBORS = 5  # Maximum V2V connections per vehicle (top-N by signal quality)
+MAX_INTERNET_NEIGHBORS = 3
 COMM_POWER_DBM = -30.0  # Transmit power (reference at 1m)
 PATH_LOSS_EXPONENT = 2.5  # Urban environment
 NOISE_FLOOR_DBM = -90.0  # Receiver noise floor
@@ -79,78 +82,72 @@ SNR_THRESHOLD_DB = 10.0  # Minimum SNR for 50% delivery probability
 BEACON_INTERVAL = 5.0  # Seconds between hello beacons
 MESSAGE_TTL = 10  # Max retry steps for undelivered messages
 
+
+# ── Shannon Channel Model (TX energy) ────────────────────
+SL_BANDWIDTH_HZ = 10e6  # 10 MHz
+SL_TX_POWER_W = 0.020  # 20 mW
+SL_SNR_AT_MAX_RANGE_DB = 10.0
+INET_BANDWIDTH_HZ = 20e6  # 20 MHz
+INET_TX_POWER_W = 0.200  # 200 mW
+INET_SNR_DB = 20.0
+
+
 # ---------------------------------------------------------------------------
 # Dashboard / UI parameters
 # ---------------------------------------------------------------------------
-WINDOW_WIDTH = 1200
-WINDOW_HEIGHT = 800
-MAP_PANEL_HEIGHT = 500
-LOG_PANEL_HEIGHT = 300
-FPS = 120  # Target render frames per second (independent of simulation rate)
-FONT_SIZE = 14
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 820
+MAP_PANEL_HEIGHT = 540
+LOG_PANEL_HEIGHT = 220
+FPS = 20           # processEvents cadence hint; Qt drives its own paint loop
+FONT_SIZE = 13
 LOG_MAX_LINES = None  # Keep the full message log from the start of the simulation
 STATUS_BAR_HEIGHT = 56  # Bottom status bar height (pixels)
+FL_LABEL_MIN_ZOOM = 3.0  # minimum zoom multiple at which α labels appear on FL links
+DPI_SCALE = 1.0    # Manual DPI hint (1.0 = auto; 2.0 forces HiDPI scaling tweaks)
 
 # ---------------------------------------------------------------------------
 # Decentralized Personalized Learning (DPL)
 # ---------------------------------------------------------------------------
-DL_CFG = {
-    # ── Algorithm ────────────────────────────────────────────
-    "ALGORITHM": "FedAvg",  # name of any algorithm in algorithms/<name>/algorithm.py
+# ── Algorithm ────────────────────────────────────────────
+ALGORITHM = "FedAvg"  # name of any algorithm in algorithms/<name>/algorithm.py
 
-    # ── Termination ──────────────────────────────────────────
-    "MAX_TR_ROUNDS": 100,
-    "TARGET_ACCURACY": 0.97,  # disable early stopping by default using 1.01
-    "EVAL_ROUNDS": 5,  # evaluate global test metrics every N shared rounds
+# ── Termination ──────────────────────────────────────────
+MAX_TR_ROUNDS = 100
+TARGET_ACCURACY = 0.97  # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
+EVAL_ROUNDS = 5  # evaluate global test metrics every N shared rounds
 
-    # ── Decentralized Learning ───────────────────────────────
-    "DATASET": "MNIST",  # MNIST | FEMNIST | CIFAR10 | CIFAR100
-    "MODEL_ARCH": "DNN",  # DNN | CNN | LSTM | Transformer | ResNet
-    "LOCAL_LR": 1e-3,  # Adam learning rate
-    "BATCH_SIZE": 32,
-    "BATCHES_PER_ROUND": 20,   # mini-batches processed per DPL training round (10×32=320 samples/round)
-    "DATA_ALPHA": 0.5,  # Dirichlet alpha for non-IID (0.1=very non-IID, 10.0~IID)
-    "SELF_WEIGHT": 0.3,  # personalized aggregation weight (applied in FedAvg and DPFL)
+# ── Decentralized Learning ───────────────────────────────
+DATASET = "MNIST"  # MNIST | FEMNIST | CIFAR10 | CIFAR100
+MODEL_ARCH = "DNN"  # DNN | CNN | LSTM | Transformer | ResNet
+LOCAL_LR = 1e-3  # Adam learning rate
+BATCH_SIZE = 32
+BATCHES_PER_ROUND = 20  # mini-batches processed per DPL training round (20×32=640 samples/round)
+DATA_ALPHA = 0.5  # Dirichlet alpha for non-IID (0.1=very non-IID, 10.0~IID)
 
-    # ── Computation energy model (DVFS) ──────────────────────
-    "KAPPA": 1e-28,  # κ — effective switched capacitance (F·cycle⁻²)
-    #   mobile phone (Snapdragon/Apple A-series): ~1e-27
-    #   Raspberry Pi (ARM Cortex-A53/A72):        ~5e-27
-    #   vehicle compute (Tesla FSD chip):          ~1e-27
-    #   laptop CPU (Intel Core / AMD Ryzen):       ~1e-26
-    #   server CPU (Intel Xeon / AMD EPYC):        ~5e-26
-    "CPU_FREQ_HZ": 1e9,  # f_k — local CPU frequency in Hz (1 GHz)
-    "CPU_CYCLES_PER_SAMPLE": 1e5,  # L_k — CPU cycles per training sample
-    #   MNIST   28×28×1  DNN:             ~1e5
-    #   FEMNIST 28×28×1  DNN:             ~1e5
-    #   CIFAR-10  32×32×3  CNN:           ~1e7
-    #   CIFAR-100 32×32×3  ResNet:        ~5e7
+# Algorithm-specific settings such as personalized aggregation weights and
+# GAT/PPO feature dimensions live in algorithms/<name>/config.py.
 
-    # ── Transmission sparsification ──────────────────────────
-    "COMPRESSION_RATIO": 1.0,  # γ — fraction of model params transmitted (1.0 = full model)
+# ── Computation energy model (DVFS) ──────────────────────
+KAPPA = 1e-28  # κ — effective switched capacitance (F·cycle⁻²)
+#   mobile phone (Snapdragon/Apple A-series): ~1e-27
+#   Raspberry Pi (ARM Cortex-A53/A72):        ~5e-27
+#   vehicle compute (Tesla FSD chip):          ~1e-27
+#   laptop CPU (Intel Core / AMD Ryzen):       ~1e-26
+#   server CPU (Intel Xeon / AMD EPYC):        ~5e-26
+CPU_FREQ_HZ = 1e9  # f_k — local CPU frequency in Hz (1 GHz)
+CPU_CYCLES_PER_SAMPLE = 1e5  # L_k — CPU cycles per training sample
+#   MNIST   28×28×1  DNN:             ~1e5
+#   FEMNIST 28×28×1  DNN:             ~1e5
+#   CIFAR-10  32×32×3  CNN:           ~1e7
+#   CIFAR-100 32×32×3  ResNet:        ~5e7
 
-    # ── V2X Network ──────────────────────────────────────────
-    "V2X_RANGE": 250.0,  # sidelink range (m)
-    "MAX_NEIGHBORS": 10,
-    "INTERNET_RANGE": 2000.0,
-    "MAX_INTERNET_NEIGHBORS": 3,
-    "INTERNET_QUALITY_THRESHOLD": 0.45,
+# ── Transmission sparsification ──────────────────────────
+COMPRESSION_RATIO = 1.0  # γ — fraction of model params transmitted (1.0 = full model)
 
-    # ── Shannon Channel Model (TX energy) ────────────────────
-    "SL_BANDWIDTH_HZ": 10e6,  # 10 MHz
-    "SL_TX_POWER_W": 0.020,  # 20 mW
-    "SL_SNR_AT_MAX_RANGE_DB": 10.0,
-    "INET_BANDWIDTH_HZ": 20e6,  # 20 MHz
-    "INET_TX_POWER_W": 0.200,  # 200 mW
-    "INET_SNR_DB": 20.0,
 
-    # ── Threading ────────────────────────────────────────────
-    "N_TRAIN_WORKERS": 10,
-
-    # ── Feature dimensions ───────────────────────────────────
-    "OWN_DIM": 6,
-    "NBR_DIM": 6,
-}
+# ── Threading ────────────────────────────────────────────
+N_TRAIN_WORKERS = 10
 
 # Theme: "dark", "light", or "system" (auto-detect from macOS appearance)
 THEME_MODE = "system"

@@ -10,7 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from algorithms.base import DLAlgorithm, LINK_INTERNET
-from config import DL_CFG as CFG
+from algorithms.dpfl.config import DPFL_UPDATE_EVERY, SELF_WEIGHT
+import config
 from dl.helpers import clone_state_dict
 
 
@@ -27,7 +28,6 @@ class DPFLAlgorithm(DLAlgorithm):
     needs_dynamic_neighbors = True
 
     def __init__(self):
-        from algorithms.dpfl.config import DPFL_UPDATE_EVERY
         self._update_every = DPFL_UPDATE_EVERY
         self._temp_model = None
 
@@ -40,7 +40,7 @@ class DPFLAlgorithm(DLAlgorithm):
             v._dpfl_alphas = {}
             v._dpfl_last_update = -(self._update_every + 1)
 
-        self._temp_model = build_model(CFG["DATASET"], CFG["MODEL_ARCH"])
+        self._temp_model = build_model(config.DATASET, config.MODEL_ARCH)
         self._temp_model.eval()
 
     def select_neighbors(self, v, candidates: list, env) -> tuple:
@@ -65,7 +65,7 @@ class DPFLAlgorithm(DLAlgorithm):
             return
 
         nbr_sds = [nbr.get_shared_weights() for nbr in accepted]
-        self_w = float(CFG["SELF_WEIGHT"])
+        self_w = float(SELF_WEIGHT)
         nbr_w = (1.0 - self_w) / len(nbr_sds)
 
         with v._lock:
@@ -91,7 +91,7 @@ class DPFLAlgorithm(DLAlgorithm):
             v._dpfl_last_update = v.tr_rounds
             return
 
-        budget = min(int(CFG["MAX_NEIGHBORS"]), len(candidate_dict))
+        budget = min(int(config.MAX_NEIGHBORS), len(candidate_dict))
         X = {}
         base_reward = self._eval_reward(v, [], val_images, val_labels)
         remaining = dict(candidate_dict)

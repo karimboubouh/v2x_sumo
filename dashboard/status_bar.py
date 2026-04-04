@@ -1,236 +1,239 @@
-"""Bottom status bar showing system resource usage and DPL progress."""
+"""StatusWidget — bottom bar with training progress and system metrics."""
+
+from __future__ import annotations
 
 import time
 
 import psutil
-import pygame
 
-from dashboard.fonts import get_font
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
+from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QFontMetrics
+from PySide6.QtWidgets import QWidget, QSizePolicy
+
 from dashboard import theme
 
 
-class StatusBar:
-    """Bottom bar showing a single merged header row, progress bar, and metrics."""
+class StatusWidget(QWidget):
+    """Compact status bar: header row · progress bar · metrics row."""
 
-    def __init__(self, rect, dpi_scale=1.0):
-        self.rect = rect
-        self.dpi_scale = dpi_scale
-        self._font_size = int(12 * dpi_scale)
-        self._small_font_size = max(int(11 * dpi_scale), 10)
+    def __init__(self, dpi_scale: float = 1.0, parent=None) -> None:
+        super().__init__(parent)
+        self._dpi = dpi_scale
+        self._training_status: dict | None = None
         self._start_time = time.monotonic()
+
+        # System metrics
         self._process = psutil.Process()
+        self._process.cpu_percent()           # prime the counter
+        self._cpu  = 0.0
+        self._mem_mb = 0.0
+        self._gpu: float | None = None
 
-        self._last_sample = 0.0
-        self._sample_interval = 1.0
-        self._proc_cpu = 0.0
-        self._proc_mem_mb = 0.0
-        self._gpu_pct = None
+        self._sample_timer = QTimer(self)
+        self._sample_timer.setInterval(1000)
+        self._sample_timer.timeout.connect(self._sample_metrics)
+        self._sample_timer.start()
 
-        self._process.cpu_percent()
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setAutoFillBackground(False)
 
-    def _sample(self):
-        """Update metrics if enough time has elapsed."""
-        now = time.monotonic()
-        if now - self._last_sample < self._sample_interval:
-            return
-        self._last_sample = now
+    # ── Data update ───────────────────────────────────────────────────────────
 
-        self._proc_cpu = self._process.cpu_percent()
-        mem_info = self._process.memory_info()
-        self._proc_mem_mb = mem_info.rss / (1024 * 1024)
+    def update_status(self, training_status: dict | None) -> None:
+        self._training_status = training_status
+        self.update()
 
-        self._gpu_pct = self._sample_gpu()
+    # ── Metrics sampling ──────────────────────────────────────────────────────
 
-    def _sample_gpu(self):
-        """Try to get GPU utilization. Returns percentage or None."""
+    def _sample_metrics(self) -> None:
+        self._cpu    = self._process.cpu_percent()
+        self._mem_mb = self._process.memory_info().rss / (1024 * 1024)
+        self._gpu    = self._sample_gpu()
+        self.update()
+
+    @staticmethod
+    def _sample_gpu() -> float | None:
         try:
             import subprocess
-            result = subprocess.run(
+            r = subprocess.run(
                 ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
-                capture_output=True,
-                text=True,
-                timeout=1,
+                capture_output=True, text=True, timeout=1,
             )
-            if "Device Utilization %" in result.stdout:
-                for line in result.stdout.splitlines():
-                    if "Device Utilization %" in line:
-                        val = line.split("=")[-1].strip().rstrip("%").strip()
-                        return float(val)
+            for line in r.stdout.splitlines():
+                if "Device Utilization %" in line:
+                    val = line.split("=")[-1].strip().rstrip("%").strip()
+                    return float(val)
         except Exception:
             pass
         return None
 
-    def _format_duration(self, seconds):
-        seconds = max(float(seconds or 0.0), 0.0)
-        hours, rem = divmod(int(seconds), 3600)
-        mins, secs = divmod(rem, 60)
-        if hours:
-            return f"{hours:02d}:{mins:02d}:{secs:02d}"
-        return f"{mins:02d}:{secs:02d}"
+    @staticmethod
+    def _fmt_dur(seconds: float) -> str:
+        s = max(int(seconds), 0)
+        h, rem = divmod(s, 3600)
+        m, sc  = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{sc:02d}" if h else f"{m:02d}:{sc:02d}"
 
-    def _draw_segmented_text(self, surface, rect, segments, font, label_font):
-        """Draw label/value segments on a single line until space runs out."""
-        x = rect.x
-        y = rect.y
-        for idx, (label, value) in enumerate(segments):
-            lbl_surf, _ = label_font.render(label, theme.color("text_secondary"))
-            val_surf, _ = font.render(value, theme.color("text"))
-            width = lbl_surf.get_width() + val_surf.get_width()
-            if idx < len(segments) - 1:
-                dot_surf, _ = font.render("  ·  ", theme.color("text_secondary"))
-                width += dot_surf.get_width()
-            if x + width > rect.right:
-                break
-            surface.blit(lbl_surf, (x, y))
-            x += lbl_surf.get_width()
-            surface.blit(val_surf, (x, y))
-            x += val_surf.get_width()
-            if idx < len(segments) - 1:
-                dot_surf, _ = font.render("  ·  ", theme.color("text_secondary"))
-                surface.blit(dot_surf, (x, y))
-                x += dot_surf.get_width()
+    # ── Paint ─────────────────────────────────────────────────────────────────
 
-    def _draw_merged_header(self, surface, rect, training_status):
-        """Single row: Runtime + DPL round/ETA/vehicles + system CPU/RAM."""
-        font = get_font(self._small_font_size)
-        label_font = get_font(self._small_font_size, bold=True)
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        d = self._dpi
+        ts = self._training_status
 
+        # Background + top border
+        painter.fillRect(self.rect(), theme.color("status_bg"))
+        painter.setPen(QPen(theme.color("separator"), 1.0))
+        painter.drawLine(0, 0, self.width(), 0)
+
+        pad_x = int(10 * d)
+        pad_y = int(5 * d)
+        inner_x  = pad_x
+        inner_y  = pad_y
+        inner_w  = self.width() - 2 * pad_x
+        inner_h  = self.height() - 2 * pad_y
+
+        # ── Header row ────────────────────────────────────────────────────────
+        hdr_font = QFont()
+        hdr_font.setPointSize(int(8.5 * d))
+        hdr_font.setWeight(QFont.DemiBold)
+        val_font = QFont()
+        val_font.setPointSize(int(8.5 * d))
+
+        hdr_h = QFontMetrics(hdr_font).height()
+
+        segments = self._build_segments(ts)
+        self._draw_segments(
+            painter,
+            QRectF(inner_x, inner_y, inner_w, hdr_h),
+            segments,
+            hdr_font, val_font,
+        )
+
+        if ts and ts.get("enabled"):
+            gap     = int(4 * d)
+            bar_top = inner_y + hdr_h + gap
+
+            # ── Progress bar ─────────────────────────────────────────────────
+            bar_h   = max(int(8 * d), 6)
+            bar_w   = inner_w
+            progress = max(0.0, min(float(ts.get("progress", 0.0)), 1.0))
+
+            # Track
+            track_c = theme.color("progress_bg")
+            painter.setBrush(QBrush(track_c))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(QRectF(inner_x, bar_top, bar_w, bar_h), 3, 3)
+
+            # Fill
+            fill_w = int(bar_w * progress)
+            if fill_w > 0:
+                fc = theme.color("progress_done" if ts.get("done") else "progress_fill")
+                painter.setBrush(QBrush(fc))
+                painter.drawRoundedRect(QRectF(inner_x, bar_top, fill_w, bar_h), 3, 3)
+
+            # ── Metrics row ───────────────────────────────────────────────────
+            met_font = QFont()
+            met_font.setPointSize(int(8 * d))
+            met_font.setStyleHint(QFont.Monospace)
+            met_y = bar_top + bar_h + gap + QFontMetrics(met_font).ascent()
+
+            train_text = (
+                f"Train  acc {ts.get('train_acc', 0.0):.2%}  "
+                f"loss {ts.get('train_loss', 0.0):.4f}"
+            )
+            painter.setFont(met_font)
+            painter.setPen(theme.color("text"))
+            painter.drawText(QPointF(inner_x, met_y), train_text)
+
+            # Right side: init → test
+            right = self._right_metrics_text(ts)
+            if right:
+                fm = QFontMetrics(met_font)
+                rw = fm.horizontalAdvance(right)
+                rx = inner_x + inner_w - rw
+                min_x = inner_x + fm.horizontalAdvance(train_text) + int(16 * d)
+                if rx >= min_x:
+                    painter.setPen(theme.color("text_secondary"))
+                    painter.drawText(QPointF(rx, met_y), right)
+
+        painter.end()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _build_segments(self, ts: dict | None) -> list[tuple[str, str]]:
         elapsed = time.monotonic() - self._start_time
-        segments = [("Runtime: ", self._format_duration(elapsed))]
+        segs: list[tuple[str, str]] = [("Runtime: ", self._fmt_dur(elapsed))]
 
-        if training_status and training_status.get("enabled"):
-            round_n = int(training_status["round"])
-            max_rounds = max(int(training_status["max_rounds"]), 1)
-            segments.append(("Round: ", f"{round_n}/{max_rounds}"))
-            segments.append(("ETA: ", self._format_duration(training_status["remaining_time"])))
-            segments.append(("Active: ", f"{training_status['active_trainers']}/{training_status['vehicle_count']}"))
-            segments.append(("Done: ", f"{training_status['done_vehicles']}/{training_status['vehicle_count']}"))
-            target_acc = float(training_status["target_acc"])
-            if target_acc <= 1.0:
-                segments.append(("Target: ", f"{target_acc:.2%}"))
+        if ts and ts.get("enabled"):
+            algo = ts.get("algorithm")
+            if algo:
+                segs.append(("Algo: ", str(algo)))
+            rn  = int(ts.get("round", 0))
+            mr  = max(int(ts.get("max_rounds", 1)), 1)
+            segs.append(("Round: ", f"{rn}/{mr}"))
+            segs.append(("ETA: ", self._fmt_dur(ts.get("remaining_time", 0.0))))
+            segs.append(("Active: ", f"{ts.get('active_trainers',0)}/{ts.get('vehicle_count',0)}"))
+            segs.append(("Done: ", f"{ts.get('done_vehicles',0)}/{ts.get('vehicle_count',0)}"))
+            tgt = float(ts.get("target_acc", 2.0))
+            if tgt < 1.0:
+                segs.append(("Target: ", f"{tgt:.2%}"))
+            if "PPO" in str(algo or ""):
+                segs.append(("Reward: ", f"{ts.get('avg_reward', 0.0):+.3f}"))
         else:
-            segments.append(("DPL: ", "disabled"))
+            segs.append(("DPL: ", "disabled"))
 
-        segments.append(("CPU: ", f"{self._proc_cpu:.1f}%"))
-        if self._gpu_pct is not None:
-            segments.append(("GPU: ", f"{self._gpu_pct:.0f}%"))
-        segments.append(("RAM: ", f"{self._proc_mem_mb:.0f} MB"))
+        segs.append(("CPU: ", f"{self._cpu:.1f}%"))
+        if self._gpu is not None:
+            segs.append(("GPU: ", f"{self._gpu:.0f}%"))
+        segs.append(("RAM: ", f"{self._mem_mb:.0f} MB"))
+        return segs
 
-        self._draw_segmented_text(surface, rect, segments, font, label_font)
+    @staticmethod
+    def _draw_segments(
+        painter: QPainter,
+        rect: QRectF,
+        segments: list[tuple[str, str]],
+        lbl_font: QFont,
+        val_font: QFont,
+    ) -> None:
+        lbl_fm = QFontMetrics(lbl_font)
+        val_fm = QFontMetrics(val_font)
+        sep_w  = val_fm.horizontalAdvance("  ·  ")
+        x      = rect.x()
+        y      = rect.y() + lbl_fm.ascent()
 
-    def _draw_progress_and_metrics(self, surface, rect, training_status):
-        """Progress bar + train/init-test/test metrics row."""
-        d = self.dpi_scale
+        for i, (label, value) in enumerate(segments):
+            lbl_w = lbl_fm.horizontalAdvance(label)
+            val_w = val_fm.horizontalAdvance(value)
+            extra = sep_w if i < len(segments) - 1 else 0
+            if x + lbl_w + val_w + extra > rect.right():
+                break
+            painter.setFont(lbl_font)
+            painter.setPen(theme.color("text_secondary"))
+            painter.drawText(QPointF(x, y), label)
+            x += lbl_w
+            painter.setFont(val_font)
+            painter.setPen(theme.color("text"))
+            painter.drawText(QPointF(x, y), value)
+            x += val_w
+            if i < len(segments) - 1:
+                painter.setPen(theme.color("text_dim"))
+                painter.drawText(QPointF(x, y), "  ·  ")
+                x += sep_w
 
-        if not training_status or not training_status.get("enabled"):
-            return
-
-        # Progress bar
-        progress = max(0.0, min(float(training_status["progress"]), 1.0))
-        bar_h = max(int(10 * d), 8)
-        pygame.draw.rect(
-            surface,
-            theme.color("status_bar_bg"),
-            (rect.x, rect.y, rect.width, bar_h),
-            border_radius=4,
-        )
-        fill_w = max(1, int(rect.width * progress)) if progress > 0 else 0
-        if fill_w > 0:
-            fill_color = (
-                theme.color("log_training") if training_status["done"]
-                else theme.color("link_strong")
-            )
-            pygame.draw.rect(
-                surface,
-                fill_color,
-                (rect.x, rect.y, fill_w, bar_h),
-                border_radius=4,
-            )
-
-        # Metrics row
-        small_font = get_font(max(self._small_font_size - 1, 9), mono=True)
-        metrics_y = rect.y + bar_h + int(4 * d)
-
-        train_text = (
-            f"Train acc {training_status['train_acc']:.2%}  "
-            f"loss {training_status['train_loss']:.4f}"
-        )
-        train_surf, _ = small_font.render(train_text, theme.color("text"))
-        surface.blit(train_surf, (rect.x, metrics_y))
-
-        # Right side: "Init 10.16% → Test 72.15%  0.8234  @ r10"
-        # or just test if no init, or just init if no current test yet
-        init_acc = training_status.get("init_test_acc")
-        init_loss = training_status.get("init_test_loss")
-        test_acc = training_status.get("test_acc")
-
+    @staticmethod
+    def _right_metrics_text(ts: dict) -> str:
+        init_acc  = ts.get("init_test_acc")
+        test_acc  = ts.get("test_acc")
+        test_loss = ts.get("test_loss")
+        rnd       = ts.get("test_round")
         if test_acc is not None and init_acc is not None:
-            right_text = (
-                f"Init {init_acc:.2%} → "
-                f"Test {test_acc:.2%}  "
-                f"loss {training_status['test_loss']:.4f}  "
-                f"@ r{training_status['test_round']}"
-            )
-            right_color = theme.color("text_secondary")
-        elif test_acc is not None:
-            right_text = (
-                f"Test acc {test_acc:.2%}  "
-                f"loss {training_status['test_loss']:.4f}  "
-                f"@ r{training_status['test_round']}"
-            )
-            right_color = theme.color("text_secondary")
-        elif init_acc is not None:
-            right_text = f"Init test {init_acc:.2%}  loss {init_loss:.4f}"
-            right_color = theme.color("text_secondary")
-        else:
-            right_text = ""
-            right_color = theme.color("text_secondary")
-
-        if right_text:
-            right_surf, _ = small_font.render(right_text, right_color)
-            right_x = rect.right - right_surf.get_width()
-            min_x = rect.x + train_surf.get_width() + int(12 * d)
-            if right_x >= min_x:
-                surface.blit(right_surf, (right_x, metrics_y))
-            else:
-                surface.blit(right_surf, (rect.x, metrics_y + int(10 * d)))
-
-    def draw(self, surface, training_status=None):
-        """Draw the status bar."""
-        self._sample()
-
-        d = self.dpi_scale
-        pad_x = int(8 * d)
-        pad_y = int(6 * d)
-
-        pygame.draw.rect(surface, theme.color("status_bg"), self.rect)
-        pygame.draw.line(
-            surface,
-            theme.color("separator"),
-            (self.rect.x, self.rect.y),
-            (self.rect.x + self.rect.width, self.rect.y),
-        )
-
-        inner = pygame.Rect(
-            self.rect.x + pad_x,
-            self.rect.y + pad_y,
-            self.rect.width - 2 * pad_x,
-            self.rect.height - 2 * pad_y,
-        )
-        header_h = int(14 * d)
-        gap = int(6 * d)
-
-        header_rect = pygame.Rect(inner.x, inner.y, inner.width, header_h)
-        progress_rect = pygame.Rect(
-            inner.x,
-            inner.y + header_h + gap,
-            inner.width,
-            inner.bottom - (inner.y + header_h + gap),
-        )
-
-        self._draw_merged_header(surface, header_rect, training_status)
-        self._draw_progress_and_metrics(surface, progress_rect, training_status)
-
-    def invalidate_caches(self):
-        """Clear any theme-dependent caches."""
-        pass
+            return (f"Init {init_acc:.2%} → Test {test_acc:.2%}  "
+                    f"loss {test_loss:.4f}  @ r{rnd}")
+        if test_acc is not None:
+            return f"Test {test_acc:.2%}  loss {test_loss:.4f}  @ r{rnd}"
+        if init_acc is not None:
+            return f"Init test {init_acc:.2%}  loss {ts.get('init_test_loss', 0.0):.4f}"
+        return ""

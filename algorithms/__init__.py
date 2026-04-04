@@ -10,8 +10,8 @@ automatically at import time by scanning all subfolders.
 
 Usage:
     from algorithms import build_algorithm, get_available_algorithms
-    from config import DL_CFG
-    algo = build_algorithm(DL_CFG)
+    import config
+    algo = build_algorithm(config.ALGORITHM)
     algo.setup(vehicles)
 """
 
@@ -65,16 +65,15 @@ def get_available_algorithms() -> list[str]:
     return sorted(_REGISTRY.keys())
 
 
-def build_algorithm(cfg: dict) -> DLAlgorithm:
-    """Instantiate and return the algorithm specified by cfg["ALGORITHM"].
+def build_algorithm(name: str) -> DLAlgorithm:
+    """Instantiate and return the algorithm specified by name.
 
     Each algorithm class is called with no arguments; algorithm-specific
     parameters are read from the algorithm's own config.py at construction time.
 
     Raises:
-        ValueError: if cfg["ALGORITHM"] does not match any discovered algorithm.
+        ValueError: if name does not match any discovered algorithm.
     """
-    name = cfg["ALGORITHM"]
     if name not in _REGISTRY:
         available = ", ".join(get_available_algorithms())
         raise ValueError(
@@ -83,10 +82,32 @@ def build_algorithm(cfg: dict) -> DLAlgorithm:
     return _REGISTRY[name]()
 
 
+def get_algorithm_config(name: str) -> dict:
+    """Return the uppercase settings exported by algorithms/<name>/config.py."""
+    if name not in _REGISTRY:
+        available = ", ".join(get_available_algorithms())
+        raise ValueError(
+            f"Unknown algorithm {name!r}. Available: {available}"
+        )
+
+    module_name = _REGISTRY[name].__module__.rsplit(".", 1)[0] + ".config"
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        return {}
+
+    return {
+        key: getattr(module, key)
+        for key in dir(module)
+        if key.isupper()
+    }
+
+
 __all__ = [
     "DLAlgorithm",
     "LINK_SIDELINK",
     "LINK_INTERNET",
     "build_algorithm",
+    "get_algorithm_config",
     "get_available_algorithms",
 ]
