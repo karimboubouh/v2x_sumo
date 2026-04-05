@@ -10,6 +10,7 @@ Adapted from v2x_sim/env.py.
 
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass
 
@@ -20,7 +21,7 @@ import config
 from algorithms import build_algorithm, LINK_SIDELINK, LINK_INTERNET
 from algorithms import get_algorithm_config
 from algorithms.gat_ppo.config import NBR_DIM
-from dl.helpers import eval_vehicles, inet_tx_energy_j, sl_tx_energy_j
+from dl.helpers import eval_vehicles, eval_weight_snapshots, inet_tx_energy_j, sl_tx_energy_j
 from dl.vehicle import Vehicle
 
 
@@ -77,6 +78,8 @@ class DLEnvironment:
         self._last_eval_round = 0
         self._last_eval_requested_round = 0
         self._eval_request_times = {}
+        self._pending_eval_jobs = deque()
+        self._scheduled_eval_rounds = set()
         self.train_history = []
         self.test_history = []
         self.reward_history = []
@@ -116,9 +119,23 @@ class DLEnvironment:
                 )
         self.global_loss = float(np.mean([v.current_loss for v in self.vehicles]))
         self.global_acc = float(np.mean([v.current_acc for v in self.vehicles]))
+        self.train_history.append({
+            "round": 0,
+            "time": 0.0,
+            "loss": self.global_loss,
+            "acc": self.global_acc,
+            **self._collect_energy_totals(),
+        })
         _init_test = ""
         if self.test_loader is not None:
             self.init_test_loss, self.init_test_acc = eval_vehicles(self.vehicles, self.test_loader)
+            self.test_history.append({
+                "round": 0,
+                "time": 0.0,
+                "loss": self.init_test_loss,
+                "acc": self.init_test_acc,
+            })
+            self._scheduled_eval_rounds.add(0)
             _init_test = f" | test_loss={self.init_test_loss:.4f} | test_acc={self.init_test_acc:.2%}"
         print(
             f" -> Initial model (before training) — loss={self.global_loss:.4f} | "
@@ -269,10 +286,39 @@ class DLEnvironment:
             **energies,
         })
 
-    def _evaluate_models(self, eval_round: int) -> tuple[int, float, float]:
+    def _capture_eval_snapshot(self) -> list[dict]:
+        """Return a thread-safe weight snapshot for every vehicle."""
+        return [v.get_shared_weights() for v in self.vehicles]
+
+    def _evaluate_models(self, eval_round: int, weight_snapshots: list[dict]) -> tuple[int, float, float]:
         """Run global test evaluation from thread-safe model weight snapshots."""
-        test_loss, test_acc = eval_vehicles(self.vehicles, self.test_loader)
+        test_loss, test_acc = eval_weight_snapshots(weight_snapshots, self.test_loader)
         return eval_round, test_loss, test_acc
+
+    def _dispatch_pending_eval(self, sim_time: float | None = None) -> None:
+        """Start the next queued evaluation if the worker is idle."""
+        if (
+            self._eval_future is not None
+            or self.eval_executor is None
+            or not self._pending_eval_jobs
+        ):
+            return
+
+        eval_round, eval_time, weight_snapshots = self._pending_eval_jobs.popleft()
+        self._eval_running_round = eval_round
+        self._last_eval_requested_round = max(self._last_eval_requested_round, eval_round)
+        self._eval_request_times[eval_round] = eval_time
+        self._eval_future = self.eval_executor.submit(
+            self._evaluate_models,
+            eval_round,
+            weight_snapshots,
+        )
+        if sim_time is not None:
+            self._emit_event(
+                sim_time,
+                "status",
+                f"running test evaluation at round {eval_round}",
+            )
 
     def _poll_eval_future(self, sim_time: float | None = None) -> None:
         """Commit completed async test metrics back onto the environment."""
@@ -311,44 +357,38 @@ class DLEnvironment:
         finally:
             self._eval_future = None
             self._eval_running_round = 0
+            self._dispatch_pending_eval(sim_time)
 
     def _maybe_schedule_eval(self, sim_time: float, stop_reason: str | None = None) -> None:
         """Launch async evaluation every EVAL_ROUNDS and once on final stop."""
-        if self.test_loader is None or self.eval_executor is None or self._eval_future is not None:
+        if self.test_loader is None or self.eval_executor is None:
             return
 
         eval_every = max(int(config.EVAL_ROUNDS), 1)
-        # Gate cooldown on _last_eval_round (when the last eval *completed*),
-        # not _last_eval_requested_round (when it was queued).  Without this,
-        # a slow eval that runs for >EVAL_ROUNDS would be re-scheduled the
-        # instant it finishes, keeping the status bar permanently in
-        # "test evaluating" mode.
-        should_eval = (
-            self.tr_round > self._last_eval_round
-            and self.tr_round > 0
-            and (
-                self.tr_round - self._last_eval_round >= eval_every
-                or stop_reason is not None
-            )
+        next_due_round = (
+            ((self._last_eval_requested_round // eval_every) + 1) * eval_every
+            if self._last_eval_requested_round > 0
+            else eval_every
         )
-        if not should_eval:
-            return
+        while next_due_round <= self.tr_round:
+            if next_due_round not in self._scheduled_eval_rounds:
+                self._scheduled_eval_rounds.add(next_due_round)
+                self._pending_eval_jobs.append((
+                    next_due_round,
+                    max(time.perf_counter() - self._wall_started, 0.0),
+                    self._capture_eval_snapshot(),
+                ))
+            next_due_round += eval_every
 
-        self._eval_running_round = self.tr_round
-        self._last_eval_requested_round = self.tr_round
-        self._eval_request_times[self.tr_round] = max(
-            time.perf_counter() - self._wall_started,
-            0.0,
-        )
-        self._eval_future = self.eval_executor.submit(
-            self._evaluate_models,
-            self.tr_round,
-        )
-        self._emit_event(
-            sim_time,
-            "status",
-            f"running test evaluation at round {self.tr_round}",
-        )
+        if stop_reason is not None and self.tr_round not in self._scheduled_eval_rounds:
+            self._scheduled_eval_rounds.add(self.tr_round)
+            self._pending_eval_jobs.append((
+                self.tr_round,
+                max(time.perf_counter() - self._wall_started, 0.0),
+                self._capture_eval_snapshot(),
+            ))
+
+        self._dispatch_pending_eval(sim_time)
 
     def get_progress_snapshot(self) -> dict:
         """Return a render-safe DPL progress summary for the dashboard."""
@@ -383,7 +423,7 @@ class DLEnvironment:
             "init_test_acc": self.init_test_acc,
             "eval_every": max(int(config.EVAL_ROUNDS), 1),
             "test_running": self._eval_future is not None,
-            "test_pending": self.test_loader is not None and self._last_eval_round == 0,
+            "test_pending": bool(self._pending_eval_jobs),
             "eval_running_round": self._eval_running_round,
             "active_trainers": active_trainers,
             "done_vehicles": done_vehicles,

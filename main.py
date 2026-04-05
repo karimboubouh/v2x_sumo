@@ -77,6 +77,9 @@ def main():
     running = True
     training_status = None
     plots_generated = False
+    plot_windows_active = False
+    last_logged_test_round = 0
+    final_test_logged = False
 
     # Speed multiplier: 1.0 = real-time, 2.0 = 2x faster, 0 = unlimited
     speed_mult = args.speed
@@ -175,8 +178,43 @@ def main():
                 )
             dl_complete_logged = True
 
+        def log_test_metrics(test_round, test_loss, test_acc):
+            nonlocal last_logged_test_round
+
+            if test_round is None or test_loss is None or test_acc is None:
+                return
+            if test_round <= last_logged_test_round:
+                return
+            last_logged_test_round = int(test_round)
+            logger.log(
+                f"Test Round {test_round} | "
+                f"Loss: {test_loss:.4f} | "
+                f"Acc: {test_acc:.2%}",
+                "result",
+            )
+
+        def log_final_test_metrics(training_snapshot):
+            nonlocal final_test_logged
+
+            if final_test_logged:
+                return
+
+            test_round = training_snapshot.get("test_round")
+            test_loss = training_snapshot.get("test_loss")
+            test_acc = training_snapshot.get("test_acc")
+            if test_round is None or test_loss is None or test_acc is None:
+                return
+
+            logger.log(
+                f"DPL Final Test | Round {test_round} | "
+                f"Loss: {test_loss:.4f} | "
+                f"Acc: {test_acc:.2%}",
+                "result",
+            )
+            final_test_logged = True
+
         def finalize_experiment_outputs():
-            nonlocal plots_generated
+            nonlocal plots_generated, plot_windows_active
 
             if plots_generated or dl_env is None:
                 return
@@ -206,6 +244,14 @@ def main():
             )
             logger.log(f"DPL outputs saved to {saved['experiment_dir']}", "success")
             logger.log(f"Experiment pickle: {saved['pickle_path']}")
+            if saved.get("shown"):
+                logger.log(f"Plot window backend: {saved['backend']}")
+                plot_windows_active = True
+            else:
+                logger.log(
+                    f"Plots were saved but not shown because backend '{saved['backend']}' is non-interactive",
+                    "warning",
+                )
             plots_generated = True
 
         def run_dl_step(current_vehicle_states, current_sim_time):
@@ -221,11 +267,10 @@ def main():
                     "result",
                 )
             if dl_info["new_test_data"]:
-                logger.log(
-                    f"Test Round {dl_info['test_round']} | "
-                    f"Loss: {dl_info['test_loss']:.4f} | "
-                    f"Test Acc: {dl_info['test_acc']:.2%}",
-                    "success",
+                log_test_metrics(
+                    dl_info["test_round"],
+                    dl_info["test_loss"],
+                    dl_info["test_acc"],
                 )
             if dl_info["done"]:
                 finish_dl(
@@ -306,7 +351,14 @@ def main():
                 training_status = dl_env.get_progress_snapshot()
                 render_links = dl_env.get_collaboration_links()
                 vehicle_overlays = dl_env.get_vehicle_overlays()
+                if training_status.get("test_round", 0) > last_logged_test_round:
+                    log_test_metrics(
+                        training_status.get("test_round"),
+                        training_status.get("test_loss"),
+                        training_status.get("test_acc"),
+                    )
                 if training_status["done"] and not training_status["test_running"]:
+                    log_final_test_metrics(training_status)
                     finalize_experiment_outputs()
             else:
                 render_links = log_links
@@ -325,6 +377,15 @@ def main():
             ):
                 break
             new_messages = []  # clear after handing to dashboard
+
+            if plot_windows_active:
+                from dl.experiment import pump_plot_events
+
+                pump_plot_events()
+
+            frame_sleep = render_interval - (time.perf_counter() - now)
+            if frame_sleep > 0:
+                time.sleep(frame_sleep)
 
             # Periodic console status
             if step_count > 0 and step_count % 100 == 0 and step_count != last_status_step:

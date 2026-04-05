@@ -7,7 +7,6 @@ import tempfile
 from datetime import datetime, timezone
 
 import config
-import numpy as np
 
 _xdg_cache_home = os.path.join(tempfile.gettempdir(), "sumo-xdg-cache")
 _mpl_cache_dir = os.path.join(tempfile.gettempdir(), "sumo-matplotlib-cache")
@@ -21,6 +20,59 @@ os.environ.setdefault(
 
 import matplotlib
 import matplotlib.pyplot as plt
+
+
+def _backend_supports_show(backend: str) -> bool:
+    backend = backend.lower()
+    if backend in {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}:
+        return False
+    if backend.startswith("module://matplotlib_inline"):
+        return False
+    interactive_markers = (
+        "qt",
+        "tk",
+        "wx",
+        "gtk",
+        "macosx",
+        "nbagg",
+        "notebook",
+        "webagg",
+    )
+    return any(marker in backend for marker in interactive_markers)
+
+
+def _present_open_figures() -> None:
+    for fig_num in plt.get_fignums():
+        try:
+            manager = plt.figure(fig_num).canvas.manager
+            window = getattr(manager, "window", None)
+            if window is None:
+                continue
+            toolbar = getattr(manager, "toolbar", None)
+            if toolbar is not None and hasattr(toolbar, "setIconSize"):
+                from PySide6.QtCore import QSize, Qt as _Qt
+                toolbar.setIconSize(QSize(16, 16))
+                window.removeToolBar(toolbar)
+                window.addToolBar(_Qt.BottomToolBarArea, toolbar)
+                toolbar.show()
+            if hasattr(window, "show"):
+                window.show()
+            if hasattr(window, "raise_"):
+                window.raise_()
+            if hasattr(window, "activateWindow"):
+                window.activateWindow()
+        except Exception:
+            continue
+
+
+def pump_plot_events() -> None:
+    """Keep non-blocking matplotlib windows responsive."""
+    if not plt.get_fignums():
+        return
+    try:
+        plt.pause(0.001)
+    except Exception:
+        pass
 
 
 def _slugify(text: str) -> str:
@@ -106,20 +158,6 @@ def _prepare_series(history: list, x_key: str, y_key: str) -> tuple[list, list]:
     return [point[x_key] for point in history], [point[y_key] for point in history]
 
 
-def _moving_average(values: list, window: int = 10) -> list:
-    if not values:
-        return []
-
-    arr = np.asarray(values, dtype=np.float32)
-    out = np.empty_like(arr)
-    cumsum = np.cumsum(arr)
-    for idx in range(len(arr)):
-        start = max(0, idx - window + 1)
-        total = cumsum[idx] - (cumsum[start - 1] if start > 0 else 0.0)
-        out[idx] = total / (idx - start + 1)
-    return out.tolist()
-
-
 def plot_experiment(
     experiment: dict,
     output_dir: str,
@@ -139,21 +177,25 @@ def plot_experiment(
     train_rounds, train_acc = _prepare_series(train_history, "round", "acc")
     train_times, _ = _prepare_series(train_history, "time", "acc")
     _, train_loss = _prepare_series(train_history, "round", "loss")
-    train_acc_ma = _moving_average(train_acc, window=10)
-    train_loss_ma = _moving_average(train_loss, window=10)
     test_rounds, test_acc = _prepare_series(test_history, "round", "acc")
     test_times, _ = _prepare_series(test_history, "time", "acc")
     _, test_loss = _prepare_series(test_history, "round", "loss")
     reward_history = list(experiment.get("reward_history", []))
     reward_steps, reward_values = _prepare_series(reward_history, "step", "reward")
     reward_times, _ = _prepare_series(reward_history, "time", "reward")
-    reward_ma = _moving_average(reward_values, window=10)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_rounds, train_acc, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#16a34a")
-    ax.plot(train_rounds, train_acc_ma, label="Train (10-round MA)", linewidth=2.2, color="#16a34a")
+    ax.plot(train_rounds, train_acc, label="Train Accuracy", linewidth=2.0, color="#16a34a")
     if test_history:
-        ax.plot(test_rounds, test_acc, label="Test", marker="o", linewidth=1.8, color="#2563eb")
+        ax.plot(
+            test_rounds,
+            test_acc,
+            label="Test Accuracy",
+            marker="o",
+            linestyle="-",
+            markersize=5.0,
+            color="#2563eb",
+        )
     ax.set_title(f"Accuracy vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Accuracy")
@@ -164,10 +206,17 @@ def plot_experiment(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_times, train_acc, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#16a34a")
-    ax.plot(train_times, train_acc_ma, label="Train (10-round MA)", linewidth=2.2, color="#16a34a")
+    ax.plot(train_times, train_acc, label="Train Accuracy", linewidth=2.0, color="#16a34a")
     if test_history:
-        ax.plot(test_times, test_acc, label="Test", marker="o", linewidth=1.8, color="#2563eb")
+        ax.plot(
+            test_times,
+            test_acc,
+            label="Test Accuracy",
+            marker="o",
+            linestyle="-",
+            markersize=5.0,
+            color="#2563eb",
+        )
     ax.set_title(f"Accuracy vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Accuracy")
@@ -178,10 +227,17 @@ def plot_experiment(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_rounds, train_loss, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#dc2626")
-    ax.plot(train_rounds, train_loss_ma, label="Train (10-round MA)", linewidth=2.2, color="#dc2626")
+    ax.plot(train_rounds, train_loss, label="Train Loss", linewidth=2.0, color="#dc2626")
     if test_history:
-        ax.plot(test_rounds, test_loss, label="Test", marker="o", linewidth=1.8, color="#2563eb")
+        ax.plot(
+            test_rounds,
+            test_loss,
+            label="Test Loss",
+            marker="o",
+            linestyle="-",
+            markersize=5.0,
+            color="#2563eb",
+        )
     ax.set_title(f"Loss vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Loss")
@@ -192,10 +248,17 @@ def plot_experiment(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_times, train_loss, label="Train (raw)", linewidth=1.6, alpha=0.35, color="#dc2626")
-    ax.plot(train_times, train_loss_ma, label="Train (10-round MA)", linewidth=2.2, color="#dc2626")
+    ax.plot(train_times, train_loss, label="Train Loss", linewidth=2.0, color="#dc2626")
     if test_history:
-        ax.plot(test_times, test_loss, label="Test", marker="o", linewidth=1.8, color="#2563eb")
+        ax.plot(
+            test_times,
+            test_loss,
+            label="Test Loss",
+            marker="o",
+            linestyle="-",
+            markersize=5.0,
+            color="#2563eb",
+        )
     ax.set_title(f"Loss vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Loss")
@@ -229,8 +292,7 @@ def plot_experiment(
 
     if reward_history:
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(reward_steps, reward_values, label="Reward (raw)", linewidth=1.6, alpha=0.35, color="#7c3aed")
-        ax.plot(reward_steps, reward_ma, label="Reward (10-step MA)", linewidth=2.2, color="#7c3aed")
+        ax.plot(reward_steps, reward_values, label="Reward", linewidth=2.0, color="#7c3aed")
         ax.axhline(0.0, color="#6b7280", linewidth=1.0, linestyle="--")
         ax.set_title(f"PPO Reward vs Steps\n{title}")
         ax.set_xlabel("Simulation Step")
@@ -242,8 +304,7 @@ def plot_experiment(
         )
 
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(reward_times, reward_values, label="Reward (raw)", linewidth=1.6, alpha=0.35, color="#7c3aed")
-        ax.plot(reward_times, reward_ma, label="Reward (10-step MA)", linewidth=2.2, color="#7c3aed")
+        ax.plot(reward_times, reward_values, label="Reward", linewidth=2.0, color="#7c3aed")
         ax.axhline(0.0, color="#6b7280", linewidth=1.0, linestyle="--")
         ax.set_title(f"PPO Reward vs Time\n{title}")
         ax.set_xlabel("Time (s)")
@@ -254,19 +315,20 @@ def plot_experiment(
             os.path.join(output_dir, "ppo_reward_vs_time.png"),
         )
 
-    backend = matplotlib.get_backend().lower()
-    shown = show and "agg" not in backend
+    backend = matplotlib.get_backend()
+    shown = show and _backend_supports_show(backend)
     if shown:
         plt.show(block=block)
         if not block:
-            plt.pause(0.001)
+            _present_open_figures()
+            pump_plot_events()
     else:
         plt.close("all")
 
     return {
         "figure_paths": figures,
         "shown": shown,
-        "backend": matplotlib.get_backend(),
+        "backend": backend,
     }
 
 

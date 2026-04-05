@@ -15,35 +15,43 @@ import config
 from dl.models import build_model
 
 
+def eval_weight_snapshots(weight_snapshots: list[dict], test_loader) -> tuple:
+    """Evaluate model-weight snapshots on the global test set."""
+    criterion = nn.CrossEntropyLoss()
+    totals = [[0.0, 0, 0] for _ in weight_snapshots]
+    models = []
+
+    for weights in weight_snapshots:
+        model = build_model(config.DATASET, config.MODEL_ARCH)
+        model.load_state_dict(weights)
+        model.eval()
+        models.append(model)
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            n = len(labels)
+            for idx, model in enumerate(models):
+                logits = model(images)
+                loss = criterion(logits, labels)
+                totals[idx][0] += loss.item() * n
+                totals[idx][1] += int((logits.argmax(1) == labels).sum())
+                totals[idx][2] += n
+
+    per_loss = [total[0] / max(total[2], 1) for total in totals]
+    per_acc = [total[1] / max(total[2], 1) for total in totals]
+    return float(np.mean(per_loss)), float(np.mean(per_acc))
+
+
 def eval_vehicles(vehicles, test_loader) -> tuple:
     """Evaluate every vehicle's model on the global test set.
 
     Returns:
         (avg_loss, avg_acc) — mean across all vehicles.
     """
-    criterion = nn.CrossEntropyLoss()
-    totals = {v.id: [0.0, 0, 0] for v in vehicles}
-    models = []
-
-    for v in vehicles:
-        model = build_model(config.DATASET, config.MODEL_ARCH)
-        model.load_state_dict(v.get_shared_weights())
-        model.eval()
-        models.append((v.id, model))
-
-    with torch.no_grad():
-        for images, labels in test_loader:
-            n = len(labels)
-            for vid, model in models:
-                logits = model(images)
-                loss = criterion(logits, labels)
-                totals[vid][0] += loss.item() * n
-                totals[vid][1] += int((logits.argmax(1) == labels).sum())
-                totals[vid][2] += n
-
-    per_loss = [totals[v.id][0] / max(totals[v.id][2], 1) for v in vehicles]
-    per_acc = [totals[v.id][1] / max(totals[v.id][2], 1) for v in vehicles]
-    return float(np.mean(per_loss)), float(np.mean(per_acc))
+    return eval_weight_snapshots(
+        [v.get_shared_weights() for v in vehicles],
+        test_loader,
+    )
 
 
 def clone_state_dict(state_dict: dict) -> dict:

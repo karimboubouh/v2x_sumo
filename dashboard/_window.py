@@ -20,14 +20,26 @@ class _LoadingOverlay(QWidget):
     """Full-window translucent overlay shown until the first simulation frame."""
 
     def __init__(self, parent: QWidget):
-        super().__init__(parent)
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
         self._dots = 0
         self._timer = QTimer(self)
         self._timer.setInterval(420)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+
+    def sync_to_parent(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        overlay_rect = parent.frameGeometry()
+        screen = parent.screen()
+        if screen is not None:
+            overlay_rect = overlay_rect.intersected(screen.geometry())
+        self.setGeometry(overlay_rect)
+        self.raise_()
 
     def _tick(self) -> None:
         self._dots = (self._dots + 1) % 4
@@ -79,9 +91,9 @@ class MainWindow(QMainWindow):
         self._build_central(net_bounds, edge_shapes, dpi_scale, scenario_name)
         self._apply_theme()
 
-        # Loading overlay (placed after central widget is set)
-        self._overlay = _LoadingOverlay(self.centralWidget())
-        self._overlay.resize(self.centralWidget().size())
+        # Loading overlay (covers the full top-level window, including the title-bar region)
+        self._overlay = _LoadingOverlay(self)
+        self._overlay.sync_to_parent()
         self._overlay.show()
 
     # ── Menu bar ─────────────────────────────────────────────────────────────
@@ -262,7 +274,12 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if hasattr(self, "_overlay") and self._overlay.isVisible():
-            self._overlay.resize(self.centralWidget().size())
+            self._overlay.sync_to_parent()
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        super().moveEvent(event)
+        if hasattr(self, "_overlay") and self._overlay.isVisible():
+            self._overlay.sync_to_parent()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.closed_signal.emit()

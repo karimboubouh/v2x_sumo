@@ -68,7 +68,7 @@ DEFAULT_SCENARIO = "dubai_marina"
 # ---------------------------------------------------------------------------
 SIM_STEP_LENGTH = 1.0  # SUMO seconds per step
 SIM_END_TIME = 3600  # 1 hour of simulation
-NUM_VEHICLES = 50  # Target number of vehicles in the scenario
+NUM_VEHICLES = 20  # Target number of vehicles in the scenario
 VEHICLE_FORCE_SPEED = None  # Force all vehicles to this speed in km/h (e.g. 50, 120, 280); None = SUMO default
 TIME_TO_TELEPORT = 10  # Seconds before a stuck vehicle is teleported (-1 = disabled, 300 = default SUMO)
 
@@ -100,11 +100,11 @@ INET_SNR_DB = 20.0
 # ---------------------------------------------------------------------------
 # Dashboard / UI parameters
 # ---------------------------------------------------------------------------
-WINDOW_WIDTH = 1280
-WINDOW_HEIGHT = 820
+WINDOW_WIDTH = 600
+WINDOW_HEIGHT = 400
 MAP_PANEL_HEIGHT = 540
 LOG_PANEL_HEIGHT = 220
-FPS = 120           # processEvents cadence hint; Qt drives its own paint loop
+FPS = 60           # Main-loop render cap in frames per second
 FONT_SIZE_LOG = 12   # Base font size for the log panel (pt)
 FONT_SIZE_MAP = 11    # Base font size for map UI elements (HUD, legend, zoom controls, etc.)
 LOG_MAX_LINES = None  # Keep the full message log from the start of the simulation
@@ -119,7 +119,7 @@ DPI_SCALE = 1.0    # Manual DPI hint (1.0 = auto; 2.0 forces HiDPI scaling tweak
 ALGORITHM = "FedAvg"  # name of any algorithm in algorithms/<name>/algorithm.py
 
 # ── Termination ──────────────────────────────────────────
-MAX_TR_ROUNDS = 100
+MAX_TR_ROUNDS = 20
 TARGET_ACCURACY = 1.01  # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
 EVAL_ROUNDS = 5  # evaluate global test metrics every N shared rounds
 
@@ -130,9 +130,6 @@ LOCAL_LR = 1e-3  # Adam learning rate
 BATCH_SIZE = 32
 BATCHES_PER_ROUND = 20  # mini-batches processed per DPL training round (20×32=640 samples/round)
 DATA_ALPHA = 0.5  # Dirichlet alpha for non-IID (0.1=very non-IID, 10.0~IID)
-
-# Algorithm-specific settings such as personalized aggregation weights and
-# GAT/PPO feature dimensions live in algorithms/<name>/config.py.
 
 # ── Computation energy model (DVFS) ──────────────────────
 KAPPA = 1e-28  # κ — effective switched capacitance (F·cycle⁻²)
