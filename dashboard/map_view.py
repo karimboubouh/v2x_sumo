@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer
+from PySide6.QtCore import Qt, QRect, QRectF, QPointF, QTimer
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QPainterPath,
     QFont, QFontMetrics, QPolygonF, QTransform, QLinearGradient, QPixmap,
@@ -19,6 +20,24 @@ from dashboard import theme
 # Mirror of algorithms/base.py constants — avoids importing torch at dashboard startup
 LINK_SIDELINK = 0.0
 LINK_INTERNET = 1.0
+
+
+def _layer_bounds(net_bounds: tuple, pad: float = 200.0) -> QRectF:
+    x_min, y_min, x_max, y_max = net_bounds
+    return QRectF(
+        x_min - pad,
+        -y_max - pad,
+        (x_max - x_min) + pad * 2,
+        (y_max - y_min) + pad * 2,
+    )
+
+
+def _merge_dirty_rect(previous: QRectF, current: QRectF) -> QRectF:
+    if previous.isValid() and not previous.isEmpty():
+        if current.isValid() and not current.isEmpty():
+            return previous.united(current)
+        return previous
+    return current
 
 
 # ── Vehicle colour palette ────────────────────────────────────────────────────
@@ -44,19 +63,11 @@ _BYZ_OUTLINE = QColor(255, 120, 120)
 
 # ── Scene layers ──────────────────────────────────────────────────────────────
 
-class _RoadsLayer(QGraphicsItem):
-    """Immutable road network drawn as a single QPainterPath."""
+class _RoadsLayer:
+    """Immutable road network painter used by the view background cache."""
 
     def __init__(self, edge_shapes: list, net_bounds: tuple) -> None:
-        super().__init__()
-        # Cache the rasterised road network. Without this, every frame re-draws
-        # the full QPainterPath (thousands of segments), which dominates frame time.
-        # The cache is invalidated only when the view zoom changes, which is
-        # already reduced to one repaint per zoom step by NoViewportUpdate in _scale_view.
-        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
-        x_min, y_min, x_max, y_max = net_bounds
-        self._bounds = QRectF(x_min - 200, -y_max - 200,
-                              (x_max - x_min) + 400, (y_max - y_min) + 400)
+        self._bounds = _layer_bounds(net_bounds)
         self._path = QPainterPath()
         for shape in edge_shapes:
             if len(shape) < 2:
@@ -64,9 +75,6 @@ class _RoadsLayer(QGraphicsItem):
             self._path.moveTo(shape[0][0], -shape[0][1])
             for x, y in shape[1:]:
                 self._path.lineTo(x, -y)
-
-    def boundingRect(self) -> QRectF:
-        return self._bounds
 
     def paint(self, painter: QPainter, option, widget) -> None:
         # Edge shadow
@@ -86,20 +94,54 @@ class _RoadsLayer(QGraphicsItem):
 class _LinksLayer(QGraphicsItem):
     """All V2V + FL collaboration links — redrawn each frame."""
 
-    def __init__(self) -> None:
+    def __init__(self, net_bounds: tuple) -> None:
         super().__init__()
         self.setZValue(1)
         self._links: list = []
         self._states: dict = {}
-        self._INF = QRectF(-1e8, -1e8, 2e8, 2e8)
+        self._bounds = _layer_bounds(net_bounds)
+        self._last_dirty_rect = QRectF()
 
-    def update_data(self, links: list, states: dict) -> None:
+    def update_data(self, links: list, states: dict, zoom_level: float) -> None:
+        dirty_rect = self._compute_dirty_rect(links, states, zoom_level)
+        repaint_rect = _merge_dirty_rect(self._last_dirty_rect, dirty_rect)
         self._links = links
         self._states = states
-        self.update()
+        self._last_dirty_rect = dirty_rect
+        if repaint_rect.isValid() and not repaint_rect.isEmpty():
+            self.update(repaint_rect.intersected(self._bounds))
 
     def boundingRect(self) -> QRectF:
-        return self._INF
+        return self._bounds
+
+    def _compute_dirty_rect(self, links: list, states: dict, zoom_level: float) -> QRectF:
+        min_x = min_y = max_x = max_y = None
+        for link in links:
+            sender = states.get(link.sender_id)
+            receiver = states.get(link.receiver_id)
+            if sender is None or receiver is None:
+                continue
+            points = ((sender.x, -sender.y), (receiver.x, -receiver.y))
+            for x, y in points:
+                if min_x is None:
+                    min_x = max_x = x
+                    min_y = max_y = y
+                else:
+                    min_x = min(min_x, x)
+                    min_y = min(min_y, y)
+                    max_x = max(max_x, x)
+                    max_y = max(max_y, y)
+
+        if min_x is None:
+            return QRectF()
+
+        padding = 32.0 if zoom_level >= 4.0 else 20.0
+        return QRectF(
+            min_x - padding,
+            min_y - padding,
+            (max_x - min_x) + padding * 2,
+            (max_y - min_y) + padding * 2,
+        )
 
     def paint(self, painter: QPainter, option, widget) -> None:
         if not self._links or not self._states:
@@ -163,18 +205,23 @@ class _VehiclesLayer(QGraphicsItem):
     _HALF_W = _CAR_W / 2
     _HALF_H = _CAR_H / 2
 
-    def __init__(self) -> None:
+    def __init__(self, net_bounds: tuple) -> None:
         super().__init__()
         self.setZValue(2)
         self._states: dict  = {}
         self._overlays: dict = {}
         self._color_map: dict[str, QColor] = {}
-        self._INF = QRectF(-1e8, -1e8, 2e8, 2e8)
+        self._bounds = _layer_bounds(net_bounds)
+        self._last_dirty_rect = QRectF()
 
-    def update_data(self, states: dict, overlays: dict) -> None:
+    def update_data(self, states: dict, overlays: dict, zoom_level: float) -> None:
+        dirty_rect = self._compute_dirty_rect(states, zoom_level)
+        repaint_rect = _merge_dirty_rect(self._last_dirty_rect, dirty_rect)
         self._states  = states
         self._overlays = overlays
-        self.update()
+        self._last_dirty_rect = dirty_rect
+        if repaint_rect.isValid() and not repaint_rect.isEmpty():
+            self.update(repaint_rect.intersected(self._bounds))
 
     def _vehicle_color(self, vid: str) -> QColor:
         if vid not in self._color_map:
@@ -183,7 +230,29 @@ class _VehiclesLayer(QGraphicsItem):
         return self._color_map[vid]
 
     def boundingRect(self) -> QRectF:
-        return self._INF
+        return self._bounds
+
+    def _compute_dirty_rect(self, states: dict, zoom_level: float) -> QRectF:
+        if not states:
+            return QRectF()
+
+        min_x = min(state.x for state in states.values())
+        max_x = max(state.x for state in states.values())
+        min_y = min(-state.y for state in states.values())
+        max_y = max(-state.y for state in states.values())
+
+        padding = max(self._CAR_H + 8.0, 24.0)
+        if zoom_level >= 1.5 and len(states) <= 30:
+            padding = max(padding, float(config.COMM_RANGE) + 8.0)
+        if zoom_level > 12.0:
+            padding = max(padding, 42.0)
+
+        return QRectF(
+            min_x - padding,
+            min_y - padding,
+            (max_x - min_x) + padding * 2,
+            (max_y - min_y) + padding * 2,
+        )
 
     def paint(self, painter: QPainter, option, widget) -> None:
         if not self._states:
@@ -282,12 +351,16 @@ class MapWidget(QGraphicsView):
         self._sim_time: float = 0.0
         self._vehicle_count: int = 0
         self._avg_speed: float = 0.0
+        self._fps: float = 0.0
+        self._last_frame_sample: float | None = None
         self._paused: bool = False
         self._overlay_text: str | None = None
         self._vehicle_states: dict = {}
         self._active_links: list = []
         self._base_transform: QTransform | None = None
         self._zoom_btn_rects: dict[str, QRectF] = {}
+        self._default_viewport_update_mode = QGraphicsView.MinimalViewportUpdate
+        self._drag_full_repaint = False
 
         # Static overlay pixmap caches — rebuilt only on theme change
         self._legend_px: QPixmap | None = None
@@ -306,6 +379,7 @@ class MapWidget(QGraphicsView):
             QPainter.SmoothPixmapTransform |
             QPainter.TextAntialiasing,
         )
+        self.setCacheMode(QGraphicsView.CacheBackground)
         # NoAnchor: we handle cursor-locking ourselves in _scale_view()
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
@@ -315,7 +389,7 @@ class MapWidget(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # DontSavePainterState is safe; DontAdjustForAntialiasing removed (causes jagged zoom)
         self.setOptimizationFlags(QGraphicsView.DontSavePainterState)
-        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
+        self.setViewportUpdateMode(self._default_viewport_update_mode)
         self.setInteractive(False)
 
         # Scene
@@ -326,9 +400,8 @@ class MapWidget(QGraphicsView):
 
         # Layers
         self._roads    = _RoadsLayer(edge_shapes, net_bounds)
-        self._links    = _LinksLayer()
-        self._vehicles = _VehiclesLayer()
-        self._scene.addItem(self._roads)
+        self._links    = _LinksLayer(net_bounds)
+        self._vehicles = _VehiclesLayer(net_bounds)
         self._scene.addItem(self._links)
         self._scene.addItem(self._vehicles)
 
@@ -346,6 +419,17 @@ class MapWidget(QGraphicsView):
         sim_time: float,
         vehicle_overlays: dict,
     ) -> None:
+        zoom_level = self._zoom_level()
+        now = time.perf_counter()
+        if self._last_frame_sample is not None:
+            dt = max(now - self._last_frame_sample, 1e-6)
+            inst_fps = 1.0 / dt
+            if self._fps <= 0.0:
+                self._fps = inst_fps
+            else:
+                self._fps = self._fps * 0.85 + inst_fps * 0.15
+        self._last_frame_sample = now
+
         self._vehicle_states = vehicle_states
         self._active_links   = active_links
         self._sim_time       = sim_time
@@ -353,9 +437,12 @@ class MapWidget(QGraphicsView):
             self._vehicle_count = len(vehicle_states)
             speeds = [v.speed * 3.6 for v in vehicle_states.values()]
             self._avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
-        self._vehicles.update_data(vehicle_states, vehicle_overlays)
-        self._links.update_data(active_links, vehicle_states)
-        self.viewport().update()
+        else:
+            self._vehicle_count = 0
+            self._avg_speed = 0.0
+        self._vehicles.update_data(vehicle_states, vehicle_overlays, zoom_level)
+        self._links.update_data(active_links, vehicle_states, zoom_level)
+        self.viewport().update(self._hud_viewport_rect())
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
@@ -380,6 +467,7 @@ class MapWidget(QGraphicsView):
             return
         scene_pt = self.mapToScene(anchor_vp)
         # Suppress intermediate repaints during the compound transform
+        prev_update_mode = self.viewportUpdateMode()
         self.setViewportUpdateMode(QGraphicsView.NoViewportUpdate)
         self.scale(factor, factor)
         new_vp = self.mapFromScene(scene_pt)
@@ -389,8 +477,25 @@ class MapWidget(QGraphicsView):
         self.verticalScrollBar().setValue(
             self.verticalScrollBar().value() + (new_vp.y() - anchor_vp.y())
         )
-        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
+        self.setViewportUpdateMode(prev_update_mode)
         self.viewport().update()  # single repaint for the whole compound transform
+
+    def _scale_view_under_mouse(self, factor: float) -> None:
+        """Scale using Qt's native under-mouse anchor.
+
+        This path is substantially cheaper than manually re-positioning the
+        scrollbars on every wheel delta, which matters during continuous zoom.
+        """
+        new_zoom = self._zoom_level() * factor
+        if not (0.2 <= new_zoom <= 50.0):
+            return
+        prev_anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        try:
+            self.scale(factor, factor)
+        finally:
+            self.setTransformationAnchor(prev_anchor)
+        self.viewport().update()
 
     def reset_view(self) -> None:
         if self._base_transform:
@@ -404,7 +509,11 @@ class MapWidget(QGraphicsView):
         self.setBackgroundBrush(QBrush(theme.color("bg")))
         self._legend_px = None   # invalidate static caches
         self._kb_px = None
+        self.resetCachedContent()
         self.viewport().update()
+
+    def _hud_viewport_rect(self) -> QRect:
+        return QRect(0, 0, int(320 * self._dpi), int(150 * self._dpi))
 
     # ── Zoom level helper ─────────────────────────────────────────────────────
 
@@ -439,20 +548,38 @@ class MapWidget(QGraphicsView):
                     actions[name]()
                     event.accept()
                     return
+            if self.dragMode() == QGraphicsView.ScrollHandDrag:
+                self._drag_full_repaint = True
+                self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+                self.resetCachedContent()
+                self.viewport().update()
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        super().mouseReleaseEvent(event)
+        if self._drag_full_repaint and event.button() == Qt.LeftButton:
+            self._drag_full_repaint = False
+            self.setViewportUpdateMode(self._default_viewport_update_mode)
+            self.viewport().update()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         delta = event.angleDelta().y()
         if delta == 0:
             return
         factor = 1.12 if delta > 0 else 1.0 / 1.12
-        # Zoom anchored to the cursor position
-        self._scale_view(factor, event.position().toPoint())
+        self._scale_view_under_mouse(factor)
+        event.accept()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if self._base_transform is None:
             QTimer.singleShot(50, self._fit_initial)
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802
+        super().scrollContentsBy(dx, dy)
+        if self._drag_full_repaint and (dx or dy):
+            self.resetCachedContent()
+            self.viewport().update()
 
     # ── Foreground: HUD + zoom controls + alpha labels + legend ──────────────
 
@@ -469,6 +596,10 @@ class MapWidget(QGraphicsView):
             self._draw_center_text(painter, vp, "⏸  PAUSED")
         if self._overlay_text:
             self._draw_done_overlay(painter, vp)
+
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        painter.fillRect(rect, self.backgroundBrush())
+        self._roads.paint(painter, None, self.viewport())
 
     # ── Range rings ───────────────────────────────────────────────────────────
 
@@ -500,6 +631,7 @@ class MapWidget(QGraphicsView):
             ("Time",       f"{self._sim_time:.0f} s"),
             ("Vehicles",   f"{self._vehicle_count}"),
             ("Avg speed",  f"{self._avg_speed:.0f} km/h"),
+            ("FPS",        f"{self._fps:.0f}" if self._fps > 0.0 else "—"),
             ("Zoom",       f"{self._zoom_level():.1f}×"),
         ]
 

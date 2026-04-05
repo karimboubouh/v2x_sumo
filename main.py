@@ -151,6 +151,10 @@ def main():
         # Accumulator: tracks how much sim-time we owe
         sim_accumulator = 0.0
         last_frame_time = time.perf_counter()
+        render_interval = 1.0 / max(config.FPS, 1)
+        # Reserve a small wall-clock slice for unlimited mode so expensive
+        # repaints do not directly throttle SUMO progression.
+        unlimited_sim_budget = render_interval
 
         def finish_dl(stop_reason, avg_loss=None, avg_acc=None, tr_round=None):
             nonlocal dl_complete_logged
@@ -233,6 +237,35 @@ def main():
                 return True
             return False
 
+        def advance_simulation_step(*, allow_dl_demo: bool = False) -> bool:
+            nonlocal vehicle_states, sim_time, step_count, last_dl_time
+
+            vehicle_states = sumo.step()
+            sim_time = sumo.get_sim_time()
+            comm.update(vehicle_states, sim_time)
+            step_count += 1
+
+            dl_done = run_dl_step(vehicle_states, sim_time)
+
+            if (
+                allow_dl_demo
+                and not dl_done
+                and dl_payload
+                and sim_time - last_dl_time >= dl_interval
+            ):
+                last_dl_time = sim_time
+                veh_ids = list(vehicle_states.keys())
+                if len(veh_ids) >= 2:
+                    sender = random.choice(veh_ids)
+                    neighbors = comm.get_neighbors(sender)
+                    if neighbors:
+                        receiver = random.choice(neighbors)
+                        weights = dl_payload.dummy_weights()
+                        payload = dl_payload.serialize_weights(weights)
+                        comm.send_message(sender, receiver, "dl_weights", payload, sim_time)
+
+            return dl_done
+
         if dl_env is not None and dl_env.is_done():
             finish_dl(
                 dl_env.get_stop_reason(),
@@ -246,41 +279,26 @@ def main():
             dt = now - last_frame_time
             last_frame_time = now
 
-            # --- Simulation stepping (decoupled from render) ---
+            # --- Simulation stepping ---
             if not dashboard.paused:
                 if speed_mult == 0:
-                    # Unlimited: one SUMO step per render frame
-                    vehicle_states = sumo.step()
-                    sim_time = sumo.get_sim_time()
-                    comm.update(vehicle_states, sim_time)
-                    step_count += 1
-                    run_dl_step(vehicle_states, sim_time)
+                    # Unlimited: spend a bounded wall-clock slice advancing SUMO,
+                    # then render the newest state once. This keeps simulation time
+                    # moving even when zoom/pan repaints are expensive.
+                    burst_deadline = time.perf_counter() + unlimited_sim_budget
+                    while True:
+                        if advance_simulation_step():
+                            break
+                        if time.perf_counter() >= burst_deadline:
+                            break
                 else:
                     sim_accumulator += dt * speed_mult
                     # Cap to prevent spiral-of-death after lag spikes
                     sim_accumulator = min(sim_accumulator, config.SIM_STEP_LENGTH * 3)
                     while sim_accumulator >= config.SIM_STEP_LENGTH:
                         sim_accumulator -= config.SIM_STEP_LENGTH
-                        vehicle_states = sumo.step()
-                        sim_time = sumo.get_sim_time()
-                        comm.update(vehicle_states, sim_time)
-                        step_count += 1
-
-                        if run_dl_step(vehicle_states, sim_time):
+                        if advance_simulation_step(allow_dl_demo=True):
                             break
-
-                        # DL weight exchange demo
-                        if dl_payload and sim_time - last_dl_time >= dl_interval:
-                            last_dl_time = sim_time
-                            veh_ids = list(vehicle_states.keys())
-                            if len(veh_ids) >= 2:
-                                sender = random.choice(veh_ids)
-                                neighbors = comm.get_neighbors(sender)
-                                if neighbors:
-                                    receiver = random.choice(neighbors)
-                                    weights = dl_payload.dummy_weights()
-                                    payload = dl_payload.serialize_weights(weights)
-                                    comm.send_message(sender, receiver, "dl_weights", payload, sim_time)
 
                 log_links = comm.get_active_links()
 
@@ -295,7 +313,7 @@ def main():
                 vehicle_overlays = None
             new_messages += event_stream.drain(max_items=event_drain_batch)
 
-            # --- Render (always, at FPS rate — Clock.tick handles pacing) ---
+            # --- Render latest state and process Qt events ---
             if not dashboard.render(
                 vehicle_states,
                 render_links,
