@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections import deque
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QRect, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QFrame, QScrollArea, QSizePolicy,
-    QAbstractScrollArea,
+    QWidget, QVBoxLayout, QFrame, QSizePolicy,
 )
 
 import config
@@ -49,7 +48,7 @@ class _LogCanvas(QWidget):
     def _make_font(self) -> QFont:
         f = QFont("Menlo, Consolas, Courier New, monospace")
         f.setStyleHint(QFont.Monospace)
-        f.setPointSize(int(config.FONT_SIZE * 0.9))
+        f.setPointSize(int(config.FONT_SIZE_LOG * 0.9))
         return f
 
     def on_theme_changed(self) -> None:
@@ -180,6 +179,57 @@ class _LogCanvas(QWidget):
         self.update()
 
 
+# ── Header bar (fully custom-painted — no stylesheet conflicts) ───────────────
+
+class _LogHeader(QWidget):
+    """Paints its own background, title, and collapse arrow — no child widgets."""
+
+    toggled = Signal(bool)   # emits True when opening, False when closing
+
+    def __init__(self, dpi_scale: float, parent=None) -> None:
+        super().__init__(parent)
+        self._open  = True
+        self._hover = False
+        self._btn_w = int(28 * dpi_scale)
+        self.setFixedHeight(int(22 * dpi_scale))
+        self.setCursor(Qt.ArrowCursor)
+        self._font = QFont()
+        self._font.setPointSize(9)
+        self._font.setWeight(QFont.DemiBold)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.fillRect(self.rect(), theme.color("status_bar_bg"))
+        p.setFont(self._font)
+        # Title
+        p.setPen(theme.color("text_secondary"))
+        title_rect = QRect(10, 0, self.width() - self._btn_w - 10, self.height())
+        p.drawText(title_rect, Qt.AlignVCenter | Qt.AlignLeft,
+                   "V2V / DPL Interaction Log")
+        # Arrow — brighter on hover
+        p.setPen(theme.color("text") if self._hover else theme.color("text_dim"))
+        btn_rect = QRect(self.width() - self._btn_w, 0, self._btn_w, self.height())
+        p.drawText(btn_rect, Qt.AlignCenter, "▼" if self._open else "▶")
+        p.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._open = not self._open
+            self.toggled.emit(self._open)
+            self.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+
+    def on_theme_changed(self) -> None:
+        self.update()
+
+
 # ── Public widget ─────────────────────────────────────────────────────────────
 
 class LogWidget(QWidget):
@@ -195,21 +245,16 @@ class LogWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header bar
-        self._header = QLabel("V2V / DPL Interaction Log")
-        header_font = QFont()
-        header_font.setPointSize(9)
-        header_font.setWeight(QFont.DemiBold)
-        self._header.setFont(header_font)
-        self._header.setContentsMargins(10, 4, 10, 4)
-        self._header.setFixedHeight(int(22 * self._dpi))
+        # Header — fully custom-painted, no child widgets, no stylesheet issues
+        self._header = _LogHeader(self._dpi)
+        self._header.toggled.connect(self._toggle_log)
         layout.addWidget(self._header)
 
         # Thin separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFixedHeight(1)
-        layout.addWidget(sep)
+        self._sep = QFrame()
+        self._sep.setFrameShape(QFrame.HLine)
+        self._sep.setFixedHeight(1)
+        layout.addWidget(self._sep)
 
         # Canvas
         self._canvas = _LogCanvas(self._dpi)
@@ -217,18 +262,20 @@ class LogWidget(QWidget):
 
         self._apply_colors()
 
+    def _toggle_log(self, opening: bool) -> None:
+        self._canvas.setVisible(opening)
+        self._sep.setVisible(opening)
+        self.setMaximumHeight(16777215 if opening else self._header.height())
+
     def _apply_colors(self) -> None:
-        bg   = theme.color("log_bg")
-        text = theme.color("text_secondary")
-        sep  = theme.color("separator")
+        sep = theme.color("separator")
         self.setStyleSheet(
-            f"QLabel {{ background: rgb({bg.red()},{bg.green()},{bg.blue()}); "
-            f"color: rgb({text.red()},{text.green()},{text.blue()}); }}"
             f"QFrame {{ background: rgb({sep.red()},{sep.green()},{sep.blue()}); }}"
         )
 
     def on_theme_changed(self) -> None:
         self._apply_colors()
+        self._header.on_theme_changed()
         self._canvas.on_theme_changed()
 
     # ── Public ───────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ difference is attributable solely to the removal of the graph attention
 encoder and the switch to uniform aggregation weights.
 """
 
-# Feature dimensions (must match DL_CFG OWN_DIM / NBR_DIM).
+# Feature dimensions consumed by the IPPO encoder.
 OWN_DIM: int = 6
 NBR_DIM: int = 6
 

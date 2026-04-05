@@ -182,7 +182,7 @@ sumo/
 │
 ├── dl/                         # Decentralized Personalized Learning package
 │   ├── __init__.py
-│   ├── config.py               # DL_CFG — all DPL constants
+│   ├── config.py               # DPL constants
 │   ├── vehicle.py              # Vehicle class (personalized model + SUMO integration)
 │   ├── env.py                  # DLEnvironment orchestrator
 │   ├── models.py               # DNN, CNN, LSTM, Transformer, ResNet
@@ -215,14 +215,17 @@ sumo/
     ├── sheikh_zayed_road/
     ├── abu_dhabi_corniche/
     ├── sharjah_university/
-    └── yas_island/
+    ├── yas_island/
+    ├── khalifa_university/
+    ├── download_maps.py        # fetch OSM data via Overpass API
+    └── generate_scenarios.py   # build SUMO networks + routes
 ```
 
 ---
 
 ## Scenarios
 
-Five pre-generated SUMO networks based on real UAE roads (OpenStreetMap):
+Six pre-generated SUMO networks based on real UAE roads (OpenStreetMap):
 
 | Key | Name | Characteristics |
 |---|---|---|
@@ -231,11 +234,56 @@ Five pre-generated SUMO networks based on real UAE roads (OpenStreetMap):
 | `abu_dhabi_corniche` | Abu Dhabi Corniche | Coastal boulevard |
 | `sharjah_university` | Sharjah University City | Campus-style road network |
 | `yas_island` | Yas Island | Circuit-style loop roads |
+| `khalifa_university` | Khalifa University | University campus on Airport Road, Abu Dhabi |
 
 Each scenario folder contains:
 - `network.net.xml` — Road topology
 - `routes.rou.xml` — Pre-computed vehicle routes
 - `simulation.sumocfg` — SUMO configuration
+
+### Generating a New Scenario
+
+Adding a new scenario requires three steps: register it in `config.py`, download the OSM map, and build the SUMO network.
+
+**Step 1 — Register the scenario in `config.py`**
+
+Add an entry to the `SCENARIOS` dict. The `bbox` is `(west, south, east, north)` in decimal degrees. A ~2–3 km² area works well; larger areas slow down netconvert and produce sparser vehicle density.
+
+```python
+# config.py
+SCENARIOS = {
+    ...
+    "my_location": {
+        "name": "My Location",
+        "description": "Short description of the road type",
+        "bbox": (lon_west, lat_south, lon_east, lat_north),
+    },
+}
+```
+
+To find the bounding box: open [OpenStreetMap](https://www.openstreetmap.org), navigate to your area, click **Export** → **Manually select a different area**, draw the box, and read off the four coordinates.
+
+**Step 2 — Download the OSM map**
+
+```bash
+python scenarios/download_maps.py
+```
+
+This fetches road data from the Overpass API for every scenario in `SCENARIOS` that does not yet have a `map.osm` file. Existing files are skipped.
+
+**Step 3 — Build the SUMO network and routes**
+
+```bash
+python scenarios/generate_scenarios.py
+```
+
+This runs `netconvert` (OSM → SUMO network) and `randomTrips.py` (generate vehicle routes) for every scenario that does not yet have a `network.net.xml`. Existing networks are skipped; routes are always regenerated to match the current `NUM_VEHICLES` in `config.py`.
+
+**Run your new scenario:**
+
+```bash
+python main.py --scenario my_location -n 20 --speed 0
+```
 
 ---
 
@@ -245,7 +293,7 @@ Each scenario folder contains:
 
 When `--dl` is passed:
 
-1. **Startup**: The dataset (MNIST / FEMNIST / CIFAR-10 / CIFAR-100) is partitioned among vehicles using **Dirichlet non-IID splitting** (controlled by `DL_CFG["DATA_ALPHA"]` in `config.py`). Lower alpha means more heterogeneous data — mimicking vehicles with distinct sensing environments and objectives.
+1. **Startup**: The dataset (MNIST / FEMNIST / CIFAR-10 / CIFAR-100) is partitioned among vehicles using **Dirichlet non-IID splitting** (controlled by `DATA_ALPHA` in `config.py`). Lower alpha means more heterogeneous data — mimicking vehicles with distinct sensing environments and objectives.
 
 2. **Each vehicle** owns a personal `nn.Module`, an optimizer, and its own data partition. Vehicles do **not** share raw data — only model weights. The goal is for each vehicle to converge to a model that best fits *its own* data distribution, not a single global model.
 
@@ -342,7 +390,7 @@ algorithms/
 # algorithms/my_algo/algorithm.py
 
 from algorithms.base import DLAlgorithm, LINK_SIDELINK, LINK_INTERNET
-from config import DL_CFG as CFG
+import config
 from dl.helpers import clone_state_dict
 
 
@@ -570,7 +618,7 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 | `STATUS_BAR_HEIGHT` | `72` | Height of the bottom status bar (pixels) |
 | `THEME_MODE` | `"system"` | `"dark"`, `"light"`, or `"system"` |
 
-### `config.py` → `DL_CFG` — DPL settings
+### `config.py` — DPL settings
 
 | Constant | Default | Description |
 |---|---|---|

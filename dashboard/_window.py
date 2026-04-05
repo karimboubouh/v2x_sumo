@@ -76,7 +76,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(QSize(800, 500))
 
         self._build_menu()
-        self._build_central(net_bounds, edge_shapes, dpi_scale)
+        self._build_central(net_bounds, edge_shapes, dpi_scale, scenario_name)
         self._apply_theme()
 
         # Loading overlay (placed after central widget is set)
@@ -135,6 +135,7 @@ class MainWindow(QMainWindow):
         net_bounds: tuple,
         edge_shapes: list,
         dpi_scale: float,
+        scenario_name: str = "",
     ) -> None:
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -146,7 +147,7 @@ class MainWindow(QMainWindow):
         self._splitter.setHandleWidth(4)
         self._splitter.setChildrenCollapsible(False)
 
-        self._map_widget = MapWidget(net_bounds, edge_shapes, dpi_scale)
+        self._map_widget = MapWidget(net_bounds, edge_shapes, dpi_scale, scenario_name)
         self._log_widget = LogWidget(dpi_scale)
 
         self._splitter.addWidget(self._map_widget)

@@ -143,18 +143,11 @@ class _LinksLayer(QGraphicsItem):
                     pen.setStyle(Qt.DashLine)
                 painter.setPen(pen)
             else:
-                # V2V link — quality encodes colour; opacity fades out at low zoom
+                # V2V sidelink — always blue; quality modulates opacity only
                 q = float(getattr(link, "quality", 0.5))
-                sc = theme.color("link_strong")
-                wc = theme.color("link_weak")
-                opacity = min(0.85, 0.04 + q * 0.06 + zoom_t * (0.38 + q * 0.34))
-                c = QColor(
-                    int(sc.red()   * q + wc.red()   * (1 - q)),
-                    int(sc.green() * q + wc.green() * (1 - q)),
-                    int(sc.blue()  * q + wc.blue()  * (1 - q)),
-                    int(opacity * 255),
-                )
-                pen = QPen(c, 1.0)  # 1.0 px cosmetic (was 1.2)
+                c = QColor(theme.color("link_sidelink"))
+                c.setAlphaF(min(0.90, 0.40 + q * 0.25 + zoom_t * (0.15 + q * 0.10)))
+                pen = QPen(c, 1.0)
                 pen.setCosmetic(True)
                 painter.setPen(pen)
 
@@ -218,10 +211,9 @@ class _VehiclesLayer(QGraphicsItem):
             painter.rotate(state.angle)
 
             # Always draw a rectangle — clamp to minimum pixel size
-            w = max(self._HALF_W, 1.5 / scale)   # minimum 3 px total width
-            h = max(self._HALF_H, 3.0 / scale)   # minimum 6 px total height
+            w = max(self._HALF_W, 2.5 / scale)   # minimum 5 px total width
+            h = max(self._HALF_H, 5.0 / scale)   # minimum 10 px total height
             body = QRectF(-w, -h, w * 2, h * 2)
-            r_px = w * scale  # half-width in pixels for corner radius
 
             painter.setBrush(QBrush(fill_color))
             painter.setPen(QPen(outline_color, 0.25))
@@ -279,12 +271,14 @@ class MapWidget(QGraphicsView):
         net_bounds: tuple,
         edge_shapes: list,
         dpi_scale: float = 1.0,
+        scenario_name: str = "",
     ) -> None:
         self._scene = QGraphicsScene()
         super().__init__(self._scene)
 
         self._net_bounds = net_bounds
         self._dpi = dpi_scale
+        self._scenario_name = scenario_name
         self._sim_time: float = 0.0
         self._vehicle_count: int = 0
         self._avg_speed: float = 0.0
@@ -300,8 +294,8 @@ class MapWidget(QGraphicsView):
         self._kb_px: QPixmap | None = None
 
         # Pre-allocated fonts (avoids QFont() allocation on every paint call)
-        self._font_hud_lbl = QFont(); self._font_hud_lbl.setPointSize(9)
-        self._font_hud_val = QFont(); self._font_hud_val.setPointSize(10)
+        self._font_hud_lbl = QFont(); self._font_hud_lbl.setPointSize(config.FONT_SIZE_MAP)
+        self._font_hud_val = QFont(); self._font_hud_val.setPointSize(config.FONT_SIZE_MAP + 1)
         self._font_hud_val.setWeight(QFont.Medium)
         self._fm_hud_lbl = QFontMetrics(self._font_hud_lbl)
         self._fm_hud_val = QFontMetrics(self._font_hud_val)
@@ -502,6 +496,7 @@ class MapWidget(QGraphicsView):
         line_h = 19
 
         rows = [
+            ("Scenario",   self._scenario_name),
             ("Time",       f"{self._sim_time:.0f} s"),
             ("Vehicles",   f"{self._vehicle_count}"),
             ("Avg speed",  f"{self._avg_speed:.0f} km/h"),
@@ -513,13 +508,6 @@ class MapWidget(QGraphicsView):
         fm_val = self._fm_hud_val
 
         lbl_col = max(fm_lbl.horizontalAdvance(lbl + ":") for lbl, _ in rows) + 10
-        val_col = max(fm_val.horizontalAdvance(val) for _, val in rows)
-        bg_w = pad + lbl_col + val_col + pad
-        bg_h = len(rows) * line_h + 14
-
-        painter.setBrush(QBrush(theme.color_alpha("surface", 215)))
-        painter.setPen(QPen(theme.color("border"), 1.0))
-        painter.drawRoundedRect(QRectF(pad - 4, pad - 4, bg_w, bg_h), 8, 8)
 
         x_lbl = pad
         x_val = pad + lbl_col
@@ -540,7 +528,7 @@ class MapWidget(QGraphicsView):
         """Render keyboard hint strip bottom-left. Content is cached as a QPixmap."""
         if self._kb_px is None:
             self._kb_px = self._build_kb_pixmap()
-        y = vp.bottom() - self._kb_px.height() - 12
+        y = vp.bottom() - self._kb_px.height() / self._kb_px.devicePixelRatioF() - 12
         painter.drawPixmap(12, int(y), self._kb_px)
 
     def _build_kb_pixmap(self) -> QPixmap:
@@ -552,8 +540,8 @@ class MapWidget(QGraphicsView):
             ("Q",      "Quit"),
         ]
         line_h = 16
-        font_key = QFont(); font_key.setPointSize(8); font_key.setWeight(QFont.Bold)
-        font_txt = QFont(); font_txt.setPointSize(8)
+        font_key = QFont(); font_key.setPointSize(config.FONT_SIZE_MAP - 1); font_key.setWeight(QFont.Bold)
+        font_txt = QFont(); font_txt.setPointSize(config.FONT_SIZE_MAP - 1)
         fm_key = QFontMetrics(font_key)
         fm_txt = QFontMetrics(font_txt)
         key_col = max(fm_key.horizontalAdvance(k) for k, _ in hints) + 8
@@ -561,7 +549,9 @@ class MapWidget(QGraphicsView):
         w = key_col + desc_w + 4
         h = len(hints) * line_h
 
-        px = QPixmap(w, h)
+        dpr = self.devicePixelRatioF()
+        px = QPixmap(int(w * dpr), int(h * dpr))
+        px.setDevicePixelRatio(dpr)
         px.fill(Qt.transparent)
         p = QPainter(px)
         p.setRenderHint(QPainter.TextAntialiasing)
@@ -584,7 +574,7 @@ class MapWidget(QGraphicsView):
         if self._zoom_level() < 4.0 or not self._vehicle_states or not self._active_links:
             return
         font = QFont()
-        font.setPointSize(7)
+        font.setPointSize(config.FONT_SIZE_MAP - 2)
         fm = QFontMetrics(font)
         painter.setFont(font)
         vp_rect = QRectF(vp)
@@ -605,7 +595,7 @@ class MapWidget(QGraphicsView):
             painter.setPen(theme.color("text_secondary"))
             painter.drawText(QPointF(mid.x() + 7, mid.y()), text)
 
-    # ── Zoom controls (bottom-right, above legend) ────────────────────────────
+    # ── Zoom controls + scenario name (top-right, no background) ────────────────
 
     def _draw_zoom_controls(self, painter: QPainter, vp) -> None:
         btn_size = 28
@@ -614,7 +604,7 @@ class MapWidget(QGraphicsView):
 
         zoom_text = f"{self._zoom_level():.1f}×"
         font = QFont()
-        font.setPointSize(9)
+        font.setPointSize(config.FONT_SIZE_MAP)
         fm = QFontMetrics(font)
         label_w = fm.horizontalAdvance(zoom_text) + 14
 
@@ -650,8 +640,9 @@ class MapWidget(QGraphicsView):
         """Blit the legend pixmap (built once, cached until theme changes)."""
         if self._legend_px is None:
             self._legend_px = self._build_legend_pixmap()
-        x = vp.right()  - self._legend_px.width()  - 12
-        y = vp.bottom() - self._legend_px.height() - 12
+        dpr = self._legend_px.devicePixelRatioF()
+        x = vp.right()  - self._legend_px.width()  / dpr - 12
+        y = vp.bottom() - self._legend_px.height() / dpr - 12
         painter.drawPixmap(int(x), int(y), self._legend_px)
 
     def _build_legend_pixmap(self) -> QPixmap:
@@ -671,8 +662,8 @@ class MapWidget(QGraphicsView):
             (_BYZ_FILL,                   "rect", "Byzantine"),
         ]
 
-        font_sm = QFont(); font_sm.setPointSize(8); font_sm.setWeight(QFont.Bold)
-        font_nm = QFont(); font_nm.setPointSize(9)
+        font_sm = QFont(); font_sm.setPointSize(config.FONT_SIZE_MAP - 1); font_sm.setWeight(QFont.Bold)
+        font_nm = QFont(); font_nm.setPointSize(config.FONT_SIZE_MAP)
         fm = QFontMetrics(font_nm)
         all_labels = ([r[2] for r in link_rows] + ["V2V (quality)"] +
                       [r[2] for r in veh_rows] + ["Width ∝ α"])
@@ -687,7 +678,9 @@ class MapWidget(QGraphicsView):
                        + row_h                    # α gradient
                        + pad)
 
-        px = QPixmap(legend_w, legend_h)
+        dpr = self.devicePixelRatioF()
+        px = QPixmap(int(legend_w * dpr), int(legend_h * dpr))
+        px.setDevicePixelRatio(dpr)
         px.fill(Qt.transparent)
         p = QPainter(px)
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
@@ -776,7 +769,7 @@ class MapWidget(QGraphicsView):
 
     def _draw_center_text(self, painter: QPainter, vp, text: str) -> None:
         font = QFont()
-        font.setPointSize(20)
+        font.setPointSize(config.FONT_SIZE_MAP + 11)
         font.setWeight(QFont.Bold)
         painter.setFont(font)
         painter.setPen(theme.color("pause_label"))
@@ -786,7 +779,7 @@ class MapWidget(QGraphicsView):
         dim = theme.color_alpha("overlay_bg", 160)
         painter.fillRect(vp, dim)
         font = QFont()
-        font.setPointSize(22)
+        font.setPointSize(config.FONT_SIZE_MAP + 13)
         font.setWeight(QFont.Bold)
         painter.setFont(font)
         painter.setPen(theme.color("accent"))

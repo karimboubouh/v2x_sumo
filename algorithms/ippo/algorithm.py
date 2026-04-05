@@ -40,7 +40,7 @@ from algorithms.ippo.config import (
     SELF_WEIGHT,
 )
 from dl.helpers import clone_state_dict, sl_tx_cost_norm
-import config as global_cfg
+import config
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
@@ -309,6 +309,7 @@ class IPPOAlgorithm(DLAlgorithm):
 
         connections: set  = set()
         link_types:  dict = {}
+        selected_ids: list[int] = []
         tx_cost:     float = 0.0
 
         for idx, (nbr, dist, link_type) in enumerate(candidates):
@@ -316,6 +317,7 @@ class IPPOAlgorithm(DLAlgorithm):
                 continue
             connections.add(nbr.id)
             link_types[nbr.id] = link_type
+            selected_ids.append(nbr.id)
             if link_type == LINK_SIDELINK:
                 tx_cost += float(sl_tx_cost_norm(dist)) * 0.02
             else:
@@ -323,9 +325,9 @@ class IPPOAlgorithm(DLAlgorithm):
 
         # Cap to MAX_NEIGHBORS — no attention score to rank by, so keep
         # candidates in the order the environment presented them (FIFO).
-        max_k = int(global_cfg.DL_CFG["MAX_NEIGHBORS"])
+        max_k = int(config.MAX_NEIGHBORS)
         if len(connections) > max_k:
-            overflow = list(connections)[max_k:]
+            overflow = selected_ids[max_k:]
             for nid in overflow:
                 connections.discard(nid)
                 link_types.pop(nid, None)

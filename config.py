@@ -54,6 +54,11 @@ SCENARIOS = {
         "description": "Circuit-style roads, interesting topology",
         "bbox": (54.595, 24.480, 54.615, 24.495),
     },
+    "khalifa_university": {
+        "name": "Khalifa University",
+        "description": "Shakhbout Bin Sultan St, Al Etihad, Abu Dhabi Island",
+        "bbox": (54.385, 24.440, 54.408, 24.457),
+    },
 }
 
 DEFAULT_SCENARIO = "dubai_marina"
@@ -99,8 +104,9 @@ WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 820
 MAP_PANEL_HEIGHT = 540
 LOG_PANEL_HEIGHT = 220
-FPS = 20           # processEvents cadence hint; Qt drives its own paint loop
-FONT_SIZE = 13
+FPS = 60           # processEvents cadence hint; Qt drives its own paint loop
+FONT_SIZE_LOG = 12   # Base font size for the log panel (pt)
+FONT_SIZE_MAP = 11    # Base font size for map UI elements (HUD, legend, zoom controls, etc.)
 LOG_MAX_LINES = None  # Keep the full message log from the start of the simulation
 STATUS_BAR_HEIGHT = 56  # Bottom status bar height (pixels)
 FL_LABEL_MIN_ZOOM = 3.0  # minimum zoom multiple at which α labels appear on FL links
@@ -114,7 +120,7 @@ ALGORITHM = "FedAvg"  # name of any algorithm in algorithms/<name>/algorithm.py
 
 # ── Termination ──────────────────────────────────────────
 MAX_TR_ROUNDS = 100
-TARGET_ACCURACY = 0.97  # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
+TARGET_ACCURACY = 1.01  # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
 EVAL_ROUNDS = 5  # evaluate global test metrics every N shared rounds
 
 # ── Decentralized Learning ───────────────────────────────
