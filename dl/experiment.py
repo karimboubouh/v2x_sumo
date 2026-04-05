@@ -21,6 +21,52 @@ os.environ.setdefault(
 import matplotlib
 import matplotlib.pyplot as plt
 
+# ── Style (from plots_reference) ──────────────────────────────────────────────
+_TEST_COLOR    = "#0072B2"   # solid  — test metric
+_TRAIN_COLOR   = "#56B4E9"   # light  — train metric (dashed)
+_PPO_COLOR     = "#7c3aed"   # purple — PPO reward
+_TRAIN_E_COLOR = "#2D6A4F"   # dark green — training energy
+_SL_COLOR      = "#0072B2"   # blue   — sidelink
+_INET_COLOR    = "#E69F00"   # amber  — internet
+_TOTAL_COLOR   = "#009E73"   # green  — total TX
+_W2 = 7.16   # figure width (inches)
+_H  = 2.3    # row height (inches)
+
+_PAPER_RC = {
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "mathtext.fontset": "stix",
+    "font.size": 9,
+    "axes.titlesize": 9,
+    "axes.labelsize": 9,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+    "legend.framealpha": 0.85,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "grid.linestyle": "--",
+    "grid.linewidth": 0.5,
+    "lines.linewidth": 1.6,
+    "lines.markersize": 3.5,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+}
+
+
+def _ema(values: list, alpha: float = 0.3) -> list:
+    """Exponential moving average smoothing."""
+    if not values:
+        return []
+    s, out = values[0], [values[0]]
+    for v in values[1:]:
+        s = alpha * v + (1.0 - alpha) * s
+        out.append(s)
+    return out
+
 
 def _backend_supports_show(backend: str) -> bool:
     backend = backend.lower()
@@ -166,12 +212,12 @@ def plot_experiment(
 ) -> dict:
     """Generate and save the requested experiment figures."""
     os.makedirs(output_dir, exist_ok=True)
-    train_history = list(experiment.get("train_history", []))
-    test_history = list(experiment.get("test_history", []))
+    train_history = sorted(experiment.get("train_history", []), key=lambda p: p["round"])
+    test_history  = sorted(experiment.get("test_history",  []), key=lambda p: p["round"])
     energy_totals = dict(experiment.get("energy_totals", {}))
     title = _line_title(experiment)
 
-    plt.style.use("seaborn-v0_8-whitegrid")
+    matplotlib.rcParams.update(_PAPER_RC)
     figures = {}
 
     train_rounds, train_acc = _prepare_series(train_history, "round", "acc")
@@ -184,131 +230,104 @@ def plot_experiment(
     reward_steps, reward_values = _prepare_series(reward_history, "step", "reward")
     reward_times, _ = _prepare_series(reward_history, "time", "reward")
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_rounds, train_acc, label="Train Accuracy", linewidth=2.0, color="#16a34a")
+    fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+    ax.plot(train_rounds, train_acc, label="Train Accuracy", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
     if test_history:
-        ax.plot(
-            test_rounds,
-            test_acc,
-            label="Test Accuracy",
-            marker="o",
-            linestyle="-",
-            markersize=5.0,
-            color="#2563eb",
-        )
+        ax.plot(test_rounds, test_acc, label="Test Accuracy", lw=1.8, marker="o", color=_TEST_COLOR)
     ax.set_title(f"Accuracy vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Accuracy")
-    ax.legend()
+    ax.legend(loc="lower right")
     figures["accuracy_vs_rounds"] = _save_figure(
         fig,
         os.path.join(output_dir, "accuracy_vs_rounds.png"),
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_times, train_acc, label="Train Accuracy", linewidth=2.0, color="#16a34a")
+    fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+    ax.plot(train_times, train_acc, label="Train Accuracy", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
     if test_history:
-        ax.plot(
-            test_times,
-            test_acc,
-            label="Test Accuracy",
-            marker="o",
-            linestyle="-",
-            markersize=5.0,
-            color="#2563eb",
-        )
+        ax.plot(test_times, test_acc, label="Test Accuracy", lw=1.8, marker="o", color=_TEST_COLOR)
     ax.set_title(f"Accuracy vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Accuracy")
-    ax.legend()
+    ax.legend(loc="lower right")
     figures["accuracy_vs_time"] = _save_figure(
         fig,
         os.path.join(output_dir, "accuracy_vs_time.png"),
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_rounds, train_loss, label="Train Loss", linewidth=2.0, color="#dc2626")
+    fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+    ax.plot(train_rounds, train_loss, label="Train Loss", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
     if test_history:
-        ax.plot(
-            test_rounds,
-            test_loss,
-            label="Test Loss",
-            marker="o",
-            linestyle="-",
-            markersize=5.0,
-            color="#2563eb",
-        )
+        ax.plot(test_rounds, test_loss, label="Test Loss", lw=1.8, marker="o", color=_TEST_COLOR)
     ax.set_title(f"Loss vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Loss")
-    ax.legend()
+    ax.legend(loc="upper right")
     figures["loss_vs_rounds"] = _save_figure(
         fig,
         os.path.join(output_dir, "loss_vs_rounds.png"),
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_times, train_loss, label="Train Loss", linewidth=2.0, color="#dc2626")
+    fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+    ax.plot(train_times, train_loss, label="Train Loss", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
     if test_history:
-        ax.plot(
-            test_times,
-            test_loss,
-            label="Test Loss",
-            marker="o",
-            linestyle="-",
-            markersize=5.0,
-            color="#2563eb",
-        )
+        ax.plot(test_times, test_loss, label="Test Loss", lw=1.8, marker="o", color=_TEST_COLOR)
     ax.set_title(f"Loss vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Loss")
-    ax.legend()
+    ax.legend(loc="upper right")
     figures["loss_vs_time"] = _save_figure(
         fig,
         os.path.join(output_dir, "loss_vs_time.png"),
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    energy_labels = [
-        "Computation",
-        "Sidelink TX",
-        "Internet TX",
-        "Total TX",
-    ]
+    fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+    energy_labels = ["Computation", "Sidelink TX", "Internet TX", "Total TX"]
     energy_values = [
         energy_totals.get("computation_energy_j", 0.0),
         energy_totals.get("sidelink_tx_energy_j", 0.0),
         energy_totals.get("internet_tx_energy_j", 0.0),
         energy_totals.get("total_tx_energy_j", 0.0),
     ]
-    bar_colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444"]
-    ax.bar(energy_labels, energy_values, color=bar_colors)
+    bar_colors = [_TRAIN_E_COLOR, _SL_COLOR, _INET_COLOR, _TOTAL_COLOR]
+    bars = ax.bar(energy_labels, energy_values, color=bar_colors, width=0.55,
+                  edgecolor="white", linewidth=0.8)
+    for bar, val in zip(bars, energy_values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
+                f"{val:.2f} J", ha="center", va="bottom", fontsize=7)
     ax.set_title(f"Energy Totals Across All Vehicles\n{title}")
     ax.set_ylabel("Energy (J)")
+    ax.tick_params(axis="x", rotation=15)
+    ax.set_ylim(top=max(energy_values) * 1.18 if any(energy_values) else 1)
     figures["energy_totals"] = _save_figure(
         fig,
         os.path.join(output_dir, "energy_totals.png"),
     )
 
     if reward_history:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(reward_steps, reward_values, label="Reward", linewidth=2.0, color="#7c3aed")
-        ax.axhline(0.0, color="#6b7280", linewidth=1.0, linestyle="--")
+        smooth = _ema(reward_values)
+
+        fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+        ax.plot(reward_steps, reward_values, color=_PPO_COLOR, lw=0.6, alpha=0.35, label="Raw reward")
+        ax.plot(reward_steps, smooth, color=_PPO_COLOR, lw=1.8, label="EMA (α=0.3)")
+        ax.axhline(0.0, color="k", lw=0.5, ls="--", alpha=0.4)
         ax.set_title(f"PPO Reward vs Steps\n{title}")
         ax.set_xlabel("Simulation Step")
-        ax.set_ylabel("Reward")
+        ax.set_ylabel("Avg. PPO Reward")
         ax.legend()
         figures["ppo_reward_vs_steps"] = _save_figure(
             fig,
             os.path.join(output_dir, "ppo_reward_vs_steps.png"),
         )
 
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(reward_times, reward_values, label="Reward", linewidth=2.0, color="#7c3aed")
-        ax.axhline(0.0, color="#6b7280", linewidth=1.0, linestyle="--")
+        fig, ax = plt.subplots(figsize=(_W2, _H * 2))
+        ax.plot(reward_times, reward_values, color=_PPO_COLOR, lw=0.6, alpha=0.35, label="Raw reward")
+        ax.plot(reward_times, smooth, color=_PPO_COLOR, lw=1.8, label="EMA (α=0.3)")
+        ax.axhline(0.0, color="k", lw=0.5, ls="--", alpha=0.4)
         ax.set_title(f"PPO Reward vs Time\n{title}")
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Reward")
+        ax.set_ylabel("Avg. PPO Reward")
         ax.legend()
         figures["ppo_reward_vs_time"] = _save_figure(
             fig,

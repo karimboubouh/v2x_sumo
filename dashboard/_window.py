@@ -218,6 +218,7 @@ class MainWindow(QMainWindow):
     def mark_done(self, overlay_text: str) -> None:
         self._sim_done = True
         self._map_widget.set_overlay(overlay_text)
+        self._status_widget.mark_done()
 
     @property
     def paused(self) -> bool:

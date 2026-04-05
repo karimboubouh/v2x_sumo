@@ -119,7 +119,7 @@ DPI_SCALE = 1.0    # Manual DPI hint (1.0 = auto; 2.0 forces HiDPI scaling tweak
 ALGORITHM = "FedAvg"  # name of any algorithm in algorithms/<name>/algorithm.py
 
 # ── Termination ──────────────────────────────────────────
-MAX_TR_ROUNDS = 20
+MAX_TR_ROUNDS = 200
 TARGET_ACCURACY = 1.01  # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
 EVAL_ROUNDS = 5  # evaluate global test metrics every N shared rounds
 

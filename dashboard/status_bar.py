@@ -29,6 +29,8 @@ class StatusWidget(QWidget):
         self._mem_mb = 0.0
         self._gpu: float | None = None
 
+        self._elapsed_frozen: float | None = None
+
         self._sample_timer = QTimer(self)
         self._sample_timer.setInterval(1000)
         self._sample_timer.timeout.connect(self._sample_metrics)
@@ -41,6 +43,11 @@ class StatusWidget(QWidget):
 
     def update_status(self, training_status: dict | None) -> None:
         self._training_status = training_status
+        self.update()
+
+    def mark_done(self) -> None:
+        if self._elapsed_frozen is None:
+            self._elapsed_frozen = time.monotonic() - self._start_time
         self.update()
 
     # ── Metrics sampling ──────────────────────────────────────────────────────
@@ -163,7 +170,7 @@ class StatusWidget(QWidget):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _build_segments(self, ts: dict | None) -> list[tuple[str, str]]:
-        elapsed = time.monotonic() - self._start_time
+        elapsed = self._elapsed_frozen if self._elapsed_frozen is not None else time.monotonic() - self._start_time
         segs: list[tuple[str, str]] = [("Runtime: ", self._fmt_dur(elapsed))]
 
         if ts and ts.get("enabled"):
