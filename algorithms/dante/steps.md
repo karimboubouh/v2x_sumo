@@ -4,148 +4,164 @@
 
 ## 0. Initialization (`setup`)
 
-When the experiment starts, every vehicle gets its own **independent PPO agent** — a `_VehiclePPOAgent`. That agent owns a single `_GATActorCritic` neural network with three sub-modules:
+Every vehicle gets its own independent PPO agent with one shared encoder and three heads:
 
 ```
 _GATActorCritic
 ├── own_encoder   (MLP: 6 → 64 → 64)    encodes v_i's own state
-├── gat           (_GATLayer)            attends over candidates
-├── actor         (MLP: 192 → 64 → 1)   decides keep/drop per candidate
-└── critic        (MLP: 128 → 64 → 1)   estimates state value V(s)
+├── gat           (_GATLayer)            builds shared neighborhood context
+├── selector      (MLP: 192 → 64 → 1)   PPO Bernoulli keep/drop logit
+├── mixer         (MLP: 192 → 64 → 1)   aggregation score per neighbor
+└── critic        (MLP: 128 → 64 → 1)   state value V(s)
 ```
 
-Nobody shares weights with anyone. Vehicle $i$'s policy is entirely its own.
+The selector and mixer are now decoupled:
+- selector decides **who to keep**
+- mixer decides **how much weight each kept neighbor gets**
 
 ---
 
 ## Step 1 — Observe the state
 
-At the start of each collaboration step, `select_neighbors` is called. Vehicle $i$ observes two things:
+`select_neighbors()` consumes:
 
-**Own state** — `v.own_features()` → shape `(6,)`:
+**Own state** — `v.own_features()` → shape `(6,)`
 
-| index | meaning |
-|-------|---------|
-| 0 | `current_loss / 5` |
-| 1 | `current_acc` |
-| 2 | `\|connections\| / MAX_COLLAB_NEIGHBORS` |
-| 3 | `pos_x / network_size` |
-| 4 | `pos_y / network_size` |
-| 5 | Byzantine flag (0 or 1) |
-
-**Neighbor features** — `env.neighbor_features(v, candidates)` → shape `(N, 6)`:
+**Neighbor features** — `env.neighbor_features(v, candidates)` → shape `(N, 7)`
 
 | index | meaning |
 |-------|---------|
 | 0 | cosine similarity of model parameters with $j$ |
-| 1 | normalized distance to $j$ |
-| 2 | tx_cost = `norm_dist²` |
-| 3 | relative heading speed (direction divergence) |
-| 4 | neighbor accuracy |
-| 5 | link type (sidelink=0, internet=1) |
+| 1 | gradient alignment with $j$ |
+| 2 | normalized distance to $j$ |
+| 3 | normalized transfer energy cost |
+| 4 | relative heading divergence |
+| 5 | neighbor accuracy |
+| 6 | link type (sidelink=0, internet=1) |
+
+The new signal is **gradient alignment**. The cost feature now uses the same energy model as the simulator's transmission accounting.
 
 ---
 
-## Step 2 — Forward pass through the GAT+PPO policy
+## Step 2 — Shared encoder + decoupled heads
 
 `agent.act(own_state, nbr_features)`
 
-**2a. GAT layer:**
+### 2a. Shared GAT context
 
 ```
-h_i  = self_proj(own_state)               # shape (64,)
-v_j  = nbr_proj(nbr_features)             # shape (N, 64)
-e_ij = attn(LeakyReLU([h_i_rep ; v_j]))   # shape (N,)
-α    = softmax(e_ij)                       # attention weights, sum to 1
-emb  = Σ α_j * v_j                        # shape (64,)  ← aggregated neighborhood
+h_i  = self_proj(own_state)
+v_j  = nbr_proj(nbr_features)
+e_ij = attn(LeakyReLU([h_i_rep ; v_j]))
+a_ij = softmax(e_ij)
+emb  = Σ a_ij * v_j
 ```
 
-The attention $\alpha_j$ tells the model how "relevant" neighbor $j$ is, before any keep/drop decision is made.
+This attention is now only an internal context mechanism. It is **not** reused as the aggregation weight.
 
-**2b. Own encoder:** `own_enc = MLP(own_state)` → shape `(64,)`
-
-**2c. Fused context:** `fused = concat(own_enc, emb)` → shape `(128,)`
-
-**2d. Critic:** `V(s) = critic(fused)` → scalar (used later for PPO)
-
-**2e. Actor — per-neighbor decision:**
+### 2b. Heads
 
 ```
-for each neighbor j:
-    logit_j = actor(concat(fused_rep, v_j))
-    action_j ~ Bernoulli(sigmoid(logit_j))   # 1 = keep, 0 = drop
+own_enc = own_encoder(own_state)
+fused   = concat(own_enc, emb)
+value   = critic(fused)
+
+selector_logit_j = selector(concat(fused_rep, v_j))
+mixer_logit_j    = mixer(concat(fused_rep, v_j))
+```
+
+The selector samples:
+
+```
+action_j ~ Bernoulli(sigmoid(selector_logit_j))
+```
+
+The mixer produces a separate soft ranking:
+
+```
+mixer_prob = softmax(mixer_logits / tau)
 ```
 
 ---
 
-## Step 3 — Filter and cap the neighborhood
+## Step 3 — Keep only useful neighbors
 
-Vehicle $i$ iterates its candidates:
-- keeps neighbor $j$ only if `action[j] == 1`
-- records `alphas[j.id] = attention[j]` and accumulates `tx_cost`
+Vehicle $i$ only keeps neighbors with `action_j = 1`.
 
-If more than `MAX_COLLAB_NEIGHBORS` were kept, the lowest-attention ones are dropped:
+Each selected neighbor gets a utility score:
 
-```python
-# keep only top-k by attention weight
-for nid in sorted(connections, key=lambda n: alphas[n])[:-max_k]:
-    connections.discard(nid)
+```
+utility_j = selector_prob_j * mixer_prob_j / (1 + normalized_energy_j)
 ```
 
-A **pending transition** is saved:
-```
-{own_state, nbr_features, action, log_prob, value, tx_cost, target_round = tr_rounds + 1}
-```
+If too many neighbors were selected, DANTE keeps the top `MAX_COLLAB_NEIGHBORS` by this utility score. This is where the selector starts preferring only the neighbors that are both useful and cheap enough.
 
-This is held until the round completes and a reward can be assigned.
+Final aggregation weights are then recomputed from the mixer probabilities over the kept subset only.
+
+The pending PPO transition stores:
+
+```
+{own_state, nbr_features, action, log_prob, value, energy_j, target_round}
+```
 
 ---
 
-## Step 4 — Local training
+## Step 4 — Local training + gradient capture
 
-Vehicle $i$ trains locally for `BATCHES_PER_ROUND` mini-batches in a background thread:
-- `_prev_loss` is set to the old `current_loss`
-- model is trained, `current_loss` and `current_acc` are updated
-- `tr_rounds += 1`, `training_done` event is set
+During `train_local()`:
+- the vehicle trains for `BATCHES_PER_ROUND` mini-batches
+- the last mini-batch gradient of the first two parameter tensors is captured
+- `last_grad_vec` is saved for future neighbor scoring
 
----
-
-## Step 5 — Attention-weighted aggregation (`aggregate`)
-
-Vehicle $i$ merges its model with the accepted neighbors', using the **GAT attention weights** as aggregation coefficients:
-
-```
-w_j     = α_j / Σ α_k                              # normalize over kept neighbors
-new_θ_i = 0.3 * θ_i + 0.7 * Σ w_j * θ_j
-```
-
-The 0.3 / 0.7 split is `SELF_WEIGHT = 0.3`. The same $\alpha_j$ values that the GAT computed to decide *who to keep* are reused to decide *how much to trust* each keeper. This is the key coupling in DANTE.
+This gives the next round a direct proxy for whether a neighbor's update direction is aligned with mine.
 
 ---
 
-## Step 6 — Reward signal and PPO update (`post_step`)
+## Step 5 — Aggregation uses the mixer, not the selector
 
-Once `v.tr_rounds >= target_round` (the pending round has completed):
+After local training, accepted neighbors are aggregated with:
 
-**Reward:**
 ```
-r = max(prev_loss - current_loss, 0)   # loss improvement
-  - tx_cost                            # communication penalty
+w_j     = mixer_prob_j / Σ mixer_prob_k     # over kept neighbors only
+new_θ_i = SELF_WEIGHT * θ_i + (1-SELF_WEIGHT) * Σ w_j * θ_j
 ```
 
-Positive if the round reduced loss, penalized by how expensive the chosen links were.
+The mixer head controls aggregation. The selector head no longer leaks into the aggregation rule.
 
-The pending transition is **finalized** with `(reward, next_value, done)` and pushed into the rollout buffer.
+---
 
-**PPO update** triggers when `len(rollout) >= PPO_UPDATE_EVERY` (= 8 transitions) or at episode end:
+## Step 6 — Reward and PPO update
 
-1. Compute **GAE advantages** over the rollout (γ = 0.99, λ = 0.95)
-2. For `PPO_EPOCHS = 4` epochs, shuffle and iterate:
-   - Re-evaluate log-probs and value under the current policy
-   - Compute clipped surrogate loss: `min(r·A, clip(r, 0.8, 1.2)·A)`
-   - Add value loss (MSE) and entropy bonus
-   - Gradient step with `max_grad_norm = 1.0` clipping
-3. Rollout buffer is cleared
+When the pending round finishes, DANTE computes a blended progress signal:
+
+```
+progress = 0.5 * Δtrain_loss + 0.5 * Δreward_loss + c_acc * Δreward_acc
+```
+
+Communication cost uses actual transmission energy:
+
+```
+cost_norm = round_energy_j / TYPICAL_ROUND_ENERGY_J
+```
+
+Reward is shaped to prefer helpful, sparse neighborhoods:
+
+```
+if progress >= 0:
+    reward = progress / (1 + λ * cost_norm)
+else:
+    reward = progress * (1 + λ * cost_norm)
+```
+
+This means:
+- helpful, cheap neighborhoods keep most of their reward
+- expensive neighborhoods get discounted
+- expensive bad neighborhoods are punished harder
+
+The PPO update still uses GAE and a clipped surrogate, but now:
+- updates happen every `8` transitions instead of `4`
+- advantage normalization is skipped on tiny rollouts
+- the mixer head gets an auxiliary supervised loss toward a gradient-alignment target
 
 ---
 
@@ -153,21 +169,23 @@ The pending transition is **finalized** with `(reward, next_value, done)` and pu
 
 ```
 Round t:
-  [observe own_state + nbr_features]
+  [observe own state + 7-dim neighbor features]
            ↓
-  [GAT attention α_j + Bernoulli actions]
+  [shared GAT context]
            ↓
-  [filter neighbors → connections, store transition]
+  [selector PPO head decides keep/drop]
            ↓
-  [train locally → loss ↓, tr_rounds++]
+  [mixer head scores kept neighbors]
            ↓
-  [aggregate: own*0.3 + Σ α_j*nbr_j*0.7]
+  [cost-aware top-k pruning]
            ↓
-  [reward = Δloss - tx_cost]
+  [local training + gradient capture]
            ↓
-  [PPO update every 8 rounds]
+  [aggregate with mixer weights]
            ↓
-Round t+1  (better policy)
+  [reward = progress shaped by actual energy]
+           ↓
+  [PPO update + mixer auxiliary update]
 ```
 
-The core novelty: the **same attention weights that select neighbors also control aggregation weights**, and the whole selection policy is learned end-to-end via PPO with a communication-aware reward.
+The key change is that DANTE now learns **selection** and **aggregation** with separate mechanisms while exposing a direct gradient-alignment signal and a reward that makes excessive internet/sidelink usage costly.

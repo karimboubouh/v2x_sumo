@@ -21,7 +21,7 @@ import config
 import logger
 from algorithms import build_algorithm, LINK_SIDELINK, LINK_INTERNET
 from algorithms import get_algorithm_config
-from algorithms.dante.config import NBR_DIM
+from algorithms.dante.config import NBR_DIM, TYPICAL_ROUND_ENERGY_J
 from dl.helpers import (
     eval_model_on_loader,
     eval_vehicles,
@@ -350,7 +350,7 @@ class DLEnvironment:
         return cos_sim * float(np.clip(other.current_reward_acc, 0.0, 1.0))
 
     def neighbor_features(self, v: Vehicle, nbrs: list) -> np.ndarray:
-        """Build the (N, NBR_DIM=6) feature matrix from V2X beacon data."""
+        """Build the (N, NBR_DIM=7) feature matrix from V2X beacon data."""
         if not nbrs:
             return np.zeros((0, NBR_DIM), dtype=np.float32)
 
@@ -358,24 +358,33 @@ class DLEnvironment:
         inet_range = float(config.INTERNET_RANGE)
         feats = []
         p_v = v.get_param_vec()
+        g_v = v.get_grad_vec()
         norm_v = np.linalg.norm(p_v)
+        grad_norm_v = np.linalg.norm(g_v)
+        typical_energy = max(float(TYPICAL_ROUND_ENERGY_J), 1e-8)
 
         for nbr, dist, link_type in nbrs:
             p_n = nbr.get_param_vec()
+            g_n = nbr.get_grad_vec()
             cos_sim = float(np.clip(
                 np.dot(p_v, p_n) / (norm_v * np.linalg.norm(p_n) + 1e-8),
+                -1.0, 1.0,
+            ))
+            grad_align = float(np.clip(
+                np.dot(g_v, g_n) / (grad_norm_v * np.linalg.norm(g_n) + 1e-8),
                 -1.0, 1.0,
             ))
 
             ref_range = v2x_range if link_type == LINK_SIDELINK else inet_range
             nd = float(np.clip(dist / max(ref_range, 1.0), 0.0, 1.0))
-            tx_cost = nd ** 2
+            tx_energy = float(sl_tx_energy_j(dist)) if link_type == LINK_SIDELINK else float(inet_tx_energy_j())
+            tx_cost = float(np.clip(tx_energy / typical_energy, 0.0, 4.0))
 
             dh = abs(v.heading - nbr.heading)
             rel_spd = float(np.clip(min(dh, 2 * np.pi - dh) / np.pi, 0.0, 1.0))
             nbr_acc = float(np.clip(nbr.current_reward_acc, 0.0, 1.0))
 
-            feats.append([cos_sim, nd, tx_cost, rel_spd, nbr_acc, link_type])
+            feats.append([cos_sim, grad_align, nd, tx_cost, rel_spd, nbr_acc, link_type])
 
         return np.array(feats, dtype=np.float32)
 

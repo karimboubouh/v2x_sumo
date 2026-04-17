@@ -17,8 +17,8 @@ COMMON_ARGS=(
 
 declare -a EXPERIMENTS=()
 
-#for algo in DPFL DANTE IPPO pFedGraph; do
-for algo in DANTE DPFL IPPO pFedGraph FedAvg D-PSGD; do
+for algo in DPFL DANTE IPPO pFedGraph; do
+#for algo in DANTE DPFL IPPO pFedGraph FedAvg D-PSGD; do
   run_cli_experiment "$algo main comparison" "${COMMON_ARGS[@]}" --dl-algorithm "$algo"
   EXPERIMENTS+=("$LAST_EXPERIMENT_DIR")
 done

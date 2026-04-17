@@ -120,9 +120,11 @@ class Vehicle:
         self.current_val_loss = init_loss
         self.current_val_acc = 0.0
         self._prev_val_loss = init_loss
+        self._prev_val_acc = 0.0
         self.current_reward_loss = init_loss
         self.current_reward_acc = 0.0
         self._prev_reward_loss = init_loss
+        self._prev_reward_acc = 0.0
         self.loss_hist = []
         self.acc_hist = []
         self.reward_hist = []
@@ -134,6 +136,7 @@ class Vehicle:
 
         # Cached flattened first-layer parameters for cosine-similarity
         self._param_vec: np.ndarray | None = None
+        self.last_grad_vec: np.ndarray = self._zero_param_vec()
         self.last_sim_time = 0.0
         self._round_started_at = 0.0
         self._pending_transfers = []
@@ -167,15 +170,36 @@ class Vehicle:
 
     # ── Feature vector ────────────────────────────────────────────────────────
 
+    def _flatten_first_two_params(self) -> np.ndarray:
+        return np.concatenate([
+            p.detach().numpy().ravel()
+            for p in list(self.model.parameters())[:2]
+        ]).astype(np.float32, copy=False)
+
+    def _flatten_first_two_grads(self) -> np.ndarray:
+        parts = []
+        for param in list(self.model.parameters())[:2]:
+            grad = param.grad
+            if grad is None:
+                parts.append(np.zeros(param.numel(), dtype=np.float32))
+            else:
+                parts.append(grad.detach().numpy().ravel().astype(np.float32, copy=False))
+        return np.concatenate(parts).astype(np.float32, copy=False)
+
+    def _zero_param_vec(self) -> np.ndarray:
+        return np.zeros_like(self._flatten_first_two_params(), dtype=np.float32)
+
     def get_param_vec(self) -> np.ndarray:
         """Cached flattened first-layer parameters for cosine-similarity."""
         if self._param_vec is None:
             with self._lock:
-                self._param_vec = np.concatenate([
-                    p.detach().numpy().flatten()
-                    for p in list(self.model.parameters())[:2]
-                ])
+                self._param_vec = self._flatten_first_two_params()
         return self._param_vec
+
+    def get_grad_vec(self) -> np.ndarray:
+        """Return the most recent captured gradient vector for neighbor scoring."""
+        with self._lock:
+            return self.last_grad_vec.copy()
 
     def own_features(self) -> np.ndarray:
         """
@@ -216,6 +240,7 @@ class Vehicle:
             self._ref_weights = clone_state_dict(self.model.state_dict())
             self.model.train()
             total_loss, total_correct, total_n = 0.0, 0, 0
+            last_grad_vec = self._zero_param_vec()
 
             _bpr = config.BATCHES_PER_ROUND
             batch_iter = (
@@ -235,6 +260,7 @@ class Vehicle:
                         loss = loss + extra
 
                 loss.backward()
+                last_grad_vec = self._flatten_first_two_grads()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
 
@@ -268,8 +294,10 @@ class Vehicle:
                 self.current_loss = avg_loss
                 self.current_acc = avg_acc
                 self._prev_reward_loss = self.current_reward_loss
+                self._prev_reward_acc = self.current_reward_acc
                 if reward_eval is not None:
                     self._prev_val_loss = self.current_val_loss
+                    self._prev_val_acc = self.current_val_acc
                     self.current_val_loss = float(reward_eval["loss"])
                     self.current_val_acc = float(reward_eval["acc"])
                     self.current_reward_loss = self.current_val_loss
@@ -283,10 +311,11 @@ class Vehicle:
                 self._shared_weights = clone_state_dict(self.model.state_dict())
 
                 # Refresh param cache for neighbor feature computation
-                self._param_vec = np.concatenate([
-                    p.detach().numpy().flatten()
-                    for p in list(self.model.parameters())[:2]
-                ])
+                self._param_vec = self._flatten_first_two_params()
+                if np.all(np.isfinite(last_grad_vec)):
+                    self.last_grad_vec = last_grad_vec.astype(np.float32, copy=True)
+                else:
+                    self.last_grad_vec = self._zero_param_vec()
                 self.computation_energy_j += computation_energy_j
 
             self.loss_hist.append(avg_loss)
