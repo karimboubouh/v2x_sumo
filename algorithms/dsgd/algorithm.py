@@ -1,12 +1,15 @@
 """
 D-PSGD — Decentralized Parallel SGD with Metropolis-Hastings gossip averaging.
 
-Dynamic topology, doubly-stochastic mixing matrix.
-Adapted from v2x_sim/algorithms/dsgd/algorithm.py.
+Dynamic topology, doubly stochastic mixing matrix.
 """
 
-from algorithms.base import DLAlgorithm
-import config
+from algorithms.base import DLAlgorithm, LINK_INTERNET
+from algorithms.dsgd.config import (
+    MAX_COLLAB_NEIGHBORS,
+    MAX_INTERNET_NEIGHBORS,
+    MAX_SIDELINK_NEIGHBORS,
+)
 from dl.helpers import clone_state_dict
 
 
@@ -21,14 +24,21 @@ class DSGDAlgorithm(DLAlgorithm):
     name = "D-PSGD"
     needs_dynamic_neighbors = True
 
+    def __init__(self):
+        self.max_sidelink_neighbors = int(MAX_SIDELINK_NEIGHBORS)
+        self.max_internet_neighbors = int(MAX_INTERNET_NEIGHBORS)
+        self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
+
     def select_neighbors(self, v, candidates: list, env) -> tuple:
-        """Accept candidates (sidelink + internet), capped at MAX_NEIGHBORS."""
-        max_k = int(config.MAX_NEIGHBORS)
+        """Accept only internet candidates, capped at self.max_collab_neighbors."""
+        max_k = int(self.max_collab_neighbors)
         connections = set()
         link_types = {}
         alphas = {}
 
         for other, dist, lt in candidates:
+            if lt != LINK_INTERNET:
+                continue
             if len(connections) >= max_k:
                 break
             connections.add(other.id)

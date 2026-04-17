@@ -158,7 +158,6 @@ python main.py --scenario abu_dhabi_corniche --speed 0 -v debug
 | `--dl-algorithm` | | `FedAvg` | DPL algorithm: `FedAvg` `D-PSGD` `DPFL` |
 | `--dl-dataset` | | `MNIST` | Training dataset: `MNIST` `FEMNIST` `CIFAR10` `CIFAR100` |
 | `--dl-model` | | `DNN` | Model architecture: `DNN` `CNN` `LSTM` `Transformer` `ResNet` |
-| `--dl-demo` | | off | Periodic dummy weight exchange demo over CommManager |
 
 ---
 
@@ -206,9 +205,6 @@ sumo/
 │   ├── menu.py                 # Top menu bar
 │   ├── status_bar.py           # Bottom CPU/RAM/GPU/time bar
 │   └── theme.py                # Dark / light theme definitions
-│
-├── fl_interface/
-│   └── fl_payload.py           # DL weight serialization (demo stub)
 │
 └── scenarios/
     ├── dubai_marina/
@@ -321,7 +317,7 @@ Internet links are only established when their quality score (cosine similarity 
 
 #### FedAvg
 
-Used here as a **DPL baseline**. Classic equal-weight model averaging on a **static random graph** built at initialization. Each vehicle gets up to `MAX_NEIGHBORS` random peers assigned once. The graph does not change as vehicles move. Since all vehicles average toward a global consensus, this algorithm does *not* personalize — it serves as the lower bound for comparison.
+Used here as a **DPL baseline**. Classic equal-weight model averaging on a **static random graph** built at initialization. Each vehicle gets up to `MAX_COLLAB_NEIGHBORS` random peers assigned once. The graph does not change as vehicles move. Since all vehicles average toward a global consensus, this algorithm does *not* personalize — it serves as the lower bound for comparison.
 
 ```
 theta_v  <-  (theta_v + sum_j theta_j) / (1 + |neighbors|)
@@ -609,7 +605,7 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 |---|---|---|
 | `NUM_VEHICLES` | `50` | Default vehicle count |
 | `COMM_RANGE` | `500` | V2V communication range in meters |
-| `MAX_NEIGHBORS` | `5` | Max V2V connections per vehicle (top-N by signal quality) |
+| `MAX_SIDELINK_NEIGHBORS` | `5` | Max sidelink candidates kept after distance ranking |
 | `SIM_STEP_LENGTH` | `1.0` | SUMO step duration (seconds) |
 | `TIME_TO_TELEPORT` | `10` | Seconds before a stuck vehicle is teleported (`-1` to disable) |
 | `VEHICLE_FORCE_SPEED` | `None` | Force speed in km/h (`None` = SUMO car-following model) |
@@ -622,10 +618,11 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 
 | Constant | Default | Description |
 |---|---|---|
-| `V2X_RANGE` | `250` | Sidelink D2D range in meters |
-| `MAX_NEIGHBORS` | `10` | Max sidelink collaborators |
+| `COMM_RANGE` | `250` | Sidelink D2D range in meters |
+| `MAX_SIDELINK_NEIGHBORS` | `5` | Max sidelink candidates kept after distance ranking |
 | `INTERNET_RANGE` | `2000` | Max distance for internet relay links |
-| `MAX_INTERNET_NEIGHBORS` | `3` | Max internet collaborators |
+| `MAX_INTERNET_NEIGHBORS` | `3` | Max internet candidates kept after quality ranking |
+| `MAX_COLLAB_NEIGHBORS` | `5` | Max peers an FL algorithm may aggregate with |
 | `INTERNET_QUALITY_THRESHOLD` | `0.45` | Minimum quality score to accept an internet peer |
 | `LOCAL_LR` | `1e-3` | Adam learning rate |
 | `BATCH_SIZE` | `32` | Mini-batch size |

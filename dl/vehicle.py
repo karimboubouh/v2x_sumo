@@ -21,7 +21,7 @@ from algorithms.base import LINK_INTERNET, LINK_SIDELINK
 import config
 from dl.data import get_n_classes
 from dl.models import build_model
-from dl.helpers import _inf_loader, clone_state_dict
+from dl.helpers import _inf_loader, clone_state_dict, eval_model_on_loader
 
 
 class Vehicle:
@@ -41,6 +41,8 @@ class Vehicle:
     tr_rounds       : completed training rounds
     current_loss    : latest avg mini-batch loss
     current_acc     : latest avg mini-batch accuracy in [0, 1]
+    current_reward_loss : latest PPO reward loss source (train or validation)
+    current_reward_acc  : latest PPO reward accuracy source (train or validation)
 
     Threading
     ---------
@@ -48,8 +50,17 @@ class Vehicle:
     training_done   : Event: SET = idle, CLEAR = training in progress
     """
 
-    def __init__(self, vid: int, sumo_id: str, train_loader, network_bounds: tuple,
-                 event_stream=None):
+    def __init__(
+        self,
+        vid: int,
+        sumo_id: str,
+        train_loader,
+        network_bounds: tuple,
+        train_eval_loader=None,
+        val_loader=None,
+        test_loader=None,
+        event_stream=None,
+    ):
         """
         Args:
             vid: integer ID (0-based, used for list indexing)
@@ -73,6 +84,10 @@ class Vehicle:
         self.model = build_model(config.DATASET, config.MODEL_ARCH)
         self._lock = threading.Lock()
         self.train_loader = train_loader
+        self.train_eval_loader = train_eval_loader or train_loader
+        self.val_loader = val_loader or self.train_eval_loader
+        self.test_loader = test_loader or self.val_loader
+        self.eval_loader = self.train_eval_loader
         self._inf_iter = _inf_loader(train_loader)
         self.n_classes = get_n_classes(config.DATASET)
         self.optimizer = torch.optim.Adam(
@@ -102,6 +117,12 @@ class Vehicle:
         self.current_loss = init_loss
         self.current_acc = 0.0
         self._prev_loss = init_loss
+        self.current_val_loss = init_loss
+        self.current_val_acc = 0.0
+        self._prev_val_loss = init_loss
+        self.current_reward_loss = init_loss
+        self.current_reward_acc = 0.0
+        self._prev_reward_loss = init_loss
         self.loss_hist = []
         self.acc_hist = []
         self.reward_hist = []
@@ -159,18 +180,22 @@ class Vehicle:
     def own_features(self) -> np.ndarray:
         """
         Compact state vector (6 features).
-        [0] loss / 5
-        [1] current_acc
-        [2] |connections| / MAX_NEIGHBORS
+        [0] reward-aligned loss / 5
+        [1] reward-aligned accuracy
+        [2] |connections| / algorithm max_collab_neighbors  — reflects the *previous*
+            round's connection set (stale by design: the current policy
+            decision has not been committed yet when this is called).
         [3] pos_x / network_size
         [4] pos_y / network_size
-        [5] Byzantine flag
+        [5] Byzantine flag — reserved; always 0.0 until Byzantine vehicle
+            support is implemented (see config.BYZANTINE_FRACTION).
         """
         ns = self._network_size
+        max_collab = max(int(getattr(self._algo, "max_collab_neighbors", 1)), 1)
         return np.array([
-            float(np.clip(self.current_loss, 0.0, 5.0)) / 5.0,
-            float(np.clip(self.current_acc, 0.0, 1.0)),
-            len(self.connections) / max(config.MAX_NEIGHBORS, 1),
+            float(np.clip(self.current_reward_loss, 0.0, 5.0)) / 5.0,
+            float(np.clip(self.current_reward_acc, 0.0, 1.0)),
+            len(self.connections) / max_collab,
             float(np.clip(self.pos[0] / ns, 0.0, 1.0)),
             float(np.clip(self.pos[1] / ns, 0.0, 1.0)),
             float(self.is_byzantine),
@@ -192,8 +217,13 @@ class Vehicle:
             self.model.train()
             total_loss, total_correct, total_n = 0.0, 0, 0
 
-            for _ in range(config.BATCHES_PER_ROUND):
-                images, labels = next(self._inf_iter)
+            _bpr = config.BATCHES_PER_ROUND
+            batch_iter = (
+                iter(self.train_loader)          # full epoch
+                if not _bpr                      # 0 or None → all batches
+                else (next(self._inf_iter) for _ in range(_bpr))
+            )
+            for images, labels in batch_iter:
                 self.optimizer.zero_grad()
                 logits = self.model(images)
                 loss = self.criterion(logits, labels)
@@ -216,6 +246,16 @@ class Vehicle:
             avg_loss = total_loss / max(total_n, 1)
             avg_acc = total_correct / max(total_n, 1)
             round_time_s = time.perf_counter() - round_started
+            reward_source = str(
+                getattr(self._algo, "reward_source", "training")
+            ).strip().lower()
+            reward_eval = None
+            if reward_source == "validation":
+                reward_eval = eval_model_on_loader(
+                    self.model,
+                    self.val_loader,
+                    criterion=self.criterion,
+                )
             # Theoretical DVFS computation energy: E = κ · I·|D_k| · L_k · f_k²
             # total_n = I × |D_k| (actual samples processed this round)
             kappa = float(config.KAPPA)
@@ -227,6 +267,16 @@ class Vehicle:
                 self._prev_loss = self.current_loss
                 self.current_loss = avg_loss
                 self.current_acc = avg_acc
+                self._prev_reward_loss = self.current_reward_loss
+                if reward_eval is not None:
+                    self._prev_val_loss = self.current_val_loss
+                    self.current_val_loss = float(reward_eval["loss"])
+                    self.current_val_acc = float(reward_eval["acc"])
+                    self.current_reward_loss = self.current_val_loss
+                    self.current_reward_acc = self.current_val_acc
+                else:
+                    self.current_reward_loss = avg_loss
+                    self.current_reward_acc = avg_acc
                 self.tr_rounds += 1
                 round_n = self.tr_rounds
 
@@ -287,9 +337,27 @@ class Vehicle:
             self.training_done.set()
 
     def get_shared_weights(self) -> dict:
-        """Thread-safe copy of the weights broadcast over V2X."""
+        """Thread-safe copy of the weights broadcast over V2X.
+
+        Byzantine vehicles send Gaussian-noise weights instead of their real
+        model to poison the aggregation of any neighbor that selects them.
+        """
         with self._lock:
+            if self.is_byzantine:
+                return self._byzantine_weights(self._shared_weights)
             return clone_state_dict(self._shared_weights)
+
+    def _byzantine_weights(self, sd: dict) -> dict:
+        """Return a state dict where every floating-point tensor is replaced
+        by i.i.d. Gaussian noise with the same shape and dtype.  Non-floating
+        tensors (e.g. BatchNorm num_batches_tracked) are cloned unchanged."""
+        corrupted = {}
+        for key, tensor in sd.items():
+            if tensor.is_floating_point():
+                corrupted[key] = torch.randn_like(tensor)
+            else:
+                corrupted[key] = tensor.clone()
+        return corrupted
 
     def add_transmission_energy(self, link_type: float, energy_j: float) -> None:
         """Accumulate transmission energy spent sending weights to peers."""

@@ -2,16 +2,20 @@
 DPFL — Decentralized Personalized Learning.
 
 Greedy Graph Construction for optimal collaboration graph.
-Adapted from v2x_sim/algorithms/dpfl/algorithm.py.
 """
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from algorithms.base import DLAlgorithm, LINK_INTERNET
-from algorithms.dpfl.config import DPFL_UPDATE_EVERY, SELF_WEIGHT
 import config
+from algorithms.base import DLAlgorithm, LINK_INTERNET
+from algorithms.dpfl.config import (
+    DPFL_UPDATE_EVERY,
+    MAX_COLLAB_NEIGHBORS,
+    MAX_INTERNET_NEIGHBORS,
+    MAX_SIDELINK_NEIGHBORS,
+    SELF_WEIGHT,
+)
 from dl.helpers import clone_state_dict
 
 
@@ -26,10 +30,14 @@ class DPFLAlgorithm(DLAlgorithm):
 
     name = "DPFL"
     needs_dynamic_neighbors = True
+    evaluation_mode = "personalized"
 
     def __init__(self):
         self._update_every = DPFL_UPDATE_EVERY
         self._temp_model = None
+        self.max_sidelink_neighbors = int(MAX_SIDELINK_NEIGHBORS)
+        self.max_internet_neighbors = int(MAX_INTERNET_NEIGHBORS)
+        self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
 
     def setup(self, vehicles: list) -> None:
         """Initialise per-vehicle DPFL state and the shared evaluation model."""
@@ -81,8 +89,9 @@ class DPFLAlgorithm(DLAlgorithm):
             v.model.load_state_dict(new_sd)
 
     def _run_ggc(self, v, candidates: list) -> None:
-        """Greedy Graph Construction (Algorithm 2, Kharrat et al. 2025)."""
-        val_images, val_labels = next(v._inf_iter)
+        """Greedy Graph Construction following the paper's double-greedy rule."""
+        eval_loader = getattr(v, "val_loader", None) or getattr(v, "eval_loader", None) or v.train_eval_loader
+        val_images, val_labels = next(iter(eval_loader))
 
         candidate_dict = {c.id: c for c, _, lt in candidates if lt == LINK_INTERNET}
         if not candidate_dict:
@@ -91,31 +100,46 @@ class DPFLAlgorithm(DLAlgorithm):
             v._dpfl_last_update = v.tr_rounds
             return
 
-        budget = min(int(config.MAX_NEIGHBORS), len(candidate_dict))
+        budget = min(int(self.max_collab_neighbors), len(candidate_dict))
+        if budget <= 0:
+            v._dpfl_collab = set()
+            v._dpfl_alphas = {}
+            v._dpfl_last_update = v.tr_rounds
+            return
+
+        # Paper-style GGC keeps two sets: X (selected collaborators) and
+        # Y (remaining feasible collaborators). Self is implicit in
+        # _eval_reward(), so X/Y only track peers.
         X = {}
-        base_reward = self._eval_reward(v, [], val_images, val_labels)
-        remaining = dict(candidate_dict)
+        Y = dict(candidate_dict)
+        shuffled_ids = np.random.permutation(list(candidate_dict.keys()))
 
-        for _ in range(budget):
-            best_gain = 0.0
-            best_nid = None
+        for nid in shuffled_ids:
+            nbr = candidate_dict[int(nid)]
 
-            for nid, nbr in remaining.items():
-                if nid in X:
-                    continue
-                reward = self._eval_reward(
-                    v, list(X.values()) + [nbr], val_images, val_labels
-                )
-                gain = reward - base_reward
-                if gain > best_gain:
-                    best_gain = gain
-                    best_nid = nid
+            reward_x = self._eval_reward(v, list(X.values()), val_images, val_labels)
+            reward_x_with_j = self._eval_reward(
+                v, list(X.values()) + [nbr], val_images, val_labels
+            )
+            reward_y = self._eval_reward(v, list(Y.values()), val_images, val_labels)
+            reward_y_without_j = self._eval_reward(
+                v,
+                [peer for peer_id, peer in Y.items() if peer_id != nid],
+                val_images,
+                val_labels,
+            )
 
-            if best_nid is None:
+            a = max(reward_x_with_j - reward_x, 0.0)
+            b = max(reward_y_without_j - reward_y, 0.0)
+            p_add = 1.0 if (a + b) == 0.0 else a / (a + b)
+
+            if np.random.random() <= p_add:
+                X[int(nid)] = nbr
+            else:
+                Y.pop(int(nid), None)
+
+            if len(X) >= budget:
                 break
-
-            X[best_nid] = remaining.pop(best_nid)
-            base_reward += best_gain
 
         n = len(X) + 1
         v._dpfl_collab = set(X.keys())
@@ -148,3 +172,6 @@ class DPFLAlgorithm(DLAlgorithm):
 
     def __repr__(self) -> str:
         return f"DPFLAlgorithm[{self.name}, update_every={self._update_every}]"
+
+    def __str__(self) -> str:
+        return self.__repr__()

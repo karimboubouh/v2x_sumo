@@ -25,6 +25,10 @@ class DLAlgorithm(ABC):
 
     name: str = "base"
     needs_dynamic_neighbors: bool = True
+    evaluation_mode: str = "global"  # "global" or "personalized"
+    max_sidelink_neighbors: int = 0
+    max_internet_neighbors: int = 0
+    max_collab_neighbors: int = 1
 
     def setup(self, vehicles: list) -> None:
         """One-time initialization called after all Vehicle objects are created."""

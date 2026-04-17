@@ -1,1 +1,1 @@
-from algorithms.dsgd.algorithm import DSGDAlgorithm  # noqa: F401
+from algorithms.dsgd.algorithm import DSGDAlgorithm

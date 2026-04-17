@@ -15,7 +15,7 @@ class CommManager:
     def __init__(
         self,
         comm_range=None,
-        max_neighbors=None,
+        max_sidelink_neighbors=None,
         power_dbm=None,
         path_loss_exp=None,
         noise_floor_dbm=None,
@@ -25,7 +25,11 @@ class CommManager:
         event_stream=None,
     ):
         self.comm_range = comm_range or config.COMM_RANGE
-        self.max_neighbors = max_neighbors if max_neighbors is not None else config.MAX_NEIGHBORS
+        self.max_sidelink_neighbors = (
+            max_sidelink_neighbors
+            if max_sidelink_neighbors is not None
+            else config.COMM_MAX_SIDELINK_LINKS
+        )
         self.power_dbm = power_dbm or config.COMM_POWER_DBM
         self.path_loss_exp = path_loss_exp or config.PATH_LOSS_EXPONENT
         self.noise_floor_dbm = noise_floor_dbm or config.NOISE_FLOOR_DBM
@@ -88,7 +92,7 @@ class CommManager:
         return dict(self._stats)
 
     def _compute_links(self, vehicle_states, sim_time):
-        """Compute pairwise links between all vehicles, capped at max_neighbors each."""
+        """Compute pairwise sidelink links, capped per vehicle by quality."""
         prev_pairs = self._active_pairs
         self._active_links = []
         self._neighbors = defaultdict(list)
@@ -122,10 +126,14 @@ class CommManager:
                     per_vehicle[id_a].append(link)
                     per_vehicle[id_b].append(link)
 
-        # Pass 2: each vehicle keeps its top-max_neighbors links by quality
+        # Pass 2: each vehicle keeps its top sidelink links by quality.
         accepted = set()
         for links in per_vehicle.values():
-            top = sorted(links, key=lambda lnk: lnk.quality, reverse=True)[:self.max_neighbors]
+            top = sorted(
+                links,
+                key=lambda lnk: lnk.quality,
+                reverse=True,
+            )[:self.max_sidelink_neighbors]
             for lnk in top:
                 accepted.add(frozenset({lnk.sender_id, lnk.receiver_id}))
 

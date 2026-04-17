@@ -1,5 +1,5 @@
 """
-GAT_PPO — Graph Attention Network + PPO neighbor selection.
+DANTE — Graph Attention Network + PPO neighbor selection.
 
 Each vehicle owns an independent GAT+PPO policy that:
   1. encodes its candidate neighborhood with attention weights,
@@ -16,8 +16,11 @@ import torch.nn.functional as F
 from torch.distributions import Bernoulli
 
 from algorithms.base import DLAlgorithm, LINK_INTERNET, LINK_SIDELINK
-from algorithms.gat_ppo.config import (
+from algorithms.dante.config import (
     GAT_HIDDEN_DIM,
+    MAX_COLLAB_NEIGHBORS,
+    MAX_INTERNET_NEIGHBORS,
+    MAX_SIDELINK_NEIGHBORS,
     NBR_DIM,
     OWN_DIM,
     PPO_CLIP_EPS,
@@ -27,12 +30,23 @@ from algorithms.gat_ppo.config import (
     PPO_GAMMA,
     PPO_LR,
     PPO_MAX_GRAD_NORM,
+    PPO_REWARD_SOURCE,
     PPO_UPDATE_EVERY,
     PPO_VALUE_COEF,
     SELF_WEIGHT,
 )
 import config
 from dl.helpers import clone_state_dict, sl_tx_cost_norm
+
+
+def _normalize_reward_source(value: str) -> str:
+    value = str(value).strip().lower()
+    if value not in {"training", "validation"}:
+        raise ValueError(
+            f"Unsupported DANTE PPO_REWARD_SOURCE {value!r}. "
+            "Expected 'training' or 'validation'."
+        )
+    return value
 
 
 class _GATLayer(nn.Module):
@@ -46,9 +60,9 @@ class _GATLayer(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.2)
 
     def forward(
-        self,
-        own_state: torch.Tensor,
-        nbr_features: torch.Tensor,
+            self,
+            own_state: torch.Tensor,
+            nbr_features: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if nbr_features.numel() == 0:
             empty_alpha = nbr_features.new_zeros((0,))
@@ -77,10 +91,16 @@ class _GATActorCritic(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
+        # Bias initial keep-probability toward ~0.25 (sigmoid(-1.1) ≈ 0.25)
+        # so PPO starts by dropping most candidates and must *earn* higher
+        # connection counts via loss improvement. Accelerates convergence
+        # toward sparse, energy-efficient neighborhoods.
+        actor_out = nn.Linear(hidden_dim, 1)
+        nn.init.constant_(actor_out.bias, -0.3)
         self.actor = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            actor_out,
         )
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -107,10 +127,10 @@ class _GATActorCritic(nn.Module):
         }
 
     def evaluate_actions(
-        self,
-        own_state: torch.Tensor,
-        nbr_features: torch.Tensor,
-        actions: torch.Tensor,
+            self,
+            own_state: torch.Tensor,
+            nbr_features: torch.Tensor,
+            actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         out = self.forward(own_state, nbr_features)
         if out["logits"].numel() == 0:
@@ -118,8 +138,11 @@ class _GATActorCritic(nn.Module):
             entropy = out["value"].new_zeros(())
         else:
             dist = Bernoulli(logits=out["logits"])
-            log_prob = dist.log_prob(actions).sum()
-            entropy = dist.entropy().sum()
+            # Use mean (not sum) so log_prob and entropy are invariant to
+            # neighborhood size; otherwise the PPO ratio exp(new-old) would
+            # shift purely from cardinality changes, not policy changes.
+            log_prob = dist.log_prob(actions).mean()
+            entropy = dist.entropy().mean()
         return log_prob, entropy, out["value"]
 
 
@@ -146,7 +169,7 @@ class _VehiclePPOAgent:
             else:
                 dist = Bernoulli(logits=out["logits"])
                 action = dist.sample()
-                log_prob = float(dist.log_prob(action).sum().item())
+                log_prob = float(dist.log_prob(action).mean().item())
 
         return {
             "own_state": own_state.astype(np.float32, copy=True),
@@ -232,14 +255,19 @@ class _VehiclePPOAgent:
         self.rollout.clear()
 
 
-class GATPPOAlgorithm(DLAlgorithm):
+class DANTEAlgorithm(DLAlgorithm):
     """Per-vehicle GAT+PPO collaboration policy with attention-weighted FedAvg."""
 
-    name = "GAT_PPO"
+    name = "DANTE"
     needs_dynamic_neighbors = True
+    evaluation_mode = "personalized"
 
     def __init__(self):
         self._agents: dict[int, _VehiclePPOAgent] = {}
+        self.reward_source = _normalize_reward_source(PPO_REWARD_SOURCE)
+        self.max_sidelink_neighbors = int(MAX_SIDELINK_NEIGHBORS)
+        self.max_internet_neighbors = int(MAX_INTERNET_NEIGHBORS)
+        self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
 
     def setup(self, vehicles: list) -> None:
         own_dim = int(OWN_DIM)
@@ -248,7 +276,6 @@ class GATPPOAlgorithm(DLAlgorithm):
         for v in vehicles:
             agent = _VehiclePPOAgent(own_dim, nbr_dim, GAT_HIDDEN_DIM)
             self._agents[v.id] = agent
-            v._gatppo_agent = agent
 
     def select_neighbors(self, v, candidates: list, env) -> tuple:
         if not v.training_done.is_set():
@@ -266,7 +293,10 @@ class GATPPOAlgorithm(DLAlgorithm):
         connections = set()
         alphas = {}
         link_types = {}
-        tx_cost = 0.0
+        # tx_costs is indexed by neighbor id; we compute it per-neighbor first
+        # and sum only after capacity culling so we don't charge for neighbors
+        # that are ultimately dropped before any communication occurs.
+        tx_costs: dict[int, float] = {}
 
         for idx, (nbr, dist, link_type) in enumerate(candidates):
             if idx >= len(decision["action"]) or decision["action"][idx] < 0.5:
@@ -277,17 +307,21 @@ class GATPPOAlgorithm(DLAlgorithm):
             link_types[nbr.id] = link_type
 
             if link_type == LINK_SIDELINK:
-                tx_cost += float(sl_tx_cost_norm(dist)) * 0.02
+                tx_costs[nbr.id] = float(sl_tx_cost_norm(dist)) * 0.05
             else:
-                tx_cost += 0.05
+                tx_costs[nbr.id] = 0.12
 
-        # Cap kept connections to MAX_NEIGHBORS, keeping highest-attention ones first
-        max_k = int(config.MAX_NEIGHBORS)
+                # Cap kept connections to self.max_collab_neighbors, keeping highest-attention ones first
+        max_k = int(self.max_collab_neighbors)
         if len(connections) > max_k:
             for nid in sorted(connections, key=lambda n: alphas.get(n, 0.0))[:-max_k]:
                 connections.discard(nid)
                 alphas.pop(nid, None)
                 link_types.pop(nid, None)
+                tx_costs.pop(nid, None)
+
+        # Charge only for neighbors that survived the capacity cap.
+        tx_cost = sum(tx_costs.values())
 
         transition = None
         if v.training_done.is_set() and not env._vehicle_is_done(v):
@@ -332,7 +366,10 @@ class GATPPOAlgorithm(DLAlgorithm):
                     continue
                 agg = self_w * own_sd[key].float()
                 for weight, sd in zip(nbr_weights, nbr_sds):
-                    agg = agg + (1.0 - self_w) * float(weight) * sd[key].float()
+                    # Fall back to own layer if a neighbor is missing this key
+                    # (e.g. interrupted weight update); avoids a hard KeyError.
+                    nbr_tensor = sd.get(key, own_sd[key])
+                    agg = agg + (1.0 - self_w) * float(weight) * nbr_tensor.float()
                 new_sd[key] = agg
             v.model.load_state_dict(new_sd)
             v._param_vec = None
@@ -345,11 +382,16 @@ class GATPPOAlgorithm(DLAlgorithm):
             next_transition = transitions.get(v.id)
 
             if (
-                agent.pending_transition is not None
-                and agent.pending_round is not None
-                and v.tr_rounds >= agent.pending_round
+                    agent.pending_transition is not None
+                    and agent.pending_round is not None
+                    and v.tr_rounds >= agent.pending_round
             ):
-                reward = max(float(v._prev_loss - v.current_loss), 0.0)
+                # Read both loss values under the lock so we never see a
+                # partially-written update from the background training thread.
+                with v._lock:
+                    prev_loss = v._prev_reward_loss
+                    cur_loss = v.current_reward_loss
+                reward = float(prev_loss - cur_loss)
                 reward -= float(agent.pending_transition.get("cost", 0.0))
                 next_value = float(next_transition["value"]) if next_transition is not None else 0.0
                 done = next_transition is None

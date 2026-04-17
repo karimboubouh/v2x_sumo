@@ -169,8 +169,13 @@ class SumoManager:
         other = [e for e in edges if edge_quadrant(e) != cur_q]
         return random.choice(other) if other else random.choice(edges)
 
-    def step(self):
-        """Advance simulation by one step. Returns dict of managed vehicle states."""
+    def step(self, headless: bool = False):
+        """Advance simulation by one step. Returns dict of managed vehicle states.
+
+        Args:
+            headless: when True, skips TraCI calls that are only needed for
+                      rendering (e.g. getRoadID), reducing per-step overhead.
+        """
         if not self._running:
             return {}
 
@@ -225,7 +230,7 @@ class SumoManager:
                 x, y = traci.vehicle.getPosition(veh_id)
                 speed = traci.vehicle.getSpeed(veh_id)
                 angle = traci.vehicle.getAngle(veh_id)
-                edge = traci.vehicle.getRoadID(veh_id)
+                edge = "" if headless else traci.vehicle.getRoadID(veh_id)
                 state = VehicleState(
                     vehicle_id=veh_id,
                     x=x, y=y,

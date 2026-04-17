@@ -181,8 +181,8 @@ class StatusWidget(QWidget):
             mr  = max(int(ts.get("max_rounds", 1)), 1)
             segs.append(("Round: ", f"{rn}/{mr}"))
             segs.append(("ETA: ", self._fmt_dur(ts.get("remaining_time", 0.0))))
+            segs.append(("Est/Rnd: ", self._fmt_dur(ts.get("estimated_round_time", ts.get("avg_round_time", 0.0)))))
             segs.append(("Active: ", f"{ts.get('active_trainers',0)}/{ts.get('vehicle_count',0)}"))
-            segs.append(("Done: ", f"{ts.get('done_vehicles',0)}/{ts.get('vehicle_count',0)}"))
             tgt = float(ts.get("target_acc", 2.0))
             if tgt < 1.0:
                 segs.append(("Target: ", f"{tgt:.2%}"))
@@ -232,15 +232,10 @@ class StatusWidget(QWidget):
 
     @staticmethod
     def _right_metrics_text(ts: dict) -> str:
-        init_acc  = ts.get("init_test_acc")
-        test_acc  = ts.get("test_acc")
-        test_loss = ts.get("test_loss")
-        rnd       = ts.get("test_round")
-        if test_acc is not None and init_acc is not None:
-            return (f"Init {init_acc:.2%} → Test {test_acc:.2%}  "
-                    f"loss {test_loss:.4f}  @ r{rnd}")
-        if test_acc is not None:
-            return f"Test {test_acc:.2%}  loss {test_loss:.4f}  @ r{rnd}"
-        if init_acc is not None:
-            return f"Init test {init_acc:.2%}  loss {ts.get('init_test_loss', 0.0):.4f}"
+        eval_acc = ts.get("eval_acc", ts.get("test_acc"))
+        eval_loss = ts.get("eval_loss", ts.get("test_loss"))
+        rnd = ts.get("eval_round", ts.get("test_round"))
+        label = ts.get("eval_label", "Test")
+        if eval_acc is not None:
+            return f"{label} {eval_acc:.2%}  loss {eval_loss:.4f}  @ r{rnd}"
         return ""

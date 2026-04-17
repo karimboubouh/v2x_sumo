@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+import config
 
 
 # ── Transforms ────────────────────────────────────────────────────────────────
@@ -64,6 +65,120 @@ def _get_labels(dataset) -> np.ndarray:
     return np.array([y for _, y in dataset])
 
 
+def _split_train_validation_indices(indices: list[int]) -> tuple[list[int], list[int]]:
+    """Split one client's assigned indices into train/validation subsets."""
+    idxs = list(indices)
+    if len(idxs) <= 1:
+        return idxs, list(idxs)
+
+    n_val = int(round(len(idxs) * float(config.VALIDATION_FRACTION)))
+    n_val = min(max(n_val, 1), len(idxs) - 1)
+    val_indices = idxs[:n_val]
+    train_indices = idxs[n_val:]
+    return train_indices, val_indices
+
+
+def _allocate_counts(total: int, weights: np.ndarray) -> np.ndarray:
+    """Allocate an integer total across clients while preserving proportions."""
+    weights = np.asarray(weights, dtype=np.float64)
+    if total <= 0 or weights.size == 0:
+        return np.zeros(weights.shape, dtype=np.int64)
+
+    weights = np.clip(weights, 0.0, None)
+    if float(weights.sum()) <= 0.0:
+        weights = np.full(weights.shape, 1.0 / len(weights), dtype=np.float64)
+    else:
+        weights = weights / float(weights.sum())
+
+    raw = weights * float(total)
+    counts = np.floor(raw).astype(np.int64)
+    remainder = int(total - counts.sum())
+    if remainder > 0:
+        order = np.argsort(-(raw - counts))
+        counts[order[:remainder]] += 1
+    return counts
+
+
+def _rebalance_empty_test_shards(
+    vehicle_test_indices: list[list[int]],
+    test_labels: np.ndarray,
+    reference_counts: np.ndarray,
+) -> None:
+    """Move a few samples so every vehicle has at least one held-out test example."""
+    empties = [v for v, idxs in enumerate(vehicle_test_indices) if not idxs]
+    if not empties:
+        return
+
+    donors = sorted(
+        range(len(vehicle_test_indices)),
+        key=lambda v: len(vehicle_test_indices[v]),
+        reverse=True,
+    )
+
+    for target in empties:
+        preferred_classes = set(np.flatnonzero(reference_counts[target] > 0).tolist())
+        moved = False
+        for donor in donors:
+            if donor == target or len(vehicle_test_indices[donor]) <= 1:
+                continue
+
+            donor_indices = vehicle_test_indices[donor]
+            move_pos = None
+            if preferred_classes:
+                for pos, sample_idx in enumerate(donor_indices):
+                    if int(test_labels[sample_idx]) in preferred_classes:
+                        move_pos = pos
+                        break
+            if move_pos is None:
+                move_pos = len(donor_indices) - 1
+
+            vehicle_test_indices[target].append(donor_indices.pop(move_pos))
+            moved = True
+            break
+
+        if not moved:
+            raise RuntimeError("Unable to construct non-empty per-vehicle test shards.")
+
+
+def _match_test_shards_to_client_distribution(
+    test_labels: np.ndarray,
+    client_indices: list[list[int]],
+    client_labels: np.ndarray,
+    n_classes: int,
+) -> list[list[int]]:
+    """Partition the shared test split so each client's shard mirrors its train labels."""
+    reference_counts = np.zeros((len(client_indices), n_classes), dtype=np.int64)
+    for vehicle_id, indices in enumerate(client_indices):
+        if not indices:
+            continue
+        reference_counts[vehicle_id] = np.bincount(
+            client_labels[np.asarray(indices, dtype=np.int64)],
+            minlength=n_classes,
+        )
+
+    vehicle_test_indices = [[] for _ in range(len(client_indices))]
+    for class_id in range(n_classes):
+        class_test_indices = np.where(test_labels == class_id)[0].tolist()
+        np.random.shuffle(class_test_indices)
+        counts = _allocate_counts(
+            len(class_test_indices),
+            reference_counts[:, class_id].astype(np.float64),
+        )
+
+        start = 0
+        for vehicle_id, count in enumerate(counts.tolist()):
+            if count <= 0:
+                continue
+            stop = start + count
+            vehicle_test_indices[vehicle_id].extend(class_test_indices[start:stop])
+            start = stop
+
+    _rebalance_empty_test_shards(vehicle_test_indices, test_labels, reference_counts)
+    for indices in vehicle_test_indices:
+        np.random.shuffle(indices)
+    return vehicle_test_indices
+
+
 def partition_dataset(dataset_name: str, n_vehicles: int,
                       alpha: float = 0.5, batch_size: int = 32,
                       data_root: str = "./data") -> tuple:
@@ -75,7 +190,13 @@ def partition_dataset(dataset_name: str, n_vehicles: int,
         Then assign class-c samples to vehicles according to p_c.
 
     Returns:
-        (list_of_train_loaders, test_loader)
+        (
+            train_loaders,
+            train_eval_loaders,
+            val_loaders,
+            local_test_loaders,
+            shared_test_loader,
+        )
     """
     tf = _TRANSFORMS[dataset_name]
     cls = _BUILDERS[dataset_name]
@@ -98,20 +219,47 @@ def partition_dataset(dataset_name: str, n_vehicles: int,
             vehicle_indices[v].extend(idxs[prev:split])
             prev = split
 
-    loaders = []
+    train_loaders = []
+    train_eval_loaders = []
+    val_loaders = []
+    client_reference_indices = []
     for v in range(n_vehicles):
-        indices = vehicle_indices[v]
+        indices = list(vehicle_indices[v])
         if not indices:
             indices = np.random.choice(len(full_dataset), 50, replace=False).tolist()
-        subset = Subset(full_dataset, indices)
-        loader = DataLoader(subset, batch_size=batch_size,
-                            shuffle=True, drop_last=False)
-        loaders.append(loader)
+        np.random.shuffle(indices)
+        client_reference_indices.append(list(indices))
+        train_indices, val_indices = _split_train_validation_indices(indices)
+
+        train_subset = Subset(full_dataset, train_indices)
+        val_subset = Subset(full_dataset, val_indices)
+
+        train_loaders.append(
+            DataLoader(train_subset, batch_size=batch_size, shuffle=True, drop_last=False)
+        )
+        train_eval_loaders.append(
+            DataLoader(train_subset, batch_size=256, shuffle=False, drop_last=False)
+        )
+        val_loaders.append(
+            DataLoader(val_subset, batch_size=256, shuffle=False, drop_last=False)
+        )
 
     test_ds = cls(root=data_root, train=False, download=True, transform=tf)
+    test_labels = _get_labels(test_ds)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
 
-    return loaders, test_loader
+    local_test_indices = _match_test_shards_to_client_distribution(
+        test_labels,
+        client_reference_indices,
+        labels,
+        n_classes,
+    )
+    local_test_loaders = [
+        DataLoader(Subset(test_ds, indices), batch_size=256, shuffle=False, drop_last=False)
+        for indices in local_test_indices
+    ]
+
+    return train_loaders, train_eval_loaders, val_loaders, local_test_loaders, test_loader
 
 
 def get_n_classes(dataset_name: str) -> int:

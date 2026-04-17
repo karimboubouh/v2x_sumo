@@ -3,19 +3,19 @@ plots.py — Publication-quality result plots for V2X TR experiments
 ===================================================================
 Usage (single run, from main.py):
     from plots import SimResults, plot_all
-    results = SimResults(algorithm="GAT_PPO", ...)
+    results = SimResults(algorithm="DANTE", ...)
     plot_all(results, save_dir="figures")
 
 Usage (multi-run comparison):
     from plots import plot_comparison
-    plot_comparison({"GAT-PPO": r1, "IPPO": r2, "FedAvg": r3}, save_dir="figures")
+    plot_comparison({"DANTE": r1, "IPPO": r2, "FedAvg": r3}, save_dir="figures")
 
 Figures produced
 ----------------
   convergence.pdf   — 2×2: test acc / test loss  ×  rounds / wall-time
   neighbors.pdf     — avg connections per round (total, sidelink, internet) ± std
   energy.pdf        — bar chart: training energy vs. TX energy breakdown
-  reward.pdf        — PPO reward vs. rounds  (GAT_PPO / IPPO only)
+  reward.pdf        — PPO reward vs. rounds  (DANTE / IPPO only)
   comparison.pdf    — multi-algorithm overlay: acc + loss vs. rounds
 
 Energy model (PC5 sidelink / 5G-NR Uu, ~200 KB DNN model)
@@ -50,7 +50,7 @@ E_COMPUTE_J_PER_SAMPLE = 5e-4  # J/sample — local SGD compute
 
 # ── Color palette (IBM accessible, colorblind-friendly) ───────────────────────
 _ALGO_COLORS = {
-    "GAT_PPO": "#0072B2",  # blue        — proposed
+    "DANTE": "#0072B2",  # blue        — proposed
     "IPPO": "#E69F00",  # amber       — RL ablation
     "FedAvg": "#D55E00",  # vermillion  — static baseline
     "FedProx": "#009E73",  # green       — proximal SOTA
@@ -109,7 +109,7 @@ class SimResults:
         r = SimResults.load("run_gat.pkl")
     """
     # Metadata
-    algorithm: str = "GAT_PPO"
+    algorithm: str = "DANTE"
     dataset: str = "MNIST"
     n_vehicles: int = 10
 
@@ -192,7 +192,7 @@ def _algo_color(algo: str, idx: int = 0) -> str:
 
 def _algo_label(algo: str) -> str:
     return {
-        "GAT_PPO": "Ours",
+        "DANTE": "DANTE",
         "IPPO": "IPPO",
         "FedAvg": "FedAvg",
         "FedProx": "FedProx",
@@ -343,8 +343,8 @@ def plot_energy(results: SimResults, save_dir: Optional[str] = None) -> plt.Figu
 # ── Plot: PPO reward ───────────────────────────────────────────────────────────
 
 def plot_reward(results: SimResults, save_dir: Optional[str] = None) -> Optional[plt.Figure]:
-    """PPO reward vs. TR rounds (only meaningful for GAT_PPO / IPPO)."""
-    if results.algorithm not in ("GAT_PPO", "IPPO") or not results.rewards:
+    """PPO reward vs. TR rounds (only meaningful for DANTE / IPPO)."""
+    if results.algorithm not in ("DANTE", "IPPO") or not results.rewards:
         return None
 
     R = results.rounds
@@ -378,7 +378,7 @@ def plot_comparison(
 
     Args:
         results_dict: mapping of display label → SimResults.
-                      Example: {"GAT-PPO (ours)": r1, "IPPO": r2, "FedAvg": r3}
+                      Example: {"DANTE": r1, "IPPO": r2, "FedAvg": r3}
     """
     with _style():
         fig, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(_W2, _H))
@@ -421,7 +421,7 @@ def plot_all(results: SimResults, save_dir: str = "figures") -> None:
         convergence.pdf/.png
         neighbors.pdf/.png
         energy.pdf/.png
-        reward.pdf/.png   (GAT_PPO / IPPO only)
+        reward.pdf/.png   (DANTE / IPPO only)
     """
     print(f"\n  Generating plots → {save_dir}/")
 

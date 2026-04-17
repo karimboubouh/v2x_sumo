@@ -1,0 +1,254 @@
+\section{DANTE: Dynamic Network Formation and Decentralized Solution}
+\label{sec:dante}
+
+Having defined the system model in Section~\ref{sec:system_model}, we now answer the central question of this work: \emph{how should each vehicle decide, at every round, with whom to collaborate so as to maximize its personalized learning benefit under the energy, bandwidth, latency, and trust constraints of a hybrid 5G C-V2X network?} We proceed in two steps. First, we cast vehicular decentralized personalized learning (VDPL) as a \emph{dynamic network formation game} played over the time-varying collaboration graph, in which each vehicle is a strategic player that forms and severs directed links to its peers. Second, we introduce \textsc{Dante}~(\underline{D}ual-interface \underline{A}ttention-guided \underline{N}etwork-formation for \underline{T}rustworthy vehicular \underline{E}dge learning), a fully decentralized solver in which every vehicle learns its own link-formation policy via an attention-guided PPO actor--critic, aggregates the received models through a fused attention--trust--robustness weighting, and maintains a local trust-update loop. No central critic, parameter server, or globally observed state is required at any stage.
+
+%-----------------------------------------------------------
+\subsection{Dynamic Network Formation as a Strategic Markov Game}
+\label{subsec:game}
+
+We model collaboration in VDPL as a discrete-time strategic network formation game in the tradition of Jackson and Wolinsky~\cite{jackson1996strategic,bala2000noncooperative,jackson2002evolution}. This class of models treats agents as deciding which directed links to form or sever and lets payoffs depend on the resulting graph rather than on a partition of the agent set into disjoint coalitions. This graph-level abstraction is well suited to vehicular collaboration, where links are overlapping, directed, and asymmetric: vehicle $i$ may benefit from $j$'s update without any reciprocity obligation, and each vehicle observes its environment only locally.
+
+\begin{definition}[Dynamic network formation game for VDPL]
+\label{def:game}
+A dynamic network formation game for VDPL is the tuple
+\begin{equation*}
+    \mathfrak{G} = \Bigl(\,\{\mathcal{V}_t\}_{t\ge 0},\;\mathcal{S},\;\{\mathcal{A}_i(\cdot)\}_i,\;\mathcal{P},\;\{u_i\}_i,\;\gamma\,\Bigr),
+\end{equation*}
+whose components are defined as follows.
+\begin{itemize}
+    \item \textbf{Players.} At round $t$, the players are the active vehicles $\mathcal{V}_t$ of Section~\ref{sec:system_model}. Every honest vehicle is a strategic, self-interested agent that maximizes its own personalized learning performance under local resource constraints.
+
+    \item \textbf{State and local observation.} The global state $s^{(t)}\in\mathcal{S}$ collects vehicle positions, channel conditions, resource budgets $b_i^{(t)}$, personalized models $\{w_i^{(t)}\}$, and trust vectors $\{q_{ij}^{(t)}\}$. No vehicle observes $s^{(t)}$. Vehicle $i$ receives only a local observation $o_i^{(t)}\in\mathcal{O}_i$ that exposes its own state together with per-candidate link features $\{f_{ij}^{(t)}\}$ and trust scores $\{q_{ij}^{(t)}\}$ restricted to the feasible neighbor set $\mathcal{F}_i^{(t)}$ defined in Section~\ref{sec:system_model}.
+
+    \item \textbf{Feasible actions.} Vehicle $i$ plays a per-candidate binary vector
+    \begin{equation*}
+        a_i^{(t)} = \bigl(a_{ij}^{(t)}\bigr)_{j\in\mathcal{F}_i^{(t)}}\in\{0,1\}^{|\mathcal{F}_i^{(t)}|},
+    \end{equation*}
+    where $a_{ij}^{(t)}=1$ accepts the model update of neighbor $j$ at round $t$. Actions induce the collaboration set $C_i^{(t)}=\{j\in\mathcal{F}_i^{(t)}:a_{ij}^{(t)}=1\}$ and the directed collaboration graph $\mathcal{G}_t^{\mathrm{coll}}$ of Section~\ref{sec:system_model}, with $(j\!\to\! i)\in\mathcal{E}_t^{\mathrm{coll}}\iff a_{ij}^{(t)}=1$. Since every candidate $j\in\mathcal{F}_i^{(t)}$ is already tagged with its physical interface $m_{ij}^{(t)}\in\mathcal{M}_{ij}^{(t)}$ by the communication layer, vehicle $i$ chooses directed edges rather than separately optimizing the interface of a fixed peer.
+
+    \item \textbf{Per-round payoff.} Vehicle $i$ receives the instantaneous utility
+    \begin{equation}
+    \label{eq:stage_payoff}
+        u_i^{(t)} = \Delta_i^{(t)} - \lambda_E\,E_i^{(t)} - \lambda_B\,B_i^{(t)} - \lambda_T\,T_i^{(t)},
+    \end{equation}
+    where
+    \begin{equation*}
+        \Delta_i^{(t)} = \widehat{F}_{i,\mathrm{val}}\!\bigl(w_i^{(t)}\bigr) - \widehat{F}_{i,\mathrm{val}}\!\bigl(w_i^{(t+1)}\bigr)
+    \end{equation*}
+    is the loss reduction measured on a held-out local validation split $\mathcal{D}_i^{\mathrm{val}}\subset\mathcal{D}_i$, $E_i^{(t)}$, $B_i^{(t)}$, and $T_i^{(t)}$ are the round-level energy, bandwidth, and latency costs inherited from the computation and communication model of Section~\ref{sec:system_model}, and $\lambda_E,\lambda_B,\lambda_T\ge 0$ are per-vehicle cost weights.
+
+    \item \textbf{Transitions.} The state evolves according to a kernel $\mathcal{P}(\cdot\mid s^{(t)},a^{(t)})$ jointly induced by vehicle mobility, wireless-channel stochasticity, resource depletion $b_i^{(t+1)}=b_i^{(t)}-[E_i^{(t)},B_i^{(t)}]^\top$, trust evolution (Section~\ref{subsubsec:trust}), and the personalized model update (Section~\ref{subsec:dante}). Vehicle $i$ does not observe $\mathcal{P}$ and interacts with it only through $o_i^{(t)}$.
+\end{itemize}
+\end{definition}
+
+\noindent\textbf{Long-term objective.} Given a joint policy profile $\pi=(\pi_i)_i$, vehicle $i$ seeks a local policy that maximizes its discounted infinite-horizon return
+\begin{equation}
+\label{eq:long_term}
+    J_i(\pi_i;\pi_{-i}) = \mathbb{E}_{\pi}\!\left[\sum_{t=0}^{\infty}\gamma^{t}\,u_i^{(t)}\right],\qquad \gamma\in(0,1),
+\end{equation}
+where $\pi_{-i}$ denotes the policy profile of the remaining vehicles. Because every vehicle optimizes its own return conditional on the strategies of the others, Equation~\eqref{eq:long_term} defines a Markov game over the evolving collaboration graph rather than a joint cooperative objective; we return to the Nash-equilibrium question in Section~\ref{subsec:convergence}.
+
+\noindent\textbf{Constraints.} At each round, the decision of vehicle $i$ must additionally satisfy
+\begin{align}
+\label{eq:cons_k}
+    |C_i^{(t)}| &\le K_i,\\
+\label{eq:cons_energy}
+    E_{i,\mathrm{cmp}}^{(t)}+\sum_{j\in C_i^{(t)}} E_{ij}^{m_{ij},(t)} &\le \bar E_i^{(t)},\\
+\label{eq:cons_bw}
+    \sum_{j\in C_i^{(t)}} B_{ij}^{m_{ij},(t)} &\le \bar B_i^{(t)},\\
+\label{eq:cons_lat}
+    T_{i,\mathrm{cmp}}^{(t)}+\max_{j\in C_i^{(t)}} T_{ij}^{m_{ij},(t)} &\le \bar T_i^{(t)},
+\end{align}
+where $K_i$ is the per-vehicle neighborhood cap and $\bar E_i^{(t)},\bar B_i^{(t)},\bar T_i^{(t)}$ are the per-round energy, bandwidth, and latency budgets of Section~\ref{sec:system_model}. Latency~\eqref{eq:cons_lat} and neighborhood size~\eqref{eq:cons_k} are hard per-round caps enforced at action-admissibility time, whereas the energy and bandwidth caps~\eqref{eq:cons_energy}--\eqref{eq:cons_bw} are tracked through the budget state $b_i^{(t)}$ so that a vehicle that overspends early loses collaboration capacity later. This design keeps the problem amenable to policy-gradient methods without resorting to a Lagrangian relaxation, while still penalizing budget depletion endogenously through the return.
+
+%-----------------------------------------------------------
+\subsection{Utility of Collaboration}
+\label{subsec:utility}
+
+The stage payoff~\eqref{eq:stage_payoff} uses the validation-loss drop $\Delta_i^{(t)}$ as its observable learning signal. That quantity is suitable for online decision making but only reveals the value of collaboration after a round has been completed. To expose the learning geometry underlying $\Delta_i^{(t)}$ and to support the theoretical analysis, we introduce an analytical surrogate based on gradient agreement.
+
+Let $g_i^{(t)}$ and $g_j^{(t)}$ denote stochastic gradients of vehicles $i$ and $j$ evaluated at their current iterates. We measure directional agreement by the cosine similarity
+\begin{equation*}
+    s_{ij}^{(t)} \;=\; \frac{\bigl(g_i^{(t)}\bigr)^\top g_j^{(t)}}{\|g_i^{(t)}\|\,\|g_j^{(t)}\|+\varepsilon}\;\in\;[-1,1],
+\end{equation*}
+with $\varepsilon>0$ a numerical-stability constant. This quantity admits a first-order interpretation: Taylor-expanding $F_i$ around $w_i^{(t)}$ gives
+\begin{equation*}
+    F_i\!\bigl(w_i^{(t)}-\eta\, g_j^{(t)}\bigr) = F_i\!\bigl(w_i^{(t)}\bigr) - \eta\,\bigl(\nabla F_i(w_i^{(t)})\bigr)^{\!\top} g_j^{(t)} + O(\eta^2),
+\end{equation*}
+so under the standard assumption that $g_i^{(t)}$ is unbiased for $\nabla F_i(w_i^{(t)})$, a positive $s_{ij}^{(t)}$ indicates, in expectation, that $j$'s update direction is aligned with the local descent direction of $i$. Combining alignment with the trust score $q_{ij}^{(t)}\in[0,1]$ introduced in Section~\ref{subsubsec:trust}, we define the trust-weighted collaboration surrogate
+\begin{equation}
+\label{eq:G_surrogate}
+    G_i\!\bigl(C_i^{(t)},s^{(t)}\bigr) \;=\; \sum_{j\in C_i^{(t)}} q_{ij}^{(t)}\,s_{ij}^{(t)}.
+\end{equation}
+Large values of $G_i$ correspond to collaboration sets whose update directions are, on average, both aligned with the local descent of $i$ and originating from trusted peers, whereas negative values indicate that the selected neighbors tend to push the model away from descent. The surrogate is introduced for interpretation and convergence analysis (Section~\ref{subsec:convergence}); the reward that drives the policy is the observable $\Delta_i^{(t)}$ entering~\eqref{eq:stage_payoff}.
+
+%-----------------------------------------------------------
+\subsection{\textsc{Dante}: Attention-Guided Decentralized Solver}
+\label{subsec:dante}
+
+\textsc{Dante} factorizes the per-vehicle policy through three coupled components: (i) a graph-attention policy head that scores candidate peers from local link features, (ii) a robust personalized aggregation layer that fuses attention with trust and a coordinate-wise robustness filter, and (iii) a local trust update that closes the loop by down-weighting peers whose past contributions hurt the local loss. Every component runs locally on vehicle $i$ using $o_i^{(t)}$ alone; no joint state, joint critic, or shared parameters are ever assembled.
+
+\subsubsection{GAT policy parameterization}
+\label{subsubsec:gatppo}
+
+Let $x_i^{(t)}\in\mathbb{R}^{d_o}$ be the ego feature vector of vehicle $i$ and $x_{ij}^{(t)}\in\mathbb{R}^{d_n}$ the feature vector of candidate neighbor $j\in\mathcal{F}_i^{(t)}$. A single-head graph-attention encoder computes
+\begin{equation}
+\label{eq:gat}
+\begin{split}
+    h_i^{(t)} &= W_s\, x_i^{(t)},\qquad v_{ij}^{(t)} = W_n\, x_{ij}^{(t)},\\
+    \beta_{ij}^{(t)} &= \frac{\exp\bigl(e_{ij}^{(t)}\bigr)}{\sum_{k\in\mathcal{F}_i^{(t)}}\exp\bigl(e_{ik}^{(t)}\bigr)},
+\end{split}
+\end{equation}
+with unnormalized logits $e_{ij}^{(t)}=a^{\!\top}\mathrm{LeakyReLU}\!\bigl([h_i^{(t)}\,\|\,v_{ij}^{(t)}]\bigr)$ and learnable parameters $W_s$, $W_n$, and $a$. The neighborhood context is $c_i^{(t)}=\sum_{j\in\mathcal{F}_i^{(t)}}\beta_{ij}^{(t)}v_{ij}^{(t)}$. The raw attention $\beta_{ij}^{(t)}$ plays a dual role: it drives the actor's Bernoulli logits, and, combined with the trust and robustness scores introduced below, it shapes the final aggregation weights $\alpha_{ij}^{(t)}$. This coupling ties \emph{whom the policy chooses to listen to} directly to \emph{how much weight that peer carries in the model update}.
+
+Conditioned on $(h_i^{(t)},c_i^{(t)},v_{ij}^{(t)})$, the actor outputs a per-candidate Bernoulli and the critic outputs a scalar value:
+\begin{equation}
+\label{eq:actor_critic}
+\begin{split}
+    \pi_{\theta_i}\!\bigl(a_{ij}^{(t)}\!=\!1\mid o_i^{(t)}\bigr) &= \sigma\!\Bigl(f_{\theta_i}\!\bigl([h_i^{(t)}\,\|\,c_i^{(t)}\,\|\,v_{ij}^{(t)}]\bigr)\Bigr),\\
+    V_{\phi_i}\!\bigl(o_i^{(t)}\bigr) &= g_{\phi_i}\!\bigl([h_i^{(t)}\,\|\,c_i^{(t)}]\bigr),
+\end{split}
+\end{equation}
+where $\sigma$ is the logistic sigmoid. Because the per-candidate actions are conditionally independent Bernoullis, the joint log-probability factorizes as $\log\pi_{\theta_i}(a_i^{(t)}\mid o_i^{(t)})=\sum_{j\in\mathcal{F}_i^{(t)}}\log\pi_{\theta_i}(a_{ij}^{(t)}\mid o_i^{(t)})$, making per-vehicle PPO updates tractable regardless of $|\mathcal{F}_i^{(t)}|$. Each vehicle stores only its own parameters $(\theta_i,\phi_i)$: no critic ever observes a joint state or joint action, and the scheme avoids the realizability issues of centralized-training-with-decentralized-execution schemes in V2X, where a joint state would presuppose a central entity that our setting precludes. If more than $K_i$ candidates are sampled as active, \textsc{Dante} retains the $K_i$ highest-attention edges, which enforces the neighborhood cap~\eqref{eq:cons_k} by construction.
+
+\subsubsection{Trust score and robustness filter}
+\label{subsubsec:trust}
+
+Vehicle $i$ maintains a local trust score $q_{ij}^{(t)}\in[0,1]$ for every feasible neighbor $j\in\mathcal{F}_i^{(t)}$, interpreted as vehicle $i$'s current estimate of the reliability of $j$'s transmitted updates. The score is updated by an exponentially weighted recursion
+\begin{equation}
+\label{eq:trust_update}
+    q_{ij}^{(t+1)} = (1-\rho)\,q_{ij}^{(t)} + \rho\,\phi_{ij}^{(t)},\qquad \rho\in(0,1],
+\end{equation}
+where the per-round reliability signal $\phi_{ij}^{(t)}\in[0,1]$ is defined as the product of two local indicators,
+\begin{equation*}
+    \phi_{ij}^{(t)} = \mathbf{1}\!\bigl\{r_{ij}^{(t)}\ge r_{\min}\bigr\}\cdot\mathbf{1}\!\bigl\{\widehat F_{i,\mathrm{val}}(w_i^{(t+1)})\le \widehat F_{i,\mathrm{val}}(w_i^{(t)})+\tau_{\mathrm{val}}\bigr\},
+\end{equation*}
+namely (i) vehicle $j$ passed the local robust filter at round $t$ and (ii) the validation loss of vehicle $i$ did not increase after including $j$'s update, up to a small slack $\tau_{\mathrm{val}}\ge 0$. Because $\phi_{ij}^{(t)}\in[0,1]$ and $\rho\in(0,1]$, the recursion keeps $q_{ij}^{(t)}\in[0,1]$ for every $t$. The smoothing in~\eqref{eq:trust_update} gives persistence against transient link errors while still allowing a sustained Byzantine peer to be progressively de-weighted.
+
+The robustness score $r_{ij}^{(t)}\in[0,1]$ is produced by a coordinate-wise robust filter applied to the set of received models $\{\hat w_j^{(t)}\}_{j\in C_i^{(t)}}$. Let $\mathrm{TM}_i^{(t)}$ denote the coordinate-wise trimmed mean of $\{\hat w_j^{(t)}\}_{j\in C_i^{(t)}}$ and let $d_{ij}^{(t)}=\|\hat w_j^{(t)}-\mathrm{TM}_i^{(t)}\|_2$; we set $r_{ij}^{(t)}=\exp\!\bigl(-d_{ij}^{(t)}/\sigma_r\bigr)\in(0,1]$, so that peers that drift far from the trimmed-mean consensus contribute near-zero weight while still-close peers retain near-unit score. Coordinate-wise trimmed mean is a standard robust aggregator in federated learning and tolerates up to a fraction $f/|C_i^{(t)}|<1/2$ of Byzantine neighbors with bounded honest gradients~\cite{yin2018byzantine,karimireddy2021learning}.
+
+\subsubsection{Fused attention--trust--robustness aggregation}
+\label{subsubsec:agg}
+
+\textsc{Dante} combines the GAT attention $\beta_{ij}^{(t)}$, the trust score $q_{ij}^{(t)}$, and the robustness score $r_{ij}^{(t)}$ into the final aggregation weight that instantiates the collaborative update of Section~\ref{subsec:learning}:
+\begin{equation}
+\label{eq:alpha_fused}
+    \alpha_{ij}^{(t)} = \bigl(1-\alpha_{ii}^{(t)}\bigr)\cdot\frac{\beta_{ij}^{(t)}\,q_{ij}^{(t)}\,r_{ij}^{(t)}}{\varepsilon+\displaystyle\sum_{k\in C_i^{(t)}}\beta_{ik}^{(t)}\,q_{ik}^{(t)}\,r_{ik}^{(t)}},\quad j\in C_i^{(t)},
+\end{equation}
+with self-retention weight $\alpha_{ii}^{(t)}\in(0,1)$ controlling the personalization/collaboration trade-off. By construction,
+\begin{equation*}
+    \alpha_{ii}^{(t)}+\sum_{j\in C_i^{(t)}}\alpha_{ij}^{(t)} = 1,\qquad \alpha_{ij}^{(t)}\ge 0,
+\end{equation*}
+so~\eqref{eq:alpha_fused} satisfies the convex-combination constraint of Section~\ref{subsec:learning} and can be substituted directly into the aggregation rule of that section, yielding $\bar w_i^{(t)}=\alpha_{ii}^{(t)}w_i^{(t)}+\sum_{j\in C_i^{(t)}}\alpha_{ij}^{(t)}\hat w_j^{(t)}$. Starting from $\bar w_i^{(t)}$, vehicle $i$ then executes $I_i^{(t)}$ local SGD steps as prescribed in Section~\ref{subsec:learning} to obtain the next personalized iterate $w_i^{(t+1)}$. The round ordering is therefore \emph{aggregate-then-train}, consistent with the system model.
+
+The fusion in~\eqref{eq:alpha_fused} is also a graceful fallback. If every neighbor in $C_i^{(t)}$ is Byzantine, the robust filter and trust recursion drive $q_{ij}^{(t)}\,r_{ij}^{(t)}\!\to\! 0$, so $\alpha_{ij}^{(t)}\!\to\! 0$ and $\bar w_i^{(t)}\!\to\! w_i^{(t)}$; the collaborative update degenerates to pure local SGD, which is the safest behavior available to an honest vehicle.
+
+\subsubsection{Local PPO optimization}
+\label{subsubsec:ppo}
+
+Each vehicle updates its actor--critic pair by Proximal Policy Optimization on local trajectories only. Let $\delta_i^{(t)}=u_i^{(t)}+\gamma\,V_{\phi_i}(o_i^{(t+1)})-V_{\phi_i}(o_i^{(t)})$ denote the temporal-difference error and $\hat A_i^{(t)}=\sum_{h\ge 0}(\gamma\lambda_{\mathrm{GAE}})^h\,\delta_i^{(t+h)}$ the generalized advantage estimate. The clipped PPO surrogate with entropy regularization is
+\begin{equation}
+\label{eq:ppo}
+\begin{split}
+    \mathcal{L}_i^{\mathrm{PPO}}(\theta_i) &= \mathbb{E}\!\left[\min\!\bigl(\rho_i^{(t)}\hat A_i^{(t)},\,\mathrm{clip}(\rho_i^{(t)},1-\epsilon,1+\epsilon)\hat A_i^{(t)}\bigr)\right]\\
+    &\quad + \eta_{\mathrm{ent}}\,\mathbb{E}\!\bigl[\mathcal{H}\bigl(\pi_{\theta_i}(\cdot\mid o_i^{(t)})\bigr)\bigr],
+\end{split}
+\end{equation}
+with likelihood ratio $\rho_i^{(t)}=\pi_{\theta_i}(a_i^{(t)}\mid o_i^{(t)})/\pi_{\theta_i^{\mathrm{old}}}(a_i^{(t)}\mid o_i^{(t)})$, clip range $\epsilon\in(0,1)$, entropy coefficient $\eta_{\mathrm{ent}}\ge 0$, and Shannon entropy $\mathcal{H}$. The critic regresses on the return targets $\hat R_i^{(t)}=\hat A_i^{(t)}+V_{\phi_i}(o_i^{(t)})$. Each vehicle therefore runs an independent local PPO loop in the style of IPPO~\cite{dewitt2020independent}, without sharing trajectories, critics, or parameters with its peers.
+
+\subsubsection{The DANTE algorithm}
+\label{subsubsec:algo}
+
+Algorithm~\ref{alg:dante} summarizes the complete per-vehicle procedure. Each iteration performs one round of environment interaction followed by local learning, and the PPO update is triggered every $K_{\mathrm{upd}}$ rounds from the local rollout buffer. All steps operate on local data and locally exchanged parameters; no global reward, joint state, or joint critic is ever assembled.
+
+\begin{algorithm}[t]
+\caption{\textsc{Dante}: per-vehicle decentralized network formation and personalized learning, run locally by each vehicle $i$.}
+\label{alg:dante}
+\begin{algorithmic}[1]
+\Require local dataset $\mathcal{D}_i$; initial model $w_i^{(0)}$; initial trust $q_{ij}^{(0)}\!=\!1$; actor--critic parameters $(\theta_i,\phi_i)$; per-round budgets $(\bar E_i,\bar B_i,\bar T_i)$; neighborhood cap $K_i$; PPO hyperparameters $(\gamma,\lambda_{\mathrm{GAE}},\epsilon,\eta_{\mathrm{ent}},K_{\mathrm{upd}})$; self-weight schedule $\alpha_{ii}^{(t)}$.
+\Ensure personalized model $w_i^{(T)}$ and policy $(\theta_i,\phi_i)$.
+\For{$t=0,1,\dots,T-1$}
+    \State Discover feasible peers $\mathcal{F}_i^{(t)}$ over PC5 sidelink and Uu relay; observe link features $\{f_{ij}^{(t)}\}$ and trust scores $\{q_{ij}^{(t)}\}$.
+    \State Encode ego and candidate features $(h_i^{(t)},\{v_{ij}^{(t)}\})$; compute attention $\{\beta_{ij}^{(t)}\}$ and value $V_{\phi_i}(o_i^{(t)})$.\Comment{Eq.~\eqref{eq:gat}}
+    \State Sample per-candidate Bernoulli actions $a_{ij}^{(t)}\!\sim\!\pi_{\theta_i}(\cdot\mid o_i^{(t)})$; form $C_i^{(t)}\!=\!\{j:a_{ij}^{(t)}\!=\!1\}$; if $|C_i^{(t)}|\!>\!K_i$, retain the top-$K_i$ edges ranked by $\beta_{ij}^{(t)}$.\Comment{Eq.~\eqref{eq:actor_critic}}
+    \State Exchange models with $C_i^{(t)}$ over the selected interface $m_{ij}^{(t)}$; receive $\{\hat w_j^{(t)}\}_{j\in C_i^{(t)}}$.
+    \State Apply the coordinate-wise robust filter to obtain $\{r_{ij}^{(t)}\}_{j\in C_i^{(t)}}$.
+    \State Form fused weights $\{\alpha_{ij}^{(t)}\}$ and aggregate $\bar w_i^{(t)}=\alpha_{ii}^{(t)}w_i^{(t)}+\sum_{j\in C_i^{(t)}}\alpha_{ij}^{(t)}\hat w_j^{(t)}$.\Comment{Eq.~\eqref{eq:alpha_fused}}
+    \State Starting from $\bar w_i^{(t)}$, run $I_i^{(t)}$ local SGD steps to obtain $w_i^{(t+1)}$.\Comment{Section~\ref{subsec:learning}}
+    \State Measure $(E_i^{(t)},B_i^{(t)},T_i^{(t)})$ and validation drop $\Delta_i^{(t)}$; form reward $u_i^{(t)}$.\Comment{Eq.~\eqref{eq:stage_payoff}}
+    \State Evaluate $\phi_{ij}^{(t)}$ from the robust-filter indicator and the post-update validation loss; update trust $\{q_{ij}^{(t+1)}\}$.\Comment{Eq.~\eqref{eq:trust_update}}
+    \State Append transition $(o_i^{(t)},a_i^{(t)},u_i^{(t)},o_i^{(t+1)},V_{\phi_i}(o_i^{(t)}))$ to local rollout buffer $\mathcal{R}_i$.
+    \If{$|\mathcal{R}_i|\ge K_{\mathrm{upd}}$}
+        \State Compute $\{\hat A_i^{(t)},\hat R_i^{(t)}\}$ via generalized advantage estimation.
+        \State Update $\theta_i\!\leftarrow\!\theta_i+\eta_\pi\nabla_{\theta_i}\mathcal{L}_i^{\mathrm{PPO}}(\theta_i)$; update $\phi_i$ by MSE on $\{\hat R_i^{(t)}\}$.\Comment{Eq.~\eqref{eq:ppo}}
+        \State Clear $\mathcal{R}_i$.
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------
+\subsection{Convergence and Complexity}
+\label{subsec:convergence}
+
+The joint problem is non-convex and non-stationary, and global optimality of coupled model and policy updates is out of reach. Following a two-timescale argument standard in multi-agent reinforcement learning, we analyze the learning and policy layers separately: convergence of the personalized learning iterates under a fixed collaboration profile, and stationarity of the local PPO update under an asymptotically stationary local MDP. Detailed proofs are deferred to Appendix~\ref{app:proofs}.
+
+\paragraph{Assumptions.}
+We use the following standard conditions.
+\begin{enumerate}
+    \item[\textbf{A1.}] \emph{(Smoothness)} Each local objective $F_i$ is $L$-smooth and bounded below by $F_i^{\inf}$.
+    \item[\textbf{A2.}] \emph{(Unbiased bounded-variance gradients)} $\mathbb{E}[g_i(w;\xi)]=\nabla F_i(w)$ and $\mathbb{E}\|g_i(w;\xi)-\nabla F_i(w)\|^2\le\sigma^2$.
+    \item[\textbf{A3.}] \emph{(Robust-aggregation bias)} The fused weights $\{\alpha_{ij}^{(t)}\}$ of~\eqref{eq:alpha_fused} together with the robust filter yield an effective post-aggregation stochastic gradient $\tilde g_i^{(t)}$ satisfying $\|\mathbb{E}[\tilde g_i^{(t)}\mid w_i^{(t)}]-\nabla F_i(w_i^{(t)})\|\le\zeta$ uniformly in $t$, for some $\zeta\ge 0$.
+    \item[\textbf{A4.}] \emph{(Bounded rewards and features)} $|u_i^{(t)}|\le u_{\max}$ almost surely, and candidate features and attention outputs are uniformly bounded.
+    \item[\textbf{A5.}] \emph{(Persistent exploration)} The entropy bonus in~\eqref{eq:ppo} keeps $\pi_{\theta_i}(\cdot\mid o_i^{(t)})$ strictly positive on every action in the support of an $\epsilon$-perturbation of the current policy.
+\end{enumerate}
+\textbf{A1}--\textbf{A2} are standard for smooth non-convex SGD~\cite{bottou2018optimization}. \textbf{A3} is the standard interface used in robust federated learning to decouple filter geometry from convergence arguments~\cite{karimireddy2021learning,yin2018byzantine}; the coordinate-wise trimmed mean of Section~\ref{subsubsec:trust} attains $\zeta=\mathcal{O}(f/|C_i^{(t)}|)\cdot B$ for $f$ Byzantine neighbors and bounded honest gradients $\|g_j\|\le B$. \textbf{A4} follows from the bounded validation-loss drop together with the per-round resource caps~\eqref{eq:cons_energy}--\eqref{eq:cons_lat}. \textbf{A5} is enforced by the entropy term in~\eqref{eq:ppo}.
+
+\paragraph{Convergence of the learning layer under fixed policies.}
+
+\begin{proposition}[Robust personalized SGD convergence]
+\label{prop:learning}
+Fix any joint policy profile $\pi$ for which the induced collaboration sequence $\{C_i^{(t)}\}_{t\ge 0}$ is measurable. Under \textbf{A1}--\textbf{A3}, with diminishing step size $\eta_i^{(t)}=\eta_0/\sqrt{t+1}$ and $\eta_0\le 1/L$, the personalized iterates $\{w_i^{(t)}\}$ generated by aggregate-then-train starting from $\bar w_i^{(t)}$ (Section~\ref{subsec:learning}) satisfy, for every honest vehicle $i$,
+\begin{equation}
+\label{eq:prop1}
+\begin{split}
+    \min_{0\le t\le T-1}&\,\mathbb{E}\!\left[\bigl\|\nabla F_i(w_i^{(t)})\bigr\|^2\right]\\
+    &\le \frac{2\bigl(F_i(w_i^{(0)})-F_i^{\inf}\bigr)}{\eta_0\sqrt{T}} + \frac{L\eta_0\sigma^2}{\sqrt{T}} + 2\zeta^2.
+\end{split}
+\end{equation}
+\end{proposition}
+
+Proposition~\ref{prop:learning} shows that the learning layer of \textsc{Dante} inherits the $\mathcal{O}(T^{-1/2})$ rate of non-convex SGD with an additive $\mathcal{O}(\zeta^2)$ floor set by the worst-case aggregation bias under the fused weights~\eqref{eq:alpha_fused}. The proof applies the standard non-convex SGD descent lemma to the equivalent stochastic gradient induced by aggregation; see Appendix~\ref{app:proof-learning}.
+
+\begin{remark}[Byzantine fallback and collaboration gain]
+\label{rem:fallback}
+When every neighbor of vehicle $i$ is honest and the trust and robustness scores are non-degenerate, \textbf{A3} holds with $\zeta=0$ and the floor vanishes. When every neighbor is Byzantine, $\alpha_{ij}^{(t)}\to 0$ by~\eqref{eq:alpha_fused}, the update reduces to pure local SGD, and the bound still holds with $\zeta=0$; \textsc{Dante} therefore degrades gracefully to safe local training. Between these extremes, collaboration strictly helps vehicle $i$ iff the effective post-aggregation gradient is closer to $\nabla F_i$ than $g_i^{(t)}$ alone, which is exactly when $G_i(C_i^{(t)},s^{(t)})>0$ in~\eqref{eq:G_surrogate}.
+\end{remark}
+
+\paragraph{Stationarity of the policy layer under fixed collaboration.}
+
+\begin{proposition}[Per-vehicle PPO stationarity]
+\label{prop:ppo}
+Assume \textbf{A4}--\textbf{A5} and that the joint policy $\pi_{-i}$ of the other vehicles induces an asymptotically stationary local MDP for vehicle $i$. Then, with sufficiently small PPO step sizes and a bounded KL per update, the sequence $\{\theta_i^{(k)}\}_{k\ge 0}$ generated by~\eqref{eq:ppo} converges to a first-order stationary point of the local surrogate, $\nabla_{\theta_i}\mathcal{L}_i^{\mathrm{PPO}}(\theta_i^\star)=0$.
+\end{proposition}
+
+Proposition~\ref{prop:ppo} is a per-vehicle stationarity result and does not claim convergence to a Nash equilibrium of the underlying Markov game; Nash analysis for multi-agent PPO remains open, and we follow the IPPO line of work~\cite{dewitt2020independent} in giving only per-vehicle stationarity. The proof reduces the local view to a policy-gradient iteration on a time-inhomogeneous MDP whose kernel converges, and then invokes standard clipped-policy-gradient analysis; see Appendix~\ref{app:proof-ppo}. Empirically, the weaker claim of per-vehicle stationarity matches the observation that, once policies stabilize, the collaboration graph changes only marginally from round to round.
+
+\paragraph{Per-round complexity.}
+
+Let $d$ denote the model dimension, $k=|\mathcal{F}_i^{(t)}|$ the number of candidate neighbors, $h$ the hidden width of the GAT encoder and actor/critic MLPs, $|\mathcal{B}_i|$ the mini-batch size, and $|\mathcal{D}_i^{\mathrm{val}}|$ the local validation split size. The per-round cost of vehicle $i$ decomposes as follows.
+\begin{itemize}
+    \item \textbf{Local SGD.} $\mathcal{O}(I_i^{(t)}\,|\mathcal{B}_i|\,d)$ for the forward/backward passes.
+    \item \textbf{GAT encoding and actor/critic forward.} $\mathcal{O}(k\,h + h^2)$.
+    \item \textbf{Model exchange.} $\mathcal{O}(k\,d)$ floats transmitted and received.
+    \item \textbf{Robust filter and aggregation.} $\mathcal{O}(k\,d)$ for the coordinate-wise trimmed-mean statistics and the weighted sum in~\eqref{eq:alpha_fused}.
+    \item \textbf{Validation probe.} $\mathcal{O}(|\mathcal{D}_i^{\mathrm{val}}|\,d)$ once per round.
+    \item \textbf{Trust update.} $\mathcal{O}(k)$.
+    \item \textbf{PPO update (every $K_{\mathrm{upd}}$ rounds).} Amortized $\mathcal{O}(k\,h+h^2)$ per round.
+\end{itemize}
+Summing the dominant terms yields
+\begin{equation*}
+    \mathcal{O}\!\Bigl((I_i^{(t)}|\mathcal{B}_i|+|\mathcal{D}_i^{\mathrm{val}}|+k)\,d + k\,h + h^2\Bigr),
+\end{equation*}
+i.e., a cost that is linear in the model dimension $d$ and in the candidate-set size $k$. Per-round communication is $\mathcal{O}(k\,d)$ in each direction and is independent of $|\mathcal{V}_t|$: \textsc{Dante} scales linearly with the local neighborhood cap $K_i$ and is agnostic to fleet size, which is essential for practical V2X deployment.

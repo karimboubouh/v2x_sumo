@@ -1,18 +1,18 @@
 """
-IPPO — Independent PPO ablation baseline for GAT_PPO.
+IPPO — Independent PPO ablation baseline for DANTE.
 
 Removes the graph attention encoder entirely.  Neighborhood context is built
 by mean-pooling projected neighbor features (uniform 1/N weights).  FL
 aggregation also uses uniform weights — no learned α at any stage.
 
-Key differences from GAT_PPO
+Key differences from DANTE
 ────────────────────────────
   Encoding   : mean pooling  vs  attention-weighted sum
   Aggregation: uniform 1/N   vs  re-normalised α_ij
   Alphas     : uniform 1/|C| vs  softmax attention scores
 
 Everything else — PPO update, GAE, reward shaping, per-candidate
-Bernoulli decisions, simulation hooks — is identical to GAT_PPO.
+Bernoulli decisions, simulation hooks — is identical to DANTE.
 """
 
 from __future__ import annotations
@@ -25,6 +25,9 @@ from torch.distributions import Bernoulli
 
 from algorithms.base import DLAlgorithm, LINK_INTERNET, LINK_SIDELINK
 from algorithms.ippo.config import (
+    MAX_COLLAB_NEIGHBORS,
+    MAX_INTERNET_NEIGHBORS,
+    MAX_SIDELINK_NEIGHBORS,
     MLP_HIDDEN_DIM,
     NBR_DIM,
     OWN_DIM,
@@ -35,12 +38,23 @@ from algorithms.ippo.config import (
     PPO_GAMMA,
     PPO_LR,
     PPO_MAX_GRAD_NORM,
+    PPO_REWARD_SOURCE,
     PPO_UPDATE_EVERY,
     PPO_VALUE_COEF,
     SELF_WEIGHT,
 )
 from dl.helpers import clone_state_dict, sl_tx_cost_norm
 import config
+
+
+def _normalize_reward_source(value: str) -> str:
+    value = str(value).strip().lower()
+    if value not in {"training", "validation"}:
+        raise ValueError(
+            f"Unsupported IPPO PPO_REWARD_SOURCE {value!r}. "
+            "Expected 'training' or 'validation'."
+        )
+    return value
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
@@ -153,7 +167,7 @@ class _MLPActorCritic(nn.Module):
 # ── Per-vehicle PPO agent ─────────────────────────────────────────────────────
 
 class _VehiclePPOAgent:
-    """Independent PPO learner — identical update logic to GAT-PPO."""
+    """Independent PPO learner — identical update logic to DANTE."""
 
     def __init__(self, own_dim: int, nbr_dim: int, hidden_dim: int) -> None:
         self.policy    = _MLPActorCritic(own_dim, nbr_dim, hidden_dim)
@@ -211,7 +225,7 @@ class _VehiclePPOAgent:
             return False
         return force or len(self.rollout) >= PPO_UPDATE_EVERY
 
-    # ── PPO update (GAE + clipped surrogate) — identical to GAT-PPO ──────────
+    # ── PPO update (GAE + clipped surrogate) — identical to DANTE ────────────
 
     def update(self) -> None:
         if not self.rollout:
@@ -279,9 +293,14 @@ class IPPOAlgorithm(DLAlgorithm):
 
     name = "IPPO"
     needs_dynamic_neighbors = True
+    evaluation_mode = "personalized"
 
     def __init__(self) -> None:
         self._agents: dict[int, _VehiclePPOAgent] = {}
+        self.reward_source = _normalize_reward_source(PPO_REWARD_SOURCE)
+        self.max_sidelink_neighbors = int(MAX_SIDELINK_NEIGHBORS)
+        self.max_internet_neighbors = int(MAX_INTERNET_NEIGHBORS)
+        self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -323,9 +342,9 @@ class IPPOAlgorithm(DLAlgorithm):
             else:
                 tx_cost += 0.05
 
-        # Cap to MAX_NEIGHBORS — no attention score to rank by, so keep
+        # Cap to self.max_collab_neighbors — no attention score to rank by, so keep
         # candidates in the order the environment presented them (FIFO).
-        max_k = int(config.MAX_NEIGHBORS)
+        max_k = int(self.max_collab_neighbors)
         if len(connections) > max_k:
             overflow = selected_ids[max_k:]
             for nid in overflow:
@@ -378,7 +397,7 @@ class IPPOAlgorithm(DLAlgorithm):
             v._param_vec = None
 
     # ── Post-step: reward assignment + PPO update trigger ─────────────────────
-    # Identical to GAT_PPO — the reward signal and update scheduling do not
+    # Identical to DANTE — the reward signal and update scheduling do not
     # depend on attention weights.
 
     def post_step(self, vehicles: list, transitions: dict, step_n: int) -> dict:
@@ -393,7 +412,7 @@ class IPPOAlgorithm(DLAlgorithm):
                 and agent.pending_round is not None
                 and v.tr_rounds >= agent.pending_round
             ):
-                reward = max(float(v._prev_loss - v.current_loss), 0.0)
+                reward = max(float(v._prev_reward_loss - v.current_reward_loss), 0.0)
                 reward -= float(agent.pending_transition.get("cost", 0.0))
                 next_value = (
                     float(next_transition["value"])

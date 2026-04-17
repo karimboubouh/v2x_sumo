@@ -1,0 +1,63 @@
+\section{Experimental Results}
+\label{sec:experiments}
+
+This section evaluates the practical behavior of \textsc{Dante} in the SUMO-based vehicular testbed developed for this work. Our goal is to assess whether the proposed dual-interface, resource-aware collaboration policy preserves strong personalized learning performance while reducing the communication burden induced by dense or poorly chosen peer exchange. We first describe the experimental setup and then analyze convergence and energy efficiency. Additional experiments on topology adaptation, robustness, and ablations can be added on top of this core evaluation protocol.
+
+\subsection{Experimental Setup}
+
+\paragraph{Datasets and learning models}
+The decentralized learning stack in our simulator supports MNIST, FEMNIST, CIFAR-10, and CIFAR-100, together with DNN, CNN, LSTM, Transformer, and ResNet backbones. Data are partitioned across vehicles through a Dirichlet non-IID split, consistent with the heterogeneous-client setting targeted by personalized decentralized learning. Each vehicle retains a small local validation split, which is used by \textsc{Dante} for reward estimation and trust updates, while performance is reported using the mean personalized test accuracy and loss across the active vehicles.
+
+\paragraph{Mobility scenarios and communication substrate}
+We evaluate the system on real-world road maps imported from OpenStreetMap into SUMO and instantiated as urban, highway, coastal, campus, and mixed-topology driving scenarios. Vehicle mobility and neighbor availability are therefore driven by the road geometry and route dynamics of the simulator rather than by a static synthetic graph. At each simulation step, feasible collaboration edges are rebuilt from the current vehicle positions according to the hybrid communication model of Section~\ref{sec:system_model}, where short-range exchanges use the PC5 sidelink and longer-range but more expensive communication can be routed through the 5G Uu interface.
+
+\paragraph{Baselines and evaluation metrics}
+We compare \textsc{Dante} against representative baselines implemented in the codebase, including FedAvg, D-PSGD, DPFL, pFedGraph, and IPPO as the closest ablation without graph attention. In the implementation and the exported plots, the proposed method appears under the name GAT\_PPO. The main convergence metrics are mean personalized test accuracy and mean test loss, reported as functions of both training rounds and wall-clock time. To evaluate resource efficiency, we additionally track total training energy from the same computation and communication cost model used in the optimization objective of Section~\ref{sec:system_model}.
+
+\paragraph{Implementation}
+The simulator is implemented in Python with PyTorch for model training and SUMO/TraCI for traffic and mobility emulation. Unless otherwise stated, experiments follow the default training configuration of the framework, including mini-batch local updates, periodic evaluation, and the per-round communication and computation budgets defined in the system model. This design ensures that the experimental evaluation is directly aligned with the assumptions used in the formulation and analysis of \textsc{Dante}.
+
+\subsection{Performance Analysis}
+
+We first study the convergence behavior of \textsc{Dante} under dynamic vehicular mobility and heterogeneous local data. The key question in this experiment is whether selective dual-interface collaboration can maintain strong personalized convergence while avoiding the unnecessary exchanges incurred by denser or less adaptive baselines.
+
+\begin{figure*}[t]
+    \centering
+    \subfloat[Mean personalized test accuracy versus wall-clock time]{%
+        \includegraphics[width=0.32\textwidth]{assets/accuracy_vs_time_comparison.pdf}
+        \label{fig:conv_time}
+    }\hfill
+    \subfloat[Mean personalized test accuracy versus training rounds]{%
+        \includegraphics[width=0.32\textwidth]{assets/accuracy_vs_rounds_comparison.pdf}
+        \label{fig:conv_rounds}
+    }\hfill
+    \subfloat[Mean personalized test loss versus wall-clock time]{%
+        \includegraphics[width=0.32\textwidth]{assets/loss_vs_time_comparison.pdf}
+        \label{fig:conv_loss}
+    }
+    \caption{Convergence behavior of \textsc{Dante} and representative baselines in SUMO-based vehicular learning. The three panels separate end-to-end runtime effects from round-wise statistical efficiency and provide complementary views of convergence. In the plots, \textsc{Dante} is reported under its implementation name GAT\_PPO.}
+    \label{fig:convergence}
+\end{figure*}
+
+\paragraph{Convergence views}
+Figure~\ref{fig:convergence} reports three complementary views of convergence. The accuracy-versus-time panel captures the full cost of learning in a realistic vehicular loop, including mobility, neighbor discovery, link selection, and model exchange. The accuracy-versus-rounds panel isolates statistical efficiency across collaborative updates, while the loss-versus-time panel provides an optimization view that remains sensitive to transient instability during training. Together, these views reveal whether the gains of \textsc{Dante} come from better learning dynamics, lower runtime overhead, or both.
+
+\paragraph{Effect of resource-aware collaboration}
+This comparison is especially important for \textsc{Dante} because the method explicitly prunes low-value links and chooses between PC5 and 5G Uu communication according to expected learning benefit and resource cost. Relative to FedAvg and D-PSGD, the experiment highlights the value of moving from fixed or purely mixing-based collaboration to adaptive directed selection. Relative to DPFL and pFedGraph, it measures the benefit of learning the topology online under mobility and interface heterogeneity. Relative to IPPO, it isolates the contribution of attention-guided neighborhood encoding and attention-driven aggregation. In the final version of the figure, these curves should therefore show whether \textsc{Dante} reaches a given target accuracy with fewer ineffective interactions and a smoother loss trajectory than the baselines.
+
+\subsection{Energy Efficiency}
+
+We next analyze whether the statistical gains of \textsc{Dante} translate into lower resource consumption. Since the simulator computes energy directly from the communication and computation model of Section~\ref{sec:system_model}, the comparison reflects the same quantities optimized by the learning objective rather than an external proxy metric.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.52\textwidth]{assets/energy_comparison.pdf}
+    \caption{Total energy comparison across the evaluated methods. The proposed method is shown under its implementation name GAT\_PPO.}
+    \label{fig:energy}
+\end{figure*}
+
+\paragraph{Total energy consumption}
+Figure~\ref{fig:energy} reports the total energy required by each method under the SUMO-based experimental setup. This comparison directly reflects the benefit of selective collaboration, because methods that keep too many low-value links or rely on less efficient communication patterns incur unnecessary exchange cost in addition to their local training cost. The lower total energy of \textsc{Dante} indicates that learning the collaboration policy from local observations can translate into tangible resource savings rather than only improved predictive performance.
+
+\paragraph{Resource-aware optimization}
+The relevance of this result is specific to the vehicular setting studied in this paper. \textsc{Dante} does not optimize topology in isolation; it exploits the dual-interface communication substrate to decide when collaboration is worth paying for and when local progress is preferable. In the final version of this section, we will add the exact percentage energy savings and relate them to the convergence curves in Figure~\ref{fig:convergence}, thereby quantifying the accuracy--resource trade-off achieved by the proposed method.

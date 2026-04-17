@@ -1,4 +1,9 @@
-"""D-PSGD algorithm configuration.
+"""D-PSGD algorithm configuration."""
 
-D-PSGD currently has no algorithm-specific parameters.
-"""
+# Candidate and collaboration caps.
+MAX_SIDELINK_NEIGHBORS: int = 0
+MAX_INTERNET_NEIGHBORS: int = 10
+MAX_COLLAB_NEIGHBORS: int = 10
+
+# Evaluation split used for runtime metrics and saved plots.
+EVAL_SPLIT: str = "test"

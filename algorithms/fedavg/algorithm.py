@@ -2,14 +2,17 @@
 FedAvg — Decentralized FedAvg baseline.
 
 Static random neighbor graph, equal-weight aggregation.
-Adapted from v2x_sim/algorithms/fedavg/algorithm.py.
 """
 
 import random
 
 from algorithms.base import DLAlgorithm, LINK_INTERNET
-from algorithms.fedavg.config import SELF_WEIGHT
-import config
+from algorithms.fedavg.config import (
+    MAX_COLLAB_NEIGHBORS,
+    MAX_INTERNET_NEIGHBORS,
+    MAX_SIDELINK_NEIGHBORS,
+    SELF_WEIGHT,
+)
 from dl.helpers import clone_state_dict
 
 
@@ -23,9 +26,14 @@ class FedAvgAlgorithm(DLAlgorithm):
     name = "FedAvg"
     needs_dynamic_neighbors = False
 
+    def __init__(self):
+        self.max_sidelink_neighbors = int(MAX_SIDELINK_NEIGHBORS)
+        self.max_internet_neighbors = int(MAX_INTERNET_NEIGHBORS)
+        self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
+
     def setup(self, vehicles: list) -> None:
-        """Assign each vehicle MAX_NEIGHBORS randomly chosen peers."""
-        max_n = int(config.MAX_NEIGHBORS)
+        """Assign each vehicle up to self.max_collab_neighbors random peers."""
+        max_n = int(self.max_collab_neighbors)
         for v in vehicles:
             others = [o.id for o in vehicles if o.id != v.id]
             k = min(max_n, len(others))
@@ -39,8 +47,14 @@ class FedAvgAlgorithm(DLAlgorithm):
         return connections, alphas, link_types, None
 
     def aggregate(self, v, vehicles: list) -> None:
-        """Personalized FedAvg: vehicle retains SELF_WEIGHT of its own model,
-        the remaining (1 - SELF_WEIGHT) is split equally across neighbors."""
+        """Aggregate the local model with neighbor models.
+
+        If SELF_WEIGHT is None, use classic FedAvg with equal weighting across
+        the local model and all received neighbor models.
+
+        If SELF_WEIGHT is numeric, retain that fraction of the local model and
+        split the remaining mass equally across neighbors.
+        """
         nbr_sds = [
             vehicles[nid].get_shared_weights()
             for nid in v.connections
@@ -49,8 +63,16 @@ class FedAvgAlgorithm(DLAlgorithm):
         if not nbr_sds:
             return
 
-        self_w = float(SELF_WEIGHT)
-        nbr_w = (1.0 - self_w) / len(nbr_sds)
+        if SELF_WEIGHT is None:
+            self_w = 1.0 / (len(nbr_sds) + 1.0)
+            nbr_w = self_w
+        else:
+            self_w = float(SELF_WEIGHT)
+            if not 0.0 <= self_w <= 1.0:
+                raise ValueError(
+                    f"FedAvg SELF_WEIGHT must be None or in [0, 1], got {SELF_WEIGHT!r}"
+                )
+            nbr_w = (1.0 - self_w) / len(nbr_sds)
 
         with v._lock:
             own_sd = v.model.state_dict()

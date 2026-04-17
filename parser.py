@@ -27,11 +27,6 @@ def parse_args():
         help=f"Communication range in meters (default: {config.COMM_RANGE})",
     )
     parser.add_argument(
-        "--dl-demo",
-        action="store_true",
-        help="Enable periodic DL weight exchange messages",
-    )
-    parser.add_argument(
         "--speed", "-x",
         type=float,
         default=1.0,
@@ -51,6 +46,12 @@ def parse_args():
         choices=["debug", "info", "success", "result", "warning", "error"],
         metavar="LEVEL",
         help="Minimum log level to display: debug|info|success|result|warning|error (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=config.HEADLESS,
+        help="Disable dashboard and graphics; run with console output only",
     )
     parser.add_argument(
         "--plot-experiment",

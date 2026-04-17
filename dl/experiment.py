@@ -157,6 +157,18 @@ def _line_title(experiment: dict) -> str:
     )
 
 
+def _evaluation_label(experiment: dict) -> str:
+    cfg = experiment.get("config", {})
+    split = str(cfg.get("EVAL_SPLIT", "test")).strip().lower()
+    mode = str(cfg.get("EVALUATION_MODE", "global")).strip().lower()
+    base = {
+        "train": "Train Eval",
+        "validation": "Validation",
+        "test": "Test",
+    }.get(split, split.title() or "Evaluation")
+    return f"{base} (personalized)" if mode == "personalized" else base
+
+
 def _ensure_out_root(out_root: str | None = None) -> str:
     root = os.path.abspath(out_root or config.OUT_DIR)
     os.makedirs(root, exist_ok=True)
@@ -204,6 +216,10 @@ def _prepare_series(history: list, x_key: str, y_key: str) -> tuple[list, list]:
     return [point[x_key] for point in history], [point[y_key] for point in history]
 
 
+def _series_with_default(history: list, key: str, default: float = 0.0) -> list[float]:
+    return [point.get(key, default) for point in history]
+
+
 def plot_experiment(
     experiment: dict,
     output_dir: str,
@@ -213,9 +229,13 @@ def plot_experiment(
     """Generate and save the requested experiment figures."""
     os.makedirs(output_dir, exist_ok=True)
     train_history = sorted(experiment.get("train_history", []), key=lambda p: p["round"])
-    test_history  = sorted(experiment.get("test_history",  []), key=lambda p: p["round"])
+    eval_history = sorted(
+        experiment.get("eval_history", experiment.get("test_history", [])),
+        key=lambda p: p["round"],
+    )
     energy_totals = dict(experiment.get("energy_totals", {}))
     title = _line_title(experiment)
+    eval_label = _evaluation_label(experiment)
 
     matplotlib.rcParams.update(_PAPER_RC)
     figures = {}
@@ -223,18 +243,28 @@ def plot_experiment(
     train_rounds, train_acc = _prepare_series(train_history, "round", "acc")
     train_times, _ = _prepare_series(train_history, "time", "acc")
     _, train_loss = _prepare_series(train_history, "round", "loss")
-    test_rounds, test_acc = _prepare_series(test_history, "round", "acc")
-    test_times, _ = _prepare_series(test_history, "time", "acc")
-    _, test_loss = _prepare_series(test_history, "round", "loss")
+    eval_rounds, eval_acc = _prepare_series(eval_history, "round", "acc")
+    eval_times, _ = _prepare_series(eval_history, "time", "acc")
+    _, eval_loss = _prepare_series(eval_history, "round", "loss")
+    eval_acc_std = _series_with_default(eval_history, "acc_std")
+    eval_loss_std = _series_with_default(eval_history, "loss_std")
     reward_history = list(experiment.get("reward_history", []))
     reward_steps, reward_values = _prepare_series(reward_history, "step", "reward")
     reward_times, _ = _prepare_series(reward_history, "time", "reward")
 
     fig, ax = plt.subplots(figsize=(_W2, _H * 2))
     ax.plot(train_rounds, train_acc, label="Train Accuracy", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
-    if test_history:
-        ax.plot(test_rounds, test_acc, label="Test Accuracy", lw=1.8, marker="o", color=_TEST_COLOR)
-    ax.set_title(f"Accuracy vs Rounds\n{title}")
+    if eval_history:
+        ax.plot(eval_rounds, eval_acc, label=f"{eval_label} Accuracy", lw=1.8, marker="o", color=_TEST_COLOR)
+        ax.fill_between(
+            eval_rounds,
+            [max(acc - std, 0.0) for acc, std in zip(eval_acc, eval_acc_std)],
+            [min(acc + std, 1.0) for acc, std in zip(eval_acc, eval_acc_std)],
+            color=_TEST_COLOR,
+            alpha=0.10,
+            linewidth=0.0,
+        )
+    ax.set_title(f"Mean Per-Vehicle Accuracy vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Accuracy")
     ax.legend(loc="lower right")
@@ -245,9 +275,17 @@ def plot_experiment(
 
     fig, ax = plt.subplots(figsize=(_W2, _H * 2))
     ax.plot(train_times, train_acc, label="Train Accuracy", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
-    if test_history:
-        ax.plot(test_times, test_acc, label="Test Accuracy", lw=1.8, marker="o", color=_TEST_COLOR)
-    ax.set_title(f"Accuracy vs Time\n{title}")
+    if eval_history:
+        ax.plot(eval_times, eval_acc, label=f"{eval_label} Accuracy", lw=1.8, marker="o", color=_TEST_COLOR)
+        ax.fill_between(
+            eval_times,
+            [max(acc - std, 0.0) for acc, std in zip(eval_acc, eval_acc_std)],
+            [min(acc + std, 1.0) for acc, std in zip(eval_acc, eval_acc_std)],
+            color=_TEST_COLOR,
+            alpha=0.10,
+            linewidth=0.0,
+        )
+    ax.set_title(f"Mean Per-Vehicle Accuracy vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Accuracy")
     ax.legend(loc="lower right")
@@ -258,9 +296,17 @@ def plot_experiment(
 
     fig, ax = plt.subplots(figsize=(_W2, _H * 2))
     ax.plot(train_rounds, train_loss, label="Train Loss", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
-    if test_history:
-        ax.plot(test_rounds, test_loss, label="Test Loss", lw=1.8, marker="o", color=_TEST_COLOR)
-    ax.set_title(f"Loss vs Rounds\n{title}")
+    if eval_history:
+        ax.plot(eval_rounds, eval_loss, label=f"{eval_label} Loss", lw=1.8, marker="o", color=_TEST_COLOR)
+        ax.fill_between(
+            eval_rounds,
+            [max(loss - std, 0.0) for loss, std in zip(eval_loss, eval_loss_std)],
+            [loss + std for loss, std in zip(eval_loss, eval_loss_std)],
+            color=_TEST_COLOR,
+            alpha=0.10,
+            linewidth=0.0,
+        )
+    ax.set_title(f"Mean Per-Vehicle Loss vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Loss")
     ax.legend(loc="upper right")
@@ -271,9 +317,17 @@ def plot_experiment(
 
     fig, ax = plt.subplots(figsize=(_W2, _H * 2))
     ax.plot(train_times, train_loss, label="Train Loss", lw=1.0, ls="--", alpha=0.6, color=_TRAIN_COLOR)
-    if test_history:
-        ax.plot(test_times, test_loss, label="Test Loss", lw=1.8, marker="o", color=_TEST_COLOR)
-    ax.set_title(f"Loss vs Time\n{title}")
+    if eval_history:
+        ax.plot(eval_times, eval_loss, label=f"{eval_label} Loss", lw=1.8, marker="o", color=_TEST_COLOR)
+        ax.fill_between(
+            eval_times,
+            [max(loss - std, 0.0) for loss, std in zip(eval_loss, eval_loss_std)],
+            [loss + std for loss, std in zip(eval_loss, eval_loss_std)],
+            color=_TEST_COLOR,
+            alpha=0.10,
+            linewidth=0.0,
+        )
+    ax.set_title(f"Mean Per-Vehicle Loss vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Loss")
     ax.legend(loc="upper right")

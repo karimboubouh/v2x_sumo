@@ -1,1 +1,1 @@
-"""IPPO algorithm package — ablation baseline for GAT_PPO."""
+"""IPPO algorithm package — ablation baseline for DANTE."""

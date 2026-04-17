@@ -4,7 +4,6 @@ dl/helpers.py — Utility functions for the DPL subsystem.
 Adapted from v2x_sim/helpers.py.
 """
 
-import itertools
 import math
 
 import numpy as np
@@ -15,42 +14,109 @@ import config
 from dl.models import build_model
 
 
-def eval_weight_snapshots(weight_snapshots: list[dict], test_loader) -> tuple:
-    """Evaluate model-weight snapshots on the global test set."""
-    criterion = nn.CrossEntropyLoss()
-    totals = [[0.0, 0, 0] for _ in weight_snapshots]
-    models = []
+def _resolve_eval_batch_limit() -> int | None:
+    """Return the configured evaluation batch cap, or None for full-loader eval."""
+    limit = getattr(config, "EVAL_BATCHES_PER_ROUND", None)
+    if limit is None:
+        return None
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return None
+    return limit if limit > 0 else None
 
-    for weights in weight_snapshots:
+
+def eval_model_on_loader(
+    model,
+    loader,
+    *,
+    criterion=None,
+    batch_limit: int | None = None,
+) -> dict:
+    """Evaluate one model on one loader and return loss/accuracy summary."""
+    if loader is None:
+        raise ValueError("loader must not be None")
+
+    criterion = criterion or nn.CrossEntropyLoss()
+    was_training = bool(model.training)
+    total_loss, total_correct, total_n = 0.0, 0, 0
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(loader):
+            if batch_limit is not None and batch_idx >= batch_limit:
+                break
+            logits = model(images)
+            loss = criterion(logits, labels)
+            n = len(labels)
+            total_loss += loss.item() * n
+            total_correct += int((logits.argmax(1) == labels).sum())
+            total_n += n
+
+    if was_training:
+        model.train()
+
+    return {
+        "loss": total_loss / max(total_n, 1),
+        "acc": total_correct / max(total_n, 1),
+        "n_samples": int(total_n),
+    }
+
+
+def eval_weight_snapshots(weight_snapshots: list[dict], eval_loaders) -> dict:
+    """Evaluate model-weight snapshots on shared or per-vehicle evaluation data."""
+    if eval_loaders is None:
+        raise ValueError("eval_loaders must not be None")
+
+    if isinstance(eval_loaders, (list, tuple)):
+        per_model_loaders = list(eval_loaders)
+        if len(per_model_loaders) != len(weight_snapshots):
+            raise ValueError(
+                "per-vehicle eval loader count must match weight snapshot count: "
+                f"{len(per_model_loaders)} != {len(weight_snapshots)}"
+            )
+    else:
+        per_model_loaders = [eval_loaders] * len(weight_snapshots)
+
+    criterion = nn.CrossEntropyLoss()
+    per_loss = []
+    per_acc = []
+    batch_limit = _resolve_eval_batch_limit()
+
+    for weights, loader in zip(weight_snapshots, per_model_loaders):
         model = build_model(config.DATASET, config.MODEL_ARCH)
         model.load_state_dict(weights)
-        model.eval()
-        models.append(model)
+        metrics = eval_model_on_loader(
+            model,
+            loader,
+            criterion=criterion,
+            batch_limit=batch_limit,
+        )
+        per_loss.append(metrics["loss"])
+        per_acc.append(metrics["acc"])
 
-    with torch.no_grad():
-        for images, labels in test_loader:
-            n = len(labels)
-            for idx, model in enumerate(models):
-                logits = model(images)
-                loss = criterion(logits, labels)
-                totals[idx][0] += loss.item() * n
-                totals[idx][1] += int((logits.argmax(1) == labels).sum())
-                totals[idx][2] += n
-
-    per_loss = [total[0] / max(total[2], 1) for total in totals]
-    per_acc = [total[1] / max(total[2], 1) for total in totals]
-    return float(np.mean(per_loss)), float(np.mean(per_acc))
+    per_loss = np.asarray(per_loss, dtype=np.float64)
+    per_acc = np.asarray(per_acc, dtype=np.float64)
+    return {
+        "loss": float(per_loss.mean()) if per_loss.size else 0.0,
+        "loss_std": float(per_loss.std()) if per_loss.size else 0.0,
+        "acc": float(per_acc.mean()) if per_acc.size else 0.0,
+        "acc_std": float(per_acc.std()) if per_acc.size else 0.0,
+        "per_vehicle_loss": per_loss.astype(np.float32).tolist(),
+        "per_vehicle_acc": per_acc.astype(np.float32).tolist(),
+        "n_vehicles": int(per_acc.size),
+    }
 
 
-def eval_vehicles(vehicles, test_loader) -> tuple:
-    """Evaluate every vehicle's model on the global test set.
+def eval_vehicles(vehicles, eval_loaders) -> dict:
+    """Evaluate every vehicle's model on the configured evaluation data.
 
     Returns:
-        (avg_loss, avg_acc) — mean across all vehicles.
+        Evaluation summary containing mean/std across vehicles.
     """
     return eval_weight_snapshots(
         [v.get_shared_weights() for v in vehicles],
-        test_loader,
+        eval_loaders,
     )
 
 
@@ -60,8 +126,9 @@ def clone_state_dict(state_dict: dict) -> dict:
 
 
 def _inf_loader(loader):
-    """Wrap a DataLoader in an infinite cycle iterator."""
-    return itertools.cycle(loader)
+    """Yield batches forever without caching every batch in memory."""
+    while True:
+        yield from loader
 
 
 # ── Shannon-capacity TX helpers ───────────────────────────────────────────────

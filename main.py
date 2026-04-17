@@ -2,7 +2,6 @@
 """SUMO V2V Communication Dashboard - Main entry point."""
 
 import os
-import random
 import signal
 import sys
 import time
@@ -15,15 +14,15 @@ from parser import parse_args
 import config
 import logger
 from communication.comm_manager import CommManager
-from dashboard.app import DashboardApp
 from event_stream import EventStream
-from fl_interface.fl_payload import DLPayload
 from simulation.sumo_manager import SumoManager
 
 
 def main():
     args = parse_args()
     logger.set_level(args.verbose)
+    if not args.headless:
+        from dashboard.app import DashboardApp
     config.COMM_RANGE = args.comm_range
 
     if args.plot_experiment:
@@ -60,7 +59,6 @@ def main():
         )
     else:
         logger.log("DPL: off")
-    logger.log(f"DPL demo: {'on' if args.dl_demo else 'off'}")
 
     if config.LOG_MAX_LINES is None:
         event_stream_max = None
@@ -71,15 +69,18 @@ def main():
 
     event_stream = EventStream(max_events=event_stream_max)
     sumo = SumoManager(args.scenario, args.num_vehicles, args.force_speed)
-    comm = CommManager(comm_range=args.comm_range, event_stream=event_stream)
+    # In headless mode pass no event stream: skips all event publishing (link
+    # connect/disconnect, weight serialisation, etc.) which is display-only work.
+    _viz_stream = None if args.headless else event_stream
+    comm = CommManager(comm_range=args.comm_range, event_stream=_viz_stream)
     dashboard = None
     dl_env = None
     running = True
     training_status = None
     plots_generated = False
     plot_windows_active = False
-    last_logged_test_round = 0
-    final_test_logged = False
+    last_logged_eval_round = -1
+    final_eval_logged = False
 
     # Speed multiplier: 1.0 = real-time, 2.0 = 2x faster, 0 = unlimited
     speed_mult = args.speed
@@ -100,9 +101,12 @@ def main():
         logger.log(f"Network bounds: {net_bounds}")
         logger.log(f"Road segments: {len(edge_shapes)}")
 
-        dashboard = DashboardApp(net_bounds, edge_shapes, scenario_info["name"])
-        dashboard.initialize()
-        logger.log("Dashboard ready. Press ESC or Q to quit.", "success")
+        if not args.headless:
+            dashboard = DashboardApp(net_bounds, edge_shapes, scenario_info["name"])
+            dashboard.initialize()
+            logger.log("Dashboard ready. Press ESC or Q to quit.", "success")
+        else:
+            logger.log("Running in headless mode (no dashboard).", "info")
 
         # ── DL initialization (only when --dl is passed) ──────────────
         dl_env = None
@@ -118,7 +122,7 @@ def main():
 
             logger.log(f"Partitioning {args.dl_dataset} (non-IID) for {args.num_vehicles} vehicles...", "info")
             sumo_ids = [f"mv_{i}" for i in range(args.num_vehicles)]
-            train_loaders, test_loader = partition_dataset(
+            train_loaders, train_eval_loaders, val_loaders, local_test_loaders, test_loader = partition_dataset(
                 config.DATASET,
                 args.num_vehicles,
                 alpha=config.DATA_ALPHA,
@@ -129,19 +133,33 @@ def main():
                 train_loaders,
                 net_bounds,
                 sumo_ids,
+                train_eval_loaders=train_eval_loaders,
+                val_loaders=val_loaders,
                 test_loader=test_loader,
-                event_stream=event_stream,
+                local_test_loaders=local_test_loaders,
+                event_stream=_viz_stream,
             )
             training_status = dl_env.get_progress_snapshot()
             logger.log(
                 f"DPL ready: {args.dl_algorithm} | {args.dl_dataset}/{args.dl_model} | {args.num_vehicles} vehicles",
                 "success",
             )
+            logger.log(
+                f"Evaluation: {dl_env.eval_label} split | mode={dl_env.evaluation_mode}",
+                "info",
+            )
+            if dl_env.reward_source is not None:
+                logger.log(
+                    f"PPO reward source: {dl_env.reward_source}",
+                    "info",
+                )
+            if dl_env.eval_split == "validation":
+                logger.log(
+                    f"Validation used: {config.VALIDATION_FRACTION:.0%} of each vehicle shard",
+                    "info",
+                )
 
-        dl_payload = DLPayload() if args.dl_demo else None
         dl_complete_logged = False
-        dl_interval = 10.0
-        last_dl_time = 0.0
         step_count = 0
         last_status_step = -1
         vehicle_states = {}
@@ -158,6 +176,8 @@ def main():
         # Reserve a small wall-clock slice for unlimited mode so expensive
         # repaints do not directly throttle SUMO progression.
         unlimited_sim_budget = render_interval
+        last_bar_update = 0.0
+        logger.enable_progress_bar()
 
         def finish_dl(stop_reason, avg_loss=None, avg_acc=None, tr_round=None):
             nonlocal dl_complete_logged
@@ -178,40 +198,87 @@ def main():
                 )
             dl_complete_logged = True
 
-        def log_test_metrics(test_round, test_loss, test_acc):
-            nonlocal last_logged_test_round
+        def log_eval_metrics(eval_round, eval_loss, eval_acc, eval_loss_std=None, eval_acc_std=None):
+            nonlocal last_logged_eval_round
 
-            if test_round is None or test_loss is None or test_acc is None:
+            if eval_round is None or eval_loss is None or eval_acc is None:
                 return
-            if test_round <= last_logged_test_round:
+            if eval_round <= last_logged_eval_round:
                 return
-            last_logged_test_round = int(test_round)
+            last_logged_eval_round = int(eval_round)
+            label = dl_env.eval_label if dl_env is not None else "Evaluation"
+            loss_text = f"{eval_loss:.4f}"
+            if eval_loss_std is not None:
+                loss_text += f" ± {eval_loss_std:.4f}"
+            acc_text = f"{eval_acc:.2%}"
+            if eval_acc_std is not None:
+                acc_text += f" ± {eval_acc_std:.2%}"
             logger.log(
-                f"Test Round {test_round} | "
-                f"Loss: {test_loss:.4f} | "
-                f"Acc: {test_acc:.2%}",
-                "result",
+                f"{label} Round {eval_round} | "
+                f"Loss: {loss_text} | "
+                f"Acc: {acc_text}",
+                "warning",
             )
 
-        def log_final_test_metrics(training_snapshot):
-            nonlocal final_test_logged
+        def log_final_eval_metrics(training_snapshot):
+            nonlocal final_eval_logged
 
-            if final_test_logged:
+            if final_eval_logged:
                 return
 
-            test_round = training_snapshot.get("test_round")
-            test_loss = training_snapshot.get("test_loss")
-            test_acc = training_snapshot.get("test_acc")
-            if test_round is None or test_loss is None or test_acc is None:
+            eval_round = training_snapshot.get("eval_round", training_snapshot.get("test_round"))
+            eval_loss = training_snapshot.get("eval_loss", training_snapshot.get("test_loss"))
+            eval_loss_std = training_snapshot.get("eval_loss_std", training_snapshot.get("test_loss_std"))
+            eval_acc = training_snapshot.get("eval_acc", training_snapshot.get("test_acc"))
+            eval_acc_std = training_snapshot.get("eval_acc_std", training_snapshot.get("test_acc_std"))
+            if eval_round is None or eval_loss is None or eval_acc is None:
                 return
+
+            label = training_snapshot.get("eval_label", "Evaluation")
+            loss_text = f"{eval_loss:.4f}"
+            if eval_loss_std is not None:
+                loss_text += f" ± {eval_loss_std:.4f}"
+            acc_text = f"{eval_acc:.2%}"
+            if eval_acc_std is not None:
+                acc_text += f" ± {eval_acc_std:.2%}"
+            elapsed = float(training_snapshot.get("elapsed_time", 0.0) or 0.0)
+            h, rem = divmod(int(elapsed), 3600)
+            m, s = divmod(rem, 60)
+            time_text = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+            comp_e = float(training_snapshot.get("computation_energy_j", 0.0) or 0.0)
+            sl_e = float(training_snapshot.get("sidelink_tx_energy_j", 0.0) or 0.0)
+            in_e = float(training_snapshot.get("internet_tx_energy_j", 0.0) or 0.0)
+            total_e = comp_e + sl_e + in_e
+
+            def _fmt_j(x: float) -> str:
+                if x >= 1000.0:
+                    return f"{x/1000.0:.2f} kJ"
+                if x >= 1.0:
+                    return f"{x:.2f} J"
+                return f"{x*1000.0:.2f} mJ"
 
             logger.log(
-                f"DPL Final Test | Round {test_round} | "
-                f"Loss: {test_loss:.4f} | "
-                f"Acc: {test_acc:.2%}",
+                f"DPL Final {label} | Round {eval_round} | "
+                f"Loss: {loss_text} | "
+                f"Acc: {acc_text} | "
+                f"Time: {time_text} | "
+                f"Comp: {_fmt_j(comp_e)} | "
+                f"SL: {_fmt_j(sl_e)} | "
+                f"IN: {_fmt_j(in_e)} | "
+                f"TL: {_fmt_j(total_e)}",
                 "result",
             )
-            final_test_logged = True
+            final_eval_logged = True
+
+        if training_status is not None:
+            log_eval_metrics(
+                training_status.get("eval_round", training_status.get("test_round")),
+                training_status.get("eval_loss", training_status.get("test_loss")),
+                training_status.get("eval_acc", training_status.get("test_acc")),
+                training_status.get("eval_loss_std", training_status.get("test_loss_std")),
+                training_status.get("eval_acc_std", training_status.get("test_acc_std")),
+            )
 
         def finalize_experiment_outputs():
             nonlocal plots_generated, plot_windows_active
@@ -234,7 +301,7 @@ def main():
             saved = save_and_plot_experiment(
                 experiment,
                 out_root=config.OUT_DIR,
-                show=True,
+                show=not args.headless,
                 block=False,
             )
             event_stream.publish(
@@ -263,14 +330,17 @@ def main():
                 logger.log(
                     f"DPL Round {dl_info['tr_round']} | "
                     f"Loss: {dl_info['avg_loss']:.4f} | "
-                    f"Acc: {dl_info['avg_acc']:.2%}",
+                    f"Acc: {dl_info['avg_acc']:.2%} | "
+                    f"SL/IN: {dl_info.get('sidelink_links', 0)}/{dl_info.get('internet_links', 0)}",
                     "result",
                 )
             if dl_info["new_test_data"]:
-                log_test_metrics(
-                    dl_info["test_round"],
-                    dl_info["test_loss"],
-                    dl_info["test_acc"],
+                log_eval_metrics(
+                    dl_info.get("eval_round", dl_info.get("test_round")),
+                    dl_info.get("eval_loss", dl_info.get("test_loss")),
+                    dl_info.get("eval_acc", dl_info.get("test_acc")),
+                    dl_info.get("eval_loss_std", dl_info.get("test_loss_std")),
+                    dl_info.get("eval_acc_std", dl_info.get("test_acc_std")),
                 )
             if dl_info["done"]:
                 finish_dl(
@@ -282,33 +352,18 @@ def main():
                 return True
             return False
 
-        def advance_simulation_step(*, allow_dl_demo: bool = False) -> bool:
-            nonlocal vehicle_states, sim_time, step_count, last_dl_time
+        def advance_simulation_step() -> bool:
+            nonlocal vehicle_states, sim_time, step_count
 
-            vehicle_states = sumo.step()
+            vehicle_states = sumo.step(headless=args.headless)
             sim_time = sumo.get_sim_time()
-            comm.update(vehicle_states, sim_time)
+            # In headless mode skip V2V link computation (O(n²) per step) because
+            # it is only needed for rendering.
+            if not args.headless:
+                comm.update(vehicle_states, sim_time)
             step_count += 1
 
             dl_done = run_dl_step(vehicle_states, sim_time)
-
-            if (
-                allow_dl_demo
-                and not dl_done
-                and dl_payload
-                and sim_time - last_dl_time >= dl_interval
-            ):
-                last_dl_time = sim_time
-                veh_ids = list(vehicle_states.keys())
-                if len(veh_ids) >= 2:
-                    sender = random.choice(veh_ids)
-                    neighbors = comm.get_neighbors(sender)
-                    if neighbors:
-                        receiver = random.choice(neighbors)
-                        weights = dl_payload.dummy_weights()
-                        payload = dl_payload.serialize_weights(weights)
-                        comm.send_message(sender, receiver, "dl_weights", payload, sim_time)
-
             return dl_done
 
         if dl_env is not None and dl_env.is_done():
@@ -325,12 +380,14 @@ def main():
             last_frame_time = now
 
             # --- Simulation stepping ---
-            if not dashboard.paused:
+            if dashboard is None or not dashboard.paused:
                 if speed_mult == 0:
-                    # Unlimited: spend a bounded wall-clock slice advancing SUMO,
-                    # then render the newest state once. This keeps simulation time
-                    # moving even when zoom/pan repaints are expensive.
-                    burst_deadline = time.perf_counter() + unlimited_sim_budget
+                    # Unlimited: burst-advance SUMO for a bounded wall-clock slice,
+                    # then do housekeeping once.  Headless uses a much larger window
+                    # (no render cost) so more steps are batched per housekeeping
+                    # cycle, keeping lock-acquisition rate on DL state low.
+                    budget = 0.1 if args.headless else unlimited_sim_budget
+                    burst_deadline = time.perf_counter() + budget
                     while True:
                         if advance_simulation_step():
                             break
@@ -340,52 +397,82 @@ def main():
                     sim_accumulator += dt * speed_mult
                     # Cap to prevent spiral-of-death after lag spikes
                     sim_accumulator = min(sim_accumulator, config.SIM_STEP_LENGTH * 3)
+                    did_step = False
                     while sim_accumulator >= config.SIM_STEP_LENGTH:
                         sim_accumulator -= config.SIM_STEP_LENGTH
-                        if advance_simulation_step(allow_dl_demo=True):
+                        did_step = True
+                        if advance_simulation_step():
                             break
+                    # Headless: sleep when no step is due to avoid a busy-wait
+                    # loop that hammers DL training locks at millions of Hz.
+                    if args.headless and not did_step:
+                        time.sleep(0.001)
 
                 log_links = comm.get_active_links()
 
             if dl_env is not None:
                 training_status = dl_env.get_progress_snapshot()
-                render_links = dl_env.get_collaboration_links()
-                vehicle_overlays = dl_env.get_vehicle_overlays()
-                if training_status.get("test_round", 0) > last_logged_test_round:
-                    log_test_metrics(
-                        training_status.get("test_round"),
-                        training_status.get("test_loss"),
-                        training_status.get("test_acc"),
+                # Collaboration links and vehicle overlays are purely for map
+                # rendering — skip them in headless mode to avoid the per-step
+                # loop over all vehicles and their connection lists.
+                if args.headless:
+                    render_links = []
+                    vehicle_overlays = None
+                else:
+                    render_links = dl_env.get_collaboration_links()
+                    vehicle_overlays = dl_env.get_vehicle_overlays()
+                if training_status.get("eval_round", training_status.get("test_round", 0)) > last_logged_eval_round:
+                    log_eval_metrics(
+                        training_status.get("eval_round", training_status.get("test_round")),
+                        training_status.get("eval_loss", training_status.get("test_loss")),
+                        training_status.get("eval_acc", training_status.get("test_acc")),
+                        training_status.get("eval_loss_std", training_status.get("test_loss_std")),
+                        training_status.get("eval_acc_std", training_status.get("test_acc_std")),
                     )
-                if training_status["done"] and not training_status["test_running"]:
-                    log_final_test_metrics(training_status)
+                if (
+                    training_status["done"]
+                    and not training_status.get("eval_running", training_status["test_running"])
+                    and not training_status.get("eval_pending", training_status.get("test_pending", False))
+                ):
+                    log_final_eval_metrics(training_status)
                     finalize_experiment_outputs()
+                    if plots_generated and not plot_windows_active:
+                        running = False
             else:
                 render_links = log_links
                 vehicle_overlays = None
-            new_messages += event_stream.drain(max_items=event_drain_batch)
+            if not args.headless:
+                new_messages += event_stream.drain(max_items=event_drain_batch)
 
             # --- Render latest state and process Qt events ---
-            if not dashboard.render(
-                vehicle_states,
-                render_links,
-                new_messages,
-                sim_time,
-                training_status=training_status,
-                vehicle_overlays=vehicle_overlays,
-                log_links=log_links,
-            ):
-                break
-            new_messages = []  # clear after handing to dashboard
+            if not args.headless:
+                if not dashboard.render(
+                        vehicle_states,
+                        render_links,
+                        new_messages,
+                        sim_time,
+                        training_status=training_status,
+                        vehicle_overlays=vehicle_overlays,
+                        log_links=log_links,
+                ):
+                    break
+                if plot_windows_active:
+                    from dl.experiment import pump_plot_events
 
-            if plot_windows_active:
-                from dl.experiment import pump_plot_events
+                    pump_plot_events()
 
-                pump_plot_events()
+                frame_sleep = render_interval - (time.perf_counter() - now)
+                if frame_sleep > 0:
+                    time.sleep(frame_sleep)
+            new_messages = []  # clear after handing to dashboard (or draining)
 
-            frame_sleep = render_interval - (time.perf_counter() - now)
-            if frame_sleep > 0:
-                time.sleep(frame_sleep)
+            # --- Console progress bar (throttled to ~10 Hz) ---
+            if now - last_bar_update >= 0.1:
+                logger.update_progress_bar(
+                    training_status, sim_time,
+                    len(vehicle_states), len(render_links), step_count,
+                )
+                last_bar_update = now
 
             # Periodic console status
             if step_count > 0 and step_count % 100 == 0 and step_count != last_status_step:
@@ -408,6 +495,7 @@ def main():
 
         traceback.print_exc()
     finally:
+        logger.clear_progress_bar()
         logger.log("Cleaning up...", "info")
         if dl_env is not None:
             dl_env.executor.shutdown(wait=False)
