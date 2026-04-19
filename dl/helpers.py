@@ -150,6 +150,12 @@ def _get_model_size_bits() -> float:
     return _MODEL_SIZE_BITS
 
 
+def tx_payload_bits() -> float:
+    """Return the transmitted payload size in bits after compression."""
+    gamma = float(config.COMPRESSION_RATIO)
+    return gamma * _get_model_size_bits()
+
+
 def sl_tx_energy_j(dist_m: float) -> float:
     """Sidelink (PC5) TX energy in Joules for one model-parameter exchange.
 
@@ -160,8 +166,7 @@ def sl_tx_energy_j(dist_m: float) -> float:
     snr_0 = _snr_linear(float(config.SL_SNR_AT_MAX_RANGE_DB))
     snr_d = snr_0 * (v2x_range / max(float(dist_m), 1.0)) ** 2
     C = float(config.SL_BANDWIDTH_HZ) * math.log2(1.0 + snr_d)
-    gamma = float(config.COMPRESSION_RATIO)
-    T = gamma * _get_model_size_bits() / C
+    T = tx_payload_bits() / C
     return float(config.SL_TX_POWER_W) * T
 
 
@@ -172,9 +177,24 @@ def inet_tx_energy_j() -> float:
     """
     snr = _snr_linear(float(config.INET_SNR_DB))
     C = float(config.INET_BANDWIDTH_HZ) * math.log2(1.0 + snr)
-    gamma = float(config.COMPRESSION_RATIO)
-    T = gamma * _get_model_size_bits() / C
+    T = tx_payload_bits() / C
     return 2.0 * float(config.INET_TX_POWER_W) * T
+
+
+def sl_tx_time_s(dist_m: float) -> float:
+    """Sidelink transmission time in seconds for one compressed payload."""
+    v2x_range = float(config.COMM_RANGE)
+    snr_0 = _snr_linear(float(config.SL_SNR_AT_MAX_RANGE_DB))
+    snr_d = snr_0 * (v2x_range / max(float(dist_m), 1.0)) ** 2
+    C = float(config.SL_BANDWIDTH_HZ) * math.log2(1.0 + snr_d)
+    return tx_payload_bits() / C
+
+
+def inet_tx_time_s() -> float:
+    """Internet relay transmission time in seconds for one compressed payload."""
+    snr = _snr_linear(float(config.INET_SNR_DB))
+    C = float(config.INET_BANDWIDTH_HZ) * math.log2(1.0 + snr)
+    return 2.0 * tx_payload_bits() / C
 
 
 def sl_tx_cost_norm(dist_m: float) -> float:

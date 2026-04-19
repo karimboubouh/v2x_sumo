@@ -334,6 +334,31 @@ def main():
                     f"SL/IN: {dl_info.get('sidelink_links', 0)}/{dl_info.get('internet_links', 0)}",
                     "result",
                 )
+                ts = dl_info.get("training_status") or {}
+                vehicle_count = max(int(ts.get("vehicle_count", len(current_vehicle_states))), 1)
+                total_links = int(dl_info.get("total_links", 0))
+                sl_links = int(dl_info.get("sidelink_links", 0))
+                in_links = int(dl_info.get("internet_links", 0))
+                avg_reward = ts.get("avg_reward")
+                total_tx_energy_j = float(ts.get("total_tx_energy_j", 0.0))
+                budget_j = getattr(getattr(dl_env, "algo", None), "round_energy_budget_j", None)
+                info_parts = [
+                    f"Links/veh: {total_links / vehicle_count:.2f}",
+                    f"SL/veh: {sl_links / vehicle_count:.2f}",
+                    f"IN/veh: {in_links / vehicle_count:.2f}",
+                    f"TX energy: {total_tx_energy_j:.2f} J",
+                ]
+                if avg_reward is not None:
+                    info_parts.append(f"Avg reward: {float(avg_reward):.4f}")
+                if budget_j is not None:
+                    info_parts.append(f"Round energy budget: {float(budget_j):.3f} J")
+                info_parts.append(f"Batches/round: {config.BATCHES_PER_ROUND}")
+                info_parts.append(f"Eval batches: {config.EVAL_BATCHES_PER_ROUND}")
+                logger.log(" | ".join(info_parts), "info")
+                consume_debug = getattr(getattr(dl_env, "algo", None), "consume_debug_logs", None)
+                if callable(consume_debug):
+                    for debug_line in consume_debug():
+                        logger.log(debug_line, "debug")
             if dl_info["new_test_data"]:
                 log_eval_metrics(
                     dl_info.get("eval_round", dl_info.get("test_round")),

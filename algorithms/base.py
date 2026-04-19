@@ -33,6 +33,10 @@ class DLAlgorithm(ABC):
     def setup(self, vehicles: list) -> None:
         """One-time initialization called after all Vehicle objects are created."""
 
+    def build_candidates(self, v, env) -> list:
+        """Return the candidate neighbor list for vehicle ``v``."""
+        return env.neighbors_of(v)
+
     @abstractmethod
     def select_neighbors(self, v, candidates: list, env) -> tuple:
         """

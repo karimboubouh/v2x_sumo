@@ -141,16 +141,16 @@ VALIDATION_FRACTION = 0.1   # fraction of each client's shard held out for valid
 # ── Training ─────────────────────────────────────────────
 LOCAL_LR = 1e-3            # Adam learning rate
 BATCH_SIZE = 32
-BATCHES_PER_ROUND = 4      # mini-batches per DPL training round (N×BATCH_SIZE samples/round); 0 or None = full epoch
+BATCHES_PER_ROUND = 15      # mini-batches per DPL training round (N×BATCH_SIZE samples/round); 0 or None = full epoch
 COMPRESSION_RATIO = 1.0    # γ — fraction of model params transmitted (1.0 = full model)
 
-# ── Termination & evaluation ─────────────────────────────
-MAX_TR_ROUNDS = 200
-TARGET_ACCURACY = 1.01       # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
+# ── Evaluation & termination ─────────────────────────────
 EVAL_ROUNDS = 10              # evaluate global metrics every N shared rounds
 EVAL_SPLIT = "test"          # default evaluation split if an algorithm does not override it
-EVAL_BATCHES_PER_ROUND = 5   # None/0 = full eval loader; positive int = cap eval to first N batches per loader
+EVAL_BATCHES_PER_ROUND = 15   # None/0 = full eval loader; positive int = cap eval to first N batches per loader
 ASYNC_EVAL = True            # True = background eval worker; False = run eval inline during the DPL step
+TARGET_ACCURACY = 1.01       # accuracy threshold for early stopping; set ≥ 1.0 to use rounds mode instead
+MAX_TR_ROUNDS = 200
 
 # ── Byzantine robustness ─────────────────────────────────
 # Fraction of vehicles that behave as Byzantine adversaries.

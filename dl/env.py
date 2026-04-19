@@ -337,6 +337,27 @@ class DLEnvironment:
 
         return sidelink + internet
 
+    def sidelink_neighbors_of(self, v: Vehicle) -> list:
+        """Return only physical sidelink neighbors for the active algorithm."""
+        v2x_range = float(config.COMM_RANGE)
+        max_sl = int(getattr(self.algo, "max_sidelink_neighbors", 0))
+        if max_sl <= 0:
+            return []
+
+        close_neighbors = []
+        for other in self.vehicles:
+            if other.id == v.id:
+                continue
+            dist = float(np.linalg.norm(v.pos - other.pos))
+            if dist <= v2x_range:
+                close_neighbors.append((other, dist))
+
+        close_neighbors.sort(key=lambda x: x[1])
+        return [
+            (other, dist, LINK_SIDELINK)
+            for other, dist in close_neighbors[:max_sl]
+        ]
+
     def _link_quality(self, v: Vehicle, other: Vehicle) -> float:
         """
         Quality score: cosine_similarity(first_layer_params) * accuracy_other.
@@ -350,12 +371,13 @@ class DLEnvironment:
         return cos_sim * float(np.clip(other.current_reward_acc, 0.0, 1.0))
 
     def neighbor_features(self, v: Vehicle, nbrs: list) -> np.ndarray:
-        """Build the (N, NBR_DIM=7) feature matrix from V2X beacon data."""
+        """Build the (N, NBR_DIM=8) feature matrix from V2X beacon data."""
         if not nbrs:
             return np.zeros((0, NBR_DIM), dtype=np.float32)
 
         v2x_range = float(config.COMM_RANGE)
         inet_range = float(config.INTERNET_RANGE)
+        retained_score_fn = getattr(self.algo, "get_retained_score", None)
         feats = []
         p_v = v.get_param_vec()
         g_v = v.get_grad_vec()
@@ -383,8 +405,20 @@ class DLEnvironment:
             dh = abs(v.heading - nbr.heading)
             rel_spd = float(np.clip(min(dh, 2 * np.pi - dh) / np.pi, 0.0, 1.0))
             nbr_acc = float(np.clip(nbr.current_reward_acc, 0.0, 1.0))
+            retained_score = 0.0
+            if callable(retained_score_fn):
+                retained_score = float(np.clip(retained_score_fn(v, nbr.id), 0.0, 1.0))
 
-            feats.append([cos_sim, grad_align, nd, tx_cost, rel_spd, nbr_acc, link_type])
+            feats.append([
+                cos_sim,
+                grad_align,
+                nd,
+                tx_cost,
+                rel_spd,
+                nbr_acc,
+                link_type,
+                retained_score,
+            ])
 
         return np.array(feats, dtype=np.float32)
 
@@ -983,7 +1017,7 @@ class DLEnvironment:
         Execute one DPL step.
 
         1. Update vehicle positions from SUMO vehicle states.
-        2. Discover neighbors (sidelink + internet) for dynamic algorithms.
+        2. Let the active algorithm build its candidate neighbor set.
         3. Run algorithm neighbor selection and model aggregation.
         4. Refresh metrics and evaluate stop conditions.
         5. Submit background training for eligible idle vehicles.
@@ -1014,7 +1048,9 @@ class DLEnvironment:
             prev_connections = set(v.connections)
             prev_link_types = dict(v.link_types)
             candidates = (
-                self.neighbors_of(v) if self.algo.needs_dynamic_neighbors else []
+                self.algo.build_candidates(v, self)
+                if self.algo.needs_dynamic_neighbors
+                else []
             )
             v.connections, v.alphas, v.link_types, t = \
                 self.algo.select_neighbors(v, candidates, self)

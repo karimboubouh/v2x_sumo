@@ -7,7 +7,7 @@ encoder and the switch to uniform aggregation weights.
 
 # Feature dimensions consumed by the IPPO encoder.
 OWN_DIM: int = 6
-NBR_DIM: int = 7
+NBR_DIM: int = 8
 
 # Personalized aggregation: fraction of the local model retained each round.
 SELF_WEIGHT: float = 0.5

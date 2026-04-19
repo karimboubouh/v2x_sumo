@@ -27,7 +27,7 @@ The selector and mixer are now decoupled:
 
 **Own state** — `v.own_features()` → shape `(6,)`
 
-**Neighbor features** — `env.neighbor_features(v, candidates)` → shape `(N, 7)`
+**Neighbor features** — `env.neighbor_features(v, candidates)` → shape `(N, 8)`
 
 | index | meaning |
 |-------|---------|
@@ -38,8 +38,9 @@ The selector and mixer are now decoupled:
 | 4 | relative heading divergence |
 | 5 | neighbor accuracy |
 | 6 | link type (sidelink=0, internet=1) |
+| 7 | retained-neighbor score |
 
-The new signal is **gradient alignment**. The cost feature now uses the same energy model as the simulator's transmission accounting.
+The new signals are **gradient alignment** and the **retained-neighbor score** used by SL-first DANTE when a previously good sidelink peer is re-injected as an internet candidate.
 
 ---
 
@@ -82,19 +83,30 @@ The mixer produces a separate soft ranking:
 mixer_prob = softmax(mixer_logits / tau)
 ```
 
+The mixer is trained to approximate statistical relevance, not transmission cost. Cost is handled later by the admissibility layer.
+
 ---
 
 ## Step 3 — Keep only useful neighbors
 
 Vehicle $i$ only keeps neighbors with `action_j = 1`.
 
-Each selected neighbor gets a utility score:
+Each selected neighbor gets a predicted benefit score from the selector confidence, mixer relevance, and alignment features. Cost is tracked separately.
 
 ```
-utility_j = selector_prob_j * mixer_prob_j / (1 + normalized_energy_j)
+benefit_j ≈ selector_prob_j * relevance_j
 ```
 
-If too many neighbors were selected, DANTE keeps the top `MAX_COLLAB_NEIGHBORS` by this utility score. This is where the selector starts preferring only the neighbors that are both useful and cheap enough.
+From the PPO-accepted neighbors, DANTE then builds the final collaboration set under the paper-style admissibility constraints:
+
+```
+|C_i| <= K_i
+sum_j energy_j <= round_energy_budget
+sum_j bandwidth_j <= round_bandwidth_budget     # optional
+max_j latency_j <= round_latency_budget         # optional
+```
+
+Among all feasible subsets, DANTE keeps the one with the largest total predicted benefit. This means a more expensive but highly relevant neighbor can still be preferred over several cheap but weak candidates, as long as the resulting set stays within budget.
 
 Final aggregation weights are then recomputed from the mixer probabilities over the kept subset only.
 
@@ -177,7 +189,7 @@ Round t:
            ↓
   [mixer head scores kept neighbors]
            ↓
-  [cost-aware top-k pruning]
+  [budget-feasible subset selection]
            ↓
   [local training + gradient capture]
            ↓

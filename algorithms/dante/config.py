@@ -2,7 +2,7 @@
 
 # Feature dimensions consumed by the GAT encoder.
 OWN_DIM: int = 6
-NBR_DIM: int = 7
+NBR_DIM: int = 8
 
 # Personalized aggregation weight retained from the local model.
 SELF_WEIGHT: float = 0.5
@@ -27,6 +27,9 @@ SELECTOR_INIT_BIAS: float = -1.0
 REWARD_ACC_WEIGHT: float = 2.0
 COST_LAMBDA: float = 2.0
 TYPICAL_ROUND_ENERGY_J: float = 0.02
+ROUND_ENERGY_BUDGET_J: float = 0.04
+ROUND_BANDWIDTH_BUDGET_BITS: float | None = None
+ROUND_LATENCY_BUDGET_S: float | None = None
 
 # PPO optimiser settings.
 PPO_LR: float = 3e-4

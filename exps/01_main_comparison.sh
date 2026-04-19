@@ -8,16 +8,16 @@ COMMON_ARGS=(
   --headless
   --scenario khalifa_university
   --num-vehicles 50
-  --rounds 200
+  --rounds 150
   --target_acc 1.01
   --dl-dataset CIFAR10
   --dl-model CNN
-  --verbose result
+  --verbose debug
 )
 
 declare -a EXPERIMENTS=()
 
-for algo in DPFL DANTE IPPO pFedGraph; do
+for algo in DANTE DPFL; do
 #for algo in DANTE DPFL IPPO pFedGraph FedAvg D-PSGD; do
   run_cli_experiment "$algo main comparison" "${COMMON_ARGS[@]}" --dl-algorithm "$algo"
   EXPERIMENTS+=("$LAST_EXPERIMENT_DIR")
