@@ -21,13 +21,15 @@ import config
 import logger
 from algorithms import build_algorithm, LINK_SIDELINK, LINK_INTERNET
 from algorithms import get_algorithm_config
-from algorithms.dante.config import NBR_DIM, TYPICAL_ROUND_ENERGY_J
 from dl.helpers import (
     eval_model_on_loader,
     eval_vehicles,
     eval_weight_snapshots,
     inet_tx_energy_j,
+    inet_tx_time_s,
     sl_tx_energy_j,
+    sl_tx_time_s,
+    tx_payload_bits,
 )
 from dl.vehicle import Vehicle
 
@@ -371,27 +373,37 @@ class DLEnvironment:
         return cos_sim * float(np.clip(other.current_reward_acc, 0.0, 1.0))
 
     def neighbor_features(self, v: Vehicle, nbrs: list) -> np.ndarray:
-        """Build the (N, NBR_DIM=8) feature matrix from V2X beacon data."""
+        """Build the algorithm-specific neighbor feature matrix from V2X beacons."""
+        feature_dim = int(getattr(self.algo, "neighbor_feature_dim", 8))
         if not nbrs:
-            return np.zeros((0, NBR_DIM), dtype=np.float32)
+            return np.zeros((0, feature_dim), dtype=np.float32)
 
         v2x_range = float(config.COMM_RANGE)
         inet_range = float(config.INTERNET_RANGE)
-        retained_score_fn = getattr(self.algo, "get_retained_score", None)
+        trust_score_fn = getattr(self.algo, "get_trust_score", None)
+        retention_value_fn = getattr(self.algo, "get_retention_value", None)
+        energy_cost_fn = getattr(self.algo, "feature_energy_cost", None)
+        bandwidth_cost_fn = getattr(self.algo, "feature_bandwidth_cost", None)
+        latency_cost_fn = getattr(self.algo, "feature_latency_cost", None)
         feats = []
-        p_v = v.get_param_vec()
         g_v = v.get_grad_vec()
-        norm_v = np.linalg.norm(p_v)
         grad_norm_v = np.linalg.norm(g_v)
-        typical_energy = max(float(TYPICAL_ROUND_ENERGY_J), 1e-8)
+        payload_bits = max(float(tx_payload_bits()), 1.0)
+        max_collab = max(int(getattr(self.algo, "max_collab_neighbors", 1)), 1)
+        default_energy_ref = max(
+            float(inet_tx_energy_j()),
+            float(sl_tx_energy_j(v2x_range)),
+            1e-8,
+        )
+        default_bandwidth_ref = payload_bits * max_collab
+        default_latency_ref = max(
+            float(inet_tx_time_s()),
+            float(sl_tx_time_s(v2x_range)),
+            1e-8,
+        )
 
         for nbr, dist, link_type in nbrs:
-            p_n = nbr.get_param_vec()
             g_n = nbr.get_grad_vec()
-            cos_sim = float(np.clip(
-                np.dot(p_v, p_n) / (norm_v * np.linalg.norm(p_n) + 1e-8),
-                -1.0, 1.0,
-            ))
             grad_align = float(np.clip(
                 np.dot(g_v, g_n) / (grad_norm_v * np.linalg.norm(g_n) + 1e-8),
                 -1.0, 1.0,
@@ -399,25 +411,48 @@ class DLEnvironment:
 
             ref_range = v2x_range if link_type == LINK_SIDELINK else inet_range
             nd = float(np.clip(dist / max(ref_range, 1.0), 0.0, 1.0))
-            tx_energy = float(sl_tx_energy_j(dist)) if link_type == LINK_SIDELINK else float(inet_tx_energy_j())
-            tx_cost = float(np.clip(tx_energy / typical_energy, 0.0, 4.0))
+            tx_energy = (
+                float(sl_tx_energy_j(dist))
+                if link_type == LINK_SIDELINK
+                else float(inet_tx_energy_j())
+            )
+            tx_latency = (
+                float(sl_tx_time_s(dist))
+                if link_type == LINK_SIDELINK
+                else float(inet_tx_time_s())
+            )
+            if callable(energy_cost_fn):
+                energy_cost = float(energy_cost_fn(v, link_type, dist))
+            else:
+                energy_cost = float(np.clip(tx_energy / default_energy_ref, 0.0, 4.0))
+            if callable(bandwidth_cost_fn):
+                bandwidth_cost = float(bandwidth_cost_fn(v, link_type, dist))
+            else:
+                bandwidth_cost = float(np.clip(payload_bits / default_bandwidth_ref, 0.0, 4.0))
+            if callable(latency_cost_fn):
+                latency_cost = float(latency_cost_fn(v, link_type, dist))
+            else:
+                latency_cost = float(np.clip(tx_latency / default_latency_ref, 0.0, 4.0))
 
             dh = abs(v.heading - nbr.heading)
-            rel_spd = float(np.clip(min(dh, 2 * np.pi - dh) / np.pi, 0.0, 1.0))
-            nbr_acc = float(np.clip(nbr.current_reward_acc, 0.0, 1.0))
-            retained_score = 0.0
-            if callable(retained_score_fn):
-                retained_score = float(np.clip(retained_score_fn(v, nbr.id), 0.0, 1.0))
+            rel_mobility = float(np.clip(min(dh, 2 * np.pi - dh) / np.pi, 0.0, 1.0))
+            trust = 1.0
+            if callable(trust_score_fn):
+                trust = float(np.clip(trust_score_fn(v, nbr.id), 0.0, 1.0))
+            retention_value = 0.0
+            if callable(retention_value_fn):
+                retention_value = float(np.clip(retention_value_fn(v, nbr.id), 0.0, 1.0))
 
             feats.append([
-                cos_sim,
                 grad_align,
                 nd,
-                tx_cost,
-                rel_spd,
-                nbr_acc,
+                energy_cost,
+                bandwidth_cost,
+                latency_cost,
+                rel_mobility,
                 link_type,
-                retained_score,
+                trust,
+                retention_value,
             ])
 
         return np.array(feats, dtype=np.float32)
@@ -462,6 +497,8 @@ class DLEnvironment:
 
         for vehicle in self.vehicles:
             for nid in vehicle.connections:
+                if float(vehicle.alphas.get(nid, 0.0)) <= 0.0:
+                    continue
                 link_type = vehicle.link_types.get(nid)
                 if link_type == LINK_SIDELINK:
                     sidelink += 1
@@ -695,6 +732,7 @@ class DLEnvironment:
             if current_eval_loss is not None or current_eval_acc is not None
             else None
         )
+        target_metrics = self._target_reach_summary()
 
         return {
             "enabled": True,
@@ -742,6 +780,7 @@ class DLEnvironment:
             "done_vehicles": done_vehicles,
             "vehicle_count": len(self.vehicles),
             "target_acc": float(config.TARGET_ACCURACY),
+            **target_metrics,
             "avg_reward": self._latest_avg_reward,
             "done": stop_reason is not None,
             "stop_reason": stop_reason,
@@ -752,6 +791,10 @@ class DLEnvironment:
     def export_experiment(self, metadata: dict | None = None) -> dict:
         """Build a serializable experiment bundle for saving and replotting."""
         snapshot = self.get_progress_snapshot()
+        algo_diagnostics = {}
+        export_diag = getattr(self.algo, "export_diagnostics", None)
+        if callable(export_diag):
+            algo_diagnostics = dict(export_diag())
         experiment_cfg = {
             "ALGORITHM": config.ALGORITHM,
             "MAX_TR_ROUNDS": config.MAX_TR_ROUNDS,
@@ -809,9 +852,13 @@ class DLEnvironment:
                 "final_test_loss_std": snapshot["test_loss_std"],
                 "final_test_acc": snapshot["test_acc"],
                 "final_test_acc_std": snapshot["test_acc_std"],
+                "rounds_to_target": snapshot["rounds_to_target"],
+                "wall_time_to_target_s": snapshot["wall_time_to_target_s"],
+                "energy_to_target_j": snapshot["energy_to_target_j"],
                 "elapsed_time": snapshot["elapsed_time"],
                 "stop_reason": snapshot["stop_reason"],
             },
+            "diagnostics": algo_diagnostics,
             "energy_totals": self._collect_energy_totals(),
             "vehicles": [
                 {
@@ -965,6 +1012,45 @@ class DLEnvironment:
             "time": max(time.perf_counter() - self._wall_started, 0.0),
             "reward": avg_reward,
         })
+
+    def _target_reach_summary(self) -> dict:
+        """Return rounds/time/energy-to-target metrics from evaluation history."""
+        target_acc = float(config.TARGET_ACCURACY)
+        summary = {
+            "rounds_to_target": None,
+            "wall_time_to_target_s": None,
+            "energy_to_target_j": None,
+        }
+        if target_acc > 1.0:
+            return summary
+
+        target_eval = next(
+            (
+                point
+                for point in sorted(self.eval_history, key=lambda p: p["round"])
+                if point["acc"] >= target_acc
+            ),
+            None,
+        )
+        if target_eval is None:
+            return summary
+
+        summary["rounds_to_target"] = int(target_eval["round"])
+        summary["wall_time_to_target_s"] = float(target_eval["time"])
+        target_train = next(
+            (
+                point
+                for point in sorted(self.train_history, key=lambda p: p["round"])
+                if point["round"] >= target_eval["round"]
+            ),
+            None,
+        )
+        if target_train is not None:
+            summary["energy_to_target_j"] = float(
+                target_train.get("computation_energy_j", 0.0)
+                + target_train.get("total_tx_energy_j", 0.0)
+            )
+        return summary
 
     def get_vehicle_overlays(self) -> dict:
         """Return per-vehicle visualization metadata for the dashboard map."""

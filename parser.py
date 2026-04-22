@@ -48,6 +48,13 @@ def parse_args():
         help="Minimum log level to display: debug|info|success|result|warning|error (default: %(default)s)",
     )
     parser.add_argument(
+        "--save-logs",
+        action="store_true",
+        default=config.SAVE_LOGS,
+        dest="save_logs",
+        help="Save plain logger output into out/<experiment_id>/run.log for DPL runs",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         default=config.HEADLESS,

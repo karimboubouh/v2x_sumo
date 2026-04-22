@@ -6,11 +6,13 @@ encoder and the switch to uniform aggregation weights.
 """
 
 # Feature dimensions consumed by the IPPO encoder.
-OWN_DIM: int = 6
-NBR_DIM: int = 8
+OWN_DIM: int = 7
+NBR_DIM: int = 9
 
 # Personalized aggregation: fraction of the local model retained each round.
-SELF_WEIGHT: float = 0.5
+# ``None`` disables fixed self-retention and gives the local model one
+# peer-sized share in the final aggregation.
+SELF_WEIGHT: float | None = 0.5
 
 # Candidate and collaboration caps.
 MAX_SIDELINK_NEIGHBORS: int = 10

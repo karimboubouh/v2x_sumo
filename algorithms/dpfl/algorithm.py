@@ -60,20 +60,25 @@ class DPFLAlgorithm(DLAlgorithm):
         available = {c.id: lt for c, _, lt in candidates}
         connections = {nid for nid in v._dpfl_collab if nid in available}
         link_types = {nid: available[nid] for nid in connections}
-        w = 1.0 / (len(connections) + 1) if connections else 1.0
-        alphas = {nid: w for nid in connections}
+        if connections:
+            self_w = self._resolve_self_weight(len(connections))
+            nbr_w = (1.0 - self_w) / len(connections)
+            alphas = {nid: nbr_w for nid in connections}
+        else:
+            alphas = {}
         return connections, alphas, link_types, None
 
     def aggregate(self, v, vehicles: list) -> None:
         """Personalized aggregation over the GGC collaboration set.
-        Vehicle retains SELF_WEIGHT of its own model; the remaining
-        (1 - SELF_WEIGHT) is split equally across selected neighbors."""
+        If SELF_WEIGHT is None, the local model is treated like one more peer.
+        If SELF_WEIGHT is numeric, that fraction is retained locally and the
+        remaining mass is split equally across selected neighbors."""
         accepted = [vehicles[nid] for nid in v.connections if nid < len(vehicles)]
         if not accepted:
             return
 
         nbr_sds = [nbr.get_shared_weights() for nbr in accepted]
-        self_w = float(SELF_WEIGHT)
+        self_w = self._resolve_self_weight(len(nbr_sds))
         nbr_w = (1.0 - self_w) / len(nbr_sds)
 
         with v._lock:
@@ -141,10 +146,25 @@ class DPFLAlgorithm(DLAlgorithm):
             if len(X) >= budget:
                 break
 
-        n = len(X) + 1
         v._dpfl_collab = set(X.keys())
-        v._dpfl_alphas = {nid: 1.0 / n for nid in X}
+        if X:
+            self_w = self._resolve_self_weight(len(X))
+            nbr_w = (1.0 - self_w) / len(X)
+            v._dpfl_alphas = {nid: nbr_w for nid in X}
+        else:
+            v._dpfl_alphas = {}
         v._dpfl_last_update = v.tr_rounds
+
+    def _resolve_self_weight(self, n_neighbors: int) -> float:
+        """Resolve DPFL self-weight with the shared personalized semantics."""
+        if SELF_WEIGHT is None:
+            return 1.0 / (n_neighbors + 1.0)
+        self_w = float(SELF_WEIGHT)
+        if not 0.0 <= self_w <= 1.0:
+            raise ValueError(
+                f"DPFL SELF_WEIGHT must be None or in [0, 1], got {SELF_WEIGHT!r}"
+            )
+        return self_w
 
     def _eval_reward(self, v, peers: list,
                      val_images: torch.Tensor,

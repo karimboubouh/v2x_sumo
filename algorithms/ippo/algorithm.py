@@ -294,6 +294,8 @@ class IPPOAlgorithm(DLAlgorithm):
     name = "IPPO"
     needs_dynamic_neighbors = True
     evaluation_mode = "personalized"
+    own_feature_dim = OWN_DIM
+    neighbor_feature_dim = NBR_DIM
 
     def __init__(self) -> None:
         self._agents: dict[int, _VehiclePPOAgent] = {}
@@ -371,6 +373,18 @@ class IPPOAlgorithm(DLAlgorithm):
 
     # ── Aggregation — uniform FedAvg ──────────────────────────────────────────
 
+    def _resolve_self_weight(self, n_neighbors: int) -> float:
+        if n_neighbors <= 0:
+            return 1.0
+        if SELF_WEIGHT is None:
+            return 1.0 / (n_neighbors + 1.0)
+        self_w = float(SELF_WEIGHT)
+        if not 0.0 <= self_w <= 1.0:
+            raise ValueError(
+                f"IPPO SELF_WEIGHT must be None or in [0, 1], got {SELF_WEIGHT!r}"
+            )
+        return self_w
+
     def aggregate(self, v, vehicles: list) -> None:
         if not v.training_done.is_set():
             return
@@ -380,7 +394,7 @@ class IPPOAlgorithm(DLAlgorithm):
             return
 
         nbr_w  = 1.0 / len(accepted)          # uniform weight per neighbor
-        self_w = float(SELF_WEIGHT)
+        self_w = self._resolve_self_weight(len(accepted))
         nbr_sds = [nbr.get_shared_weights() for nbr in accepted]
 
         with v._lock:

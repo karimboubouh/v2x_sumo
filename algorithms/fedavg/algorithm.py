@@ -42,7 +42,12 @@ class FedAvgAlgorithm(DLAlgorithm):
     def select_neighbors(self, v, candidates: list, env) -> tuple:
         """Return the fixed static neighbor set via LINK_INTERNET."""
         connections = set(v.static_neighbors)
-        alphas = {nid: 1.0 for nid in v.static_neighbors}
+        if connections:
+            self_w = self._resolve_self_weight(len(connections))
+            nbr_w = (1.0 - self_w) / len(connections)
+            alphas = {nid: nbr_w for nid in connections}
+        else:
+            alphas = {}
         link_types = {nid: LINK_INTERNET for nid in v.static_neighbors}
         return connections, alphas, link_types, None
 
@@ -63,16 +68,8 @@ class FedAvgAlgorithm(DLAlgorithm):
         if not nbr_sds:
             return
 
-        if SELF_WEIGHT is None:
-            self_w = 1.0 / (len(nbr_sds) + 1.0)
-            nbr_w = self_w
-        else:
-            self_w = float(SELF_WEIGHT)
-            if not 0.0 <= self_w <= 1.0:
-                raise ValueError(
-                    f"FedAvg SELF_WEIGHT must be None or in [0, 1], got {SELF_WEIGHT!r}"
-                )
-            nbr_w = (1.0 - self_w) / len(nbr_sds)
+        self_w = self._resolve_self_weight(len(nbr_sds))
+        nbr_w = (1.0 - self_w) / len(nbr_sds)
 
         with v._lock:
             own_sd = v.model.state_dict()
@@ -85,3 +82,14 @@ class FedAvgAlgorithm(DLAlgorithm):
                     agg = agg + nbr_w * sd[key].float()
                 new_sd[key] = agg
             v.model.load_state_dict(new_sd)
+
+    def _resolve_self_weight(self, n_neighbors: int) -> float:
+        """Resolve FedAvg self-weight with the shared personalized semantics."""
+        if SELF_WEIGHT is None:
+            return 1.0 / (n_neighbors + 1.0)
+        self_w = float(SELF_WEIGHT)
+        if not 0.0 <= self_w <= 1.0:
+            raise ValueError(
+                f"FedAvg SELF_WEIGHT must be None or in [0, 1], got {SELF_WEIGHT!r}"
+            )
+        return self_w

@@ -181,6 +181,59 @@ def load_experiment(path: str) -> dict:
         return pickle.load(fh)
 
 
+def prepare_experiment_dir(metadata: dict, out_root: str | None = None) -> dict:
+    """Reserve the final experiment folder before saving artifacts."""
+    root = _ensure_out_root(out_root)
+    experiment_id = _experiment_id({"metadata": dict(metadata or {})})
+    experiment_dir = os.path.join(root, experiment_id)
+    os.makedirs(experiment_dir, exist_ok=True)
+    return {
+        "experiment_id": experiment_id,
+        "experiment_dir": experiment_dir,
+        "log_path": os.path.join(experiment_dir, "run.log"),
+    }
+
+
+def _normalize_algorithm_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _max_active_links(experiment: dict) -> int:
+    return max(
+        (int(point.get("total_links", 0) or 0) for point in experiment.get("train_history", [])),
+        default=0,
+    )
+
+
+def _declares_zero_collaboration(experiment: dict) -> bool:
+    cfg = dict(experiment.get("config", {}))
+    caps = [
+        cfg.get("MAX_SIDELINK_NEIGHBORS"),
+        cfg.get("MAX_INTERNET_NEIGHBORS"),
+        cfg.get("MAX_COLLAB_NEIGHBORS"),
+    ]
+    if all(cap is not None and int(cap) <= 0 for cap in caps):
+        return True
+    metadata = dict(experiment.get("metadata", {}))
+    labels = {
+        _normalize_algorithm_label(metadata.get("algorithm", "")),
+        _normalize_algorithm_label(cfg.get("ALGORITHM", "")),
+    }
+    return "localonly" in labels
+
+
+def _assert_collaboration_integrity(experiment: dict) -> None:
+    max_links = _max_active_links(experiment)
+    if _declares_zero_collaboration(experiment) and max_links > 0:
+        metadata = dict(experiment.get("metadata", {}))
+        cfg = dict(experiment.get("config", {}))
+        label = metadata.get("algorithm") or cfg.get("ALGORITHM") or "experiment"
+        raise ValueError(
+            f"{label} declares zero collaboration capacity but recorded "
+            f"{max_links} active links. Refusing to save an invalid baseline artifact."
+        )
+
+
 def save_experiment(experiment: dict, out_root: str | None = None) -> dict:
     """Persist one experiment pickle into its own folder under out_root."""
     root = _ensure_out_root(out_root)
@@ -193,17 +246,22 @@ def save_experiment(experiment: dict, out_root: str | None = None) -> dict:
     metadata.setdefault("experiment_id", experiment_id)
     metadata.setdefault("saved_at", datetime.now(timezone.utc).isoformat())
     experiment["metadata"] = metadata
+    _assert_collaboration_integrity(experiment)
 
     pickle_path = os.path.join(experiment_dir, "experiment.pkl")
     with open(pickle_path, "wb") as fh:
         pickle.dump(experiment, fh)
 
-    return {
+    saved = {
         "experiment": experiment,
         "experiment_id": experiment_id,
         "experiment_dir": experiment_dir,
         "pickle_path": pickle_path,
     }
+    log_path = os.path.join(experiment_dir, "run.log")
+    if os.path.isfile(log_path):
+        saved["log_path"] = log_path
+    return saved
 
 
 def _save_figure(fig, path: str) -> str:
@@ -435,9 +493,13 @@ def plot_saved_experiment(
     if out_root is not None:
         output_dir = save_experiment(experiment, out_root=out_root)["experiment_dir"]
     plotted = plot_experiment(experiment, output_dir, show=show, block=block)
-    return {
+    result = {
         "experiment": experiment,
         "experiment_dir": output_dir,
         "pickle_path": os.path.abspath(pickle_path),
         **plotted,
     }
+    log_path = os.path.join(output_dir, "run.log")
+    if os.path.isfile(log_path):
+        result["log_path"] = log_path
+    return result

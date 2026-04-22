@@ -24,6 +24,7 @@ def main():
     if not args.headless:
         from dashboard.app import DashboardApp
     config.COMM_RANGE = args.comm_range
+    config.SAVE_LOGS = bool(args.save_logs)
 
     if args.plot_experiment:
         from dl.experiment import plot_saved_experiment
@@ -39,6 +40,33 @@ def main():
         return
 
     scenario_info = config.SCENARIOS[args.scenario]
+    experiment_paths = None
+
+    def build_experiment_metadata(sim_time_value: float | None = None) -> dict:
+        metadata = {
+            "scenario": args.scenario,
+            "scenario_name": scenario_info["name"],
+            "algorithm": args.dl_algorithm,
+            "dataset": args.dl_dataset,
+            "model": args.dl_model,
+            "num_vehicles": args.num_vehicles,
+            "args": vars(args),
+        }
+        if sim_time_value is not None:
+            metadata["sim_time"] = sim_time_value
+        if experiment_paths is not None:
+            metadata["experiment_id"] = experiment_paths["experiment_id"]
+        return metadata
+
+    if args.save_logs and args.dl and not args.plot_experiment:
+        from dl.experiment import prepare_experiment_dir
+
+        experiment_paths = prepare_experiment_dir(
+            build_experiment_metadata(),
+            out_root=config.OUT_DIR,
+        )
+        logger.start_file_logging(experiment_paths["log_path"])
+
     logger.log("Starting SUMO V2V Dashboard", "info")
     logger.log(f"Scenario: {scenario_info['name']} ({args.scenario})")
     logger.log(f"Vehicles: {args.num_vehicles}")
@@ -288,16 +316,7 @@ def main():
 
             from dl.experiment import save_and_plot_experiment
 
-            experiment = dl_env.export_experiment({
-                "scenario": args.scenario,
-                "scenario_name": scenario_info["name"],
-                "algorithm": config.ALGORITHM,
-                "dataset": config.DATASET,
-                "model": config.MODEL_ARCH,
-                "num_vehicles": args.num_vehicles,
-                "sim_time": sim_time,
-                "args": vars(args),
-            })
+            experiment = dl_env.export_experiment(build_experiment_metadata(sim_time))
             saved = save_and_plot_experiment(
                 experiment,
                 out_root=config.OUT_DIR,
@@ -311,6 +330,8 @@ def main():
             )
             logger.log(f"DPL outputs saved to {saved['experiment_dir']}", "success")
             logger.log(f"Experiment pickle: {saved['pickle_path']}")
+            if saved.get("log_path"):
+                logger.log(f"Run log: {saved['log_path']}")
             if saved.get("shown"):
                 logger.log(f"Plot window backend: {saved['backend']}")
                 plot_windows_active = True
@@ -530,6 +551,7 @@ def main():
             dashboard.cleanup()
         sumo.stop()
         logger.log("Done.", "success")
+        logger.stop_file_logging()
 
 
 if __name__ == "__main__":

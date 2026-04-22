@@ -1,203 +1,150 @@
-# DANTE — Execution walkthrough from vehicle $i$'s perspective
+# DANTE - Execution walkthrough from vehicle i's perspective
 
----
+## 0. Initialization
 
-## 0. Initialization (`setup`)
+Each vehicle gets an independent PPO agent with:
 
-Every vehicle gets its own independent PPO agent with one shared encoder and three heads:
-
-```
+```text
 _GATActorCritic
-├── own_encoder   (MLP: 6 → 64 → 64)    encodes v_i's own state
-├── gat           (_GATLayer)            builds shared neighborhood context
-├── selector      (MLP: 192 → 64 → 1)   PPO Bernoulli keep/drop logit
-├── mixer         (MLP: 192 → 64 → 1)   aggregation score per neighbor
-└── critic        (MLP: 128 → 64 → 1)   state value V(s)
+|- _GATLayer   (single-head attention over ego + candidate neighbors)
+|- selector    (Bernoulli actor over candidate edges)
+`- critic      (state-value head)
 ```
 
-The selector and mixer are now decoupled:
-- selector decides **who to keep**
-- mixer decides **how much weight each kept neighbor gets**
+The algorithm also keeps three local state tables per vehicle:
 
----
+- trust scores `q_ij`
+- retained neighbors eligible for Internet reinjection
+- residual energy/bandwidth budgets plus last-round latency slack
 
-## Step 1 — Observe the state
+## 1. Observe the local state
 
-`select_neighbors()` consumes:
+`v.own_features()` now exposes:
 
-**Own state** — `v.own_features()` → shape `(6,)`
+1. validation loss
+2. validation accuracy
+3. remaining energy ratio
+4. remaining bandwidth ratio
+5. previous-round latency slack
+6. accepted-neighbor ratio
 
-**Neighbor features** — `env.neighbor_features(v, candidates)` → shape `(N, 8)`
+`env.neighbor_features(v, candidates)` now exposes:
 
-| index | meaning |
-|-------|---------|
-| 0 | cosine similarity of model parameters with $j$ |
-| 1 | gradient alignment with $j$ |
-| 2 | normalized distance to $j$ |
-| 3 | normalized transfer energy cost |
-| 4 | relative heading divergence |
-| 5 | neighbor accuracy |
-| 6 | link type (sidelink=0, internet=1) |
-| 7 | retained-neighbor score |
+1. gradient alignment
+2. normalized distance
+3. normalized energy cost
+4. normalized bandwidth cost
+5. normalized latency cost
+6. relative mobility
+7. link type (`SL` or `IN`)
+8. trust score `q_ij`
 
-The new signals are **gradient alignment** and the **retained-neighbor score** used by SL-first DANTE when a previously good sidelink peer is re-injected as an internet candidate.
+## 2. Candidate discovery
 
----
+DANTE discovers new neighbors over sidelink only.
 
-## Step 2 — Shared encoder + decoupled heads
+- PC5 neighbors come directly from physical discovery.
+- Previously helpful sidelink peers are retained locally.
+- Retained peers may be re-injected as Internet candidates if they stay within Internet range.
 
-`agent.act(own_state, nbr_features)`
+This keeps the paper's decentralized logic while matching the intended "PC5 first, then keep good peers over Uu" behavior.
 
-### 2a. Shared GAT context
+## 3. GAT encoding and PPO action
 
-```
-h_i  = self_proj(own_state)
-v_j  = nbr_proj(nbr_features)
-e_ij = attn(LeakyReLU([h_i_rep ; v_j]))
-a_ij = softmax(e_ij)
-emb  = Σ a_ij * v_j
-```
+For the current candidate set:
 
-This attention is now only an internal context mechanism. It is **not** reused as the aggregation weight.
-
-### 2b. Heads
-
-```
-own_enc = own_encoder(own_state)
-fused   = concat(own_enc, emb)
-value   = critic(fused)
-
-selector_logit_j = selector(concat(fused_rep, v_j))
-mixer_logit_j    = mixer(concat(fused_rep, v_j))
+```text
+h_i      = W_s x_i
+v_ij     = W_n x_ij
+beta_ij  = softmax(attention([h_i ; v_ij]))
+c_i      = sum_j beta_ij * v_ij
 ```
 
-The selector samples:
+The actor samples one Bernoulli decision per candidate:
 
-```
-action_j ~ Bernoulli(sigmoid(selector_logit_j))
-```
-
-The mixer produces a separate soft ranking:
-
-```
-mixer_prob = softmax(mixer_logits / tau)
+```text
+a_ij ~ Bernoulli(sigmoid(f([h_i ; c_i ; v_ij])))
 ```
 
-The mixer is trained to approximate statistical relevance, not transmission cost. Cost is handled later by the admissibility layer.
+The critic estimates:
 
----
-
-## Step 3 — Keep only useful neighbors
-
-Vehicle $i$ only keeps neighbors with `action_j = 1`.
-
-Each selected neighbor gets a predicted benefit score from the selector confidence, mixer relevance, and alignment features. Cost is tracked separately.
-
-```
-benefit_j ≈ selector_prob_j * relevance_j
+```text
+V(o_i) = g([h_i ; c_i])
 ```
 
-From the PPO-accepted neighbors, DANTE then builds the final collaboration set under the paper-style admissibility constraints:
+PPO stores the joint Bernoulli log-probability as a sum across candidates.
 
-```
-|C_i| <= K_i
-sum_j energy_j <= round_energy_budget
-sum_j bandwidth_j <= round_bandwidth_budget     # optional
-max_j latency_j <= round_latency_budget         # optional
-```
+## 4. Admissibility and subset selection
 
-Among all feasible subsets, DANTE keeps the one with the largest total predicted benefit. This means a more expensive but highly relevant neighbor can still be preferred over several cheap but weak candidates, as long as the resulting set stays within budget.
+After sampling, DANTE keeps only a budget-feasible subset.
 
-Final aggregation weights are then recomputed from the mixer probabilities over the kept subset only.
+- hard cap on the number of collaborators
+- hard per-round latency constraint
+- current residual energy budget
+- current residual bandwidth budget
 
-The pending PPO transition stores:
+Among feasible subsets, DANTE keeps the one with the largest total predicted benefit:
 
-```
-{own_state, nbr_features, action, log_prob, value, energy_j, target_round}
+```text
+benefit_ij = p_select_ij * max(q_ij * s_ij, 0)
 ```
 
----
+where `s_ij` is gradient alignment.
 
-## Step 4 — Local training + gradient capture
+## 5. Robust aggregation
 
-During `train_local()`:
-- the vehicle trains for `BATCHES_PER_ROUND` mini-batches
-- the last mini-batch gradient of the first two parameter tensors is captured
-- `last_grad_vec` is saved for future neighbor scoring
+Accepted neighbor models are aggregated with the paper-style fused weight:
 
-This gives the next round a direct proxy for whether a neighbor's update direction is aligned with mine.
-
----
-
-## Step 5 — Aggregation uses the mixer, not the selector
-
-After local training, accepted neighbors are aggregated with:
-
-```
-w_j     = mixer_prob_j / Σ mixer_prob_k     # over kept neighbors only
-new_θ_i = SELF_WEIGHT * θ_i + (1-SELF_WEIGHT) * Σ w_j * θ_j
+```text
+alpha_ij proportional to beta_ij * q_ij * r_ij
 ```
 
-The mixer head controls aggregation. The selector head no longer leaks into the aggregation rule.
+where:
 
----
+- `beta_ij` is the GAT attention
+- `q_ij` is trust
+- `r_ij` is the robust score from the adaptive trimmed-mean filter
 
-## Step 6 — Reward and PPO update
+If every accepted peer fails the robust filter, DANTE falls back to pure local training.
 
-When the pending round finishes, DANTE computes a blended progress signal:
+## 6. Local training and trust update
 
-```
-progress = 0.5 * Δtrain_loss + 0.5 * Δreward_loss + c_acc * Δreward_acc
-```
+After aggregation, the vehicle trains locally and evaluates the updated model on its validation split.
 
-Communication cost uses actual transmission energy:
+For each selected neighbor:
 
-```
-cost_norm = round_energy_j / TYPICAL_ROUND_ENERGY_J
-```
-
-Reward is shaped to prefer helpful, sparse neighborhoods:
-
-```
-if progress >= 0:
-    reward = progress / (1 + λ * cost_norm)
-else:
-    reward = progress * (1 + λ * cost_norm)
+```text
+phi_ij = 1{robust_pass_ij} * 1{validation loss did not worsen}
+q_ij <- (1 - rho) q_ij + rho phi_ij
 ```
 
-This means:
-- helpful, cheap neighborhoods keep most of their reward
-- expensive neighborhoods get discounted
-- expensive bad neighborhoods are punished harder
+Retention behavior:
 
-The PPO update still uses GAE and a clipped surrogate, but now:
-- updates happen every `8` transitions instead of `4`
-- advantage normalization is skipped on tiny rollouts
-- the mixer head gets an auxiliary supervised loss toward a gradient-alignment target
+- a helpful sidelink peer (`phi_ij = 1`) is promoted to the retained set
+- a retained Internet peer is dropped if it is offered but not selected
+- a retained peer is also dropped if it is selected and later gets `phi_ij = 0`
 
----
+## 7. Reward
 
-## Summary
+DANTE now uses a validation-only stage payoff:
 
-```
-Round t:
-  [observe own state + 7-dim neighbor features]
-           ↓
-  [shared GAT context]
-           ↓
-  [selector PPO head decides keep/drop]
-           ↓
-  [mixer head scores kept neighbors]
-           ↓
-  [budget-feasible subset selection]
-           ↓
-  [local training + gradient capture]
-           ↓
-  [aggregate with mixer weights]
-           ↓
-  [reward = progress shaped by actual energy]
-           ↓
-  [PPO update + mixer auxiliary update]
+```text
+reward =
+    validation_loss_drop
+    - total_energy / active_energy_budget
+    - bandwidth / active_bandwidth_budget
+    - latency / active_latency_budget
 ```
 
-The key change is that DANTE now learns **selection** and **aggregation** with separate mechanisms while exposing a direct gradient-alignment signal and a reward that makes excessive internet/sidelink usage costly.
+`total_energy` includes both communication energy induced by the chosen links and the local computation energy spent in the round.
+
+## 8. PPO update
+
+Once enough local transitions are collected, the vehicle runs PPO with:
+
+- GAE advantages
+- clipped surrogate loss
+- entropy regularization
+- local trajectories only
+
+No central critic, no shared parameters, and no global state are introduced.

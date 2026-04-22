@@ -1,11 +1,17 @@
-"""DANTE algorithm configuration."""
+"""DANTE algorithm configuration.
 
-# Feature dimensions consumed by the GAT encoder.
-OWN_DIM: int = 6
-NBR_DIM: int = 8
+The remaining settings are intentionally limited to paper-native quantities,
+simulator budget controls, and standard PPO optimization parameters.
+"""
+
+# Feature dimensions consumed by the DANTE encoder.
+OWN_DIM: int = 7
+NBR_DIM: int = 9
 
 # Personalized aggregation weight retained from the local model.
-SELF_WEIGHT: float = 0.5
+# ``None`` disables fixed self-retention and gives the local model one
+# peer-sized share in the final aggregation.
+SELF_WEIGHT: float | None = 0.5
 
 # Candidate and collaboration caps.
 MAX_SIDELINK_NEIGHBORS: int = 10
@@ -18,22 +24,17 @@ EVAL_SPLIT: str = "test"
 # Shared hidden width used by the GAT encoder, actor, and critic.
 GAT_HIDDEN_DIM: int = 64
 
-# Mixer head supervision.
-MIXER_LOSS_COEF: float = 0.5
-MIXER_TAU: float = 0.7
-SELECTOR_INIT_BIAS: float = -1.0
+# Trust recursion coefficient from the paper.
+TRUST_SMOOTHING: float = 0.2
 
-# Reward shaping.
-REWARD_ACC_WEIGHT: float = 2.0
-COST_LAMBDA: float = 2.0
-TYPICAL_ROUND_ENERGY_J: float = 0.02
+# Per-round admissibility budgets.
+# ``None`` means "derive a simulator-grounded default" inside the algorithm.
 ROUND_ENERGY_BUDGET_J: float = 0.04
 ROUND_BANDWIDTH_BUDGET_BITS: float | None = None
 ROUND_LATENCY_BUDGET_S: float | None = None
 
-# PPO optimiser settings.
+# PPO optimizer settings.
 PPO_LR: float = 3e-4
-PPO_REWARD_SOURCE: str = "validation"  # "validation" or "training"
 PPO_UPDATE_EVERY: int = 8
 PPO_EPOCHS: int = 4
 PPO_CLIP_EPS: float = 0.2

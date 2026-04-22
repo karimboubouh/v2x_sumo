@@ -42,6 +42,8 @@ _bar_mem_mb      = 0.0
 _bar_last_sample = 0.0
 _bar_proc        = None
 _bar_line        = ""
+_file_handle     = None
+_file_path       = None
 
 _ANSI_ESC = re.compile(r"\033\[[^m]*m")
 _BAR_W    = 18   # visual width of the filled/empty block
@@ -53,6 +55,34 @@ def set_level(level: str):
     level = level.lower()
     if level in _LEVELS:
         _min_severity = _LEVELS[level]["severity"]
+
+
+def start_file_logging(path: str) -> None:
+    """Begin mirroring logger.log(...) output to a plain-text file."""
+    global _file_handle, _file_path
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with _bar_lock:
+        if _file_handle is not None:
+            _file_handle.close()
+        _file_path = os.path.abspath(path)
+        _file_handle = open(_file_path, "a", encoding="utf-8")
+
+
+def stop_file_logging() -> None:
+    """Stop mirroring logger output to the plain-text file sink."""
+    global _file_handle, _file_path
+    with _bar_lock:
+        if _file_handle is not None:
+            _file_handle.close()
+            _file_handle = None
+        _file_path = None
+
+
+def _write_file_log_line(text: str) -> None:
+    if _file_handle is None:
+        return
+    _file_handle.write(text + "\n")
+    _file_handle.flush()
 
 
 def log(message: str, type: str = None):
@@ -83,6 +113,7 @@ def log(message: str, type: str = None):
         color = level_info["color"]
         label = level_info["label"]
         text = f"{color}{_REVERSE}[{label}]{_RESET} {color}{message}{_RESET}"
+        file_text = f"[{label.strip()}] {message}"
 
     else:
         # Continuation: inherit last type's color/filter, indent to align
@@ -90,8 +121,10 @@ def log(message: str, type: str = None):
             return
         color = _LEVELS[_last_type]["color"]
         text = f"{color}{' ' * _INDENT}{message}{_RESET}"
+        file_text = f"{' ' * _INDENT}{message}"
 
     with _bar_lock:
+        _write_file_log_line(file_text)
         if _bar_active and _bar_tty:
             # Erase bar line, print log line, redraw bar underneath
             sys.stdout.write(f"\r\033[K{text}\n")

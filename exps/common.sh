@@ -11,6 +11,52 @@ mkdir -p "$OUT_DIR" "$PAPER_ASSETS_DIR"
 LAST_EXPERIMENT_DIR=""
 LAST_COMPARISON_DIR=""
 
+warn_if_zero_link_experiment() {
+  local experiment_dir="$1"
+  local label="${2:-}"
+
+  python - "$experiment_dir/experiment.pkl" "$label" <<'PY'
+import pickle
+import re
+import sys
+
+path = sys.argv[1]
+label = sys.argv[2].strip() or "experiment"
+with open(path, "rb") as fh:
+    experiment = pickle.load(fh)
+
+def normalize(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+max_links = max(
+    (int(point.get("total_links", 0)) for point in experiment.get("train_history", [])),
+    default=0,
+)
+cfg = dict(experiment.get("config", {}))
+metadata = dict(experiment.get("metadata", {}))
+labels = {
+    normalize(label),
+    normalize(metadata.get("algorithm", "")),
+    normalize(cfg.get("ALGORITHM", "")),
+}
+zero_caps = all(
+    int(cfg.get(key, 0) or 0) <= 0
+    for key in ("MAX_SIDELINK_NEIGHBORS", "MAX_INTERNET_NEIGHBORS", "MAX_COLLAB_NEIGHBORS")
+)
+is_local_only = "localonly" in labels or "localonlymaincomparison" in labels or "localonlymaincomparison" in normalize(label)
+if (is_local_only or zero_caps) and max_links > 0:
+    raise SystemExit(
+        f"{label} declared zero collaboration capacity but recorded {max_links} active links."
+    )
+if max_links == 0 and not is_local_only:
+    print(
+        f"    WARNING: {label} recorded zero collaboration links across all rounds; "
+        "treat it as a local baseline, not an active collaborative comparator.",
+        file=sys.stderr,
+    )
+PY
+}
+
 snapshot_experiments() {
   find "$OUT_DIR" -mindepth 1 -maxdepth 1 -type d -exec test -f "{}/experiment.pkl" ";" -print | sort
 }
@@ -58,6 +104,7 @@ run_cli_experiment() {
   fi
 
   echo "    Saved experiment: $LAST_EXPERIMENT_DIR"
+  warn_if_zero_link_experiment "$LAST_EXPERIMENT_DIR" "$label"
 }
 
 run_wrapped_experiment() {
@@ -106,6 +153,7 @@ PY
   fi
 
   echo "    Saved experiment: $LAST_EXPERIMENT_DIR"
+  warn_if_zero_link_experiment "$LAST_EXPERIMENT_DIR" "$label"
 }
 
 relabel_experiment() {

@@ -203,26 +203,40 @@ class Vehicle:
 
     def own_features(self) -> np.ndarray:
         """
-        Compact state vector (6 features).
-        [0] reward-aligned loss / 5
-        [1] reward-aligned accuracy
-        [2] |connections| / algorithm max_collab_neighbors  — reflects the *previous*
-            round's connection set (stale by design: the current policy
-            decision has not been committed yet when this is called).
-        [3] pos_x / network_size
-        [4] pos_y / network_size
-        [5] Byzantine flag — reserved; always 0.0 until Byzantine vehicle
-            support is implemented (see config.BYZANTINE_FRACTION).
+        Compact state vector (7 features).
+        [0] validation loss / 5
+        [1] validation accuracy
+        [2] remaining energy budget ratio
+        [3] remaining bandwidth budget ratio
+        [4] latency slack ratio from the last completed round
+        [5] accepted-neighbor ratio from the last committed collaboration set
+        [6] learned local baseline gain
         """
-        ns = self._network_size
+        budget_features = (1.0, 1.0, 1.0)
+        budget_feature_fn = getattr(self._algo, "get_budget_features", None)
+        if callable(budget_feature_fn):
+            budget_features = tuple(float(x) for x in budget_feature_fn(self))
+        baseline_gain = 0.0
+        baseline_gain_fn = getattr(self._algo, "get_baseline_gain", None)
+        if callable(baseline_gain_fn):
+            baseline_gain = float(baseline_gain_fn(self))
+
         max_collab = max(int(getattr(self._algo, "max_collab_neighbors", 1)), 1)
+        active_neighbors = sum(
+            1 for alpha in self.alphas.values()
+            if float(alpha) > 0.0
+        )
+        if active_neighbors <= 0:
+            active_neighbors = len(self.connections)
+
         return np.array([
-            float(np.clip(self.current_reward_loss, 0.0, 5.0)) / 5.0,
-            float(np.clip(self.current_reward_acc, 0.0, 1.0)),
-            len(self.connections) / max_collab,
-            float(np.clip(self.pos[0] / ns, 0.0, 1.0)),
-            float(np.clip(self.pos[1] / ns, 0.0, 1.0)),
-            float(self.is_byzantine),
+            float(np.clip(self.current_val_loss, 0.0, 5.0)) / 5.0,
+            float(np.clip(self.current_val_acc, 0.0, 1.0)),
+            float(np.clip(budget_features[0], 0.0, 1.0)),
+            float(np.clip(budget_features[1], 0.0, 1.0)),
+            float(np.clip(budget_features[2], 0.0, 1.0)),
+            active_neighbors / max_collab,
+            float(np.clip(baseline_gain, -1.0, 1.0)),
         ], dtype=np.float32)
 
     # ── Background training round ─────────────────────────────────────────────

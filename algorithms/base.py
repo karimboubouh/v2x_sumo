@@ -29,6 +29,8 @@ class DLAlgorithm(ABC):
     max_sidelink_neighbors: int = 0
     max_internet_neighbors: int = 0
     max_collab_neighbors: int = 1
+    own_feature_dim: int = 6
+    neighbor_feature_dim: int = 8
 
     def setup(self, vehicles: list) -> None:
         """One-time initialization called after all Vehicle objects are created."""
@@ -57,6 +59,20 @@ class DLAlgorithm(ABC):
     def post_step(self, vehicles: list, transitions: dict, step_n: int) -> dict:
         """Called once per simulation step after aggregation and training."""
         return {v.id: 0.0 for v in vehicles}
+
+    def consume_debug_logs(self) -> list[str]:
+        """Return algorithm-specific debug lines accumulated since the last call."""
+        return []
+
+    def get_baseline_gain(self, v) -> float:
+        """Return the learned local-progress baseline used for state features."""
+        del v
+        return 0.0
+
+    def get_retention_value(self, v, neighbor_id: int) -> float:
+        """Return the learned retention value for one neighbor."""
+        del v, neighbor_id
+        return 0.0
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}[{self.name}]"

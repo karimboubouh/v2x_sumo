@@ -8,18 +8,22 @@ COMMON_ARGS=(
   --headless
   --scenario khalifa_university
   --num-vehicles 50
-  --rounds 150
+  --rounds 50
   --target_acc 1.01
   --dl-dataset CIFAR10
   --dl-model CNN
   --verbose debug
+  --save-logs
 )
 
 declare -a EXPERIMENTS=()
 
-for algo in DANTE DPFL; do
+for algo in DANTE DPFL LocalOnly; do
 #for algo in DANTE DPFL IPPO pFedGraph FedAvg D-PSGD; do
   run_cli_experiment "$algo main comparison" "${COMMON_ARGS[@]}" --dl-algorithm "$algo"
+  if [[ "$algo" == "LocalOnly" ]]; then
+    relabel_experiment "$LAST_EXPERIMENT_DIR" "Local Only"
+  fi
   EXPERIMENTS+=("$LAST_EXPERIMENT_DIR")
 done
 
