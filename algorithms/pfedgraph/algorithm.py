@@ -31,18 +31,6 @@ from algorithms.pfedgraph.config import (
 from dl.helpers import clone_state_dict
 
 
-def _synchronize_initial_models(vehicles: list) -> dict:
-    """Align all vehicles to a common initial model, matching FL assumptions."""
-    anchor_state = clone_state_dict(vehicles[0].model.state_dict())
-    for vehicle in vehicles:
-        vehicle.model.load_state_dict(anchor_state)
-        vehicle._shared_weights = clone_state_dict(anchor_state)
-        vehicle._ref_weights = clone_state_dict(anchor_state)
-        vehicle.shared_weights_bytes = vehicle._state_dict_nbytes(anchor_state)
-        vehicle._param_vec = None
-    return anchor_state
-
-
 def _project_to_simplex(values: np.ndarray) -> np.ndarray:
     """Euclidean projection onto the probability simplex."""
     if values.size == 1:
@@ -67,7 +55,7 @@ class PFedGraphAlgorithm(DLAlgorithm):
         self._alpha_scale = float(GRAPH_ALPHA_SCALE)
         self._reg_lambda = float(REG_LAMBDA)
         self._similarity_cap = float(SIMILARITY_CAP)
-        self._initial_state = None
+        self._initial_states = {}
         self._dataset_sizes = {}
         self._similarity_cache_step = -1
         self._similarity_cache = {}
@@ -76,7 +64,10 @@ class PFedGraphAlgorithm(DLAlgorithm):
         self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
 
     def setup(self, vehicles: list) -> None:
-        self._initial_state = _synchronize_initial_models(vehicles)
+        self._initial_states = {
+            vehicle.id: clone_state_dict(vehicle.model.state_dict())
+            for vehicle in vehicles
+        }
         self._dataset_sizes = {
             vehicle.id: max(int(len(vehicle.train_loader.dataset)), 1)
             for vehicle in vehicles
@@ -201,11 +192,12 @@ class PFedGraphAlgorithm(DLAlgorithm):
         norms = {}
         for vehicle in env.vehicles:
             current = vehicle.get_shared_weights()
+            base_state = self._initial_states.get(vehicle.id, current)
             parts = []
             for key, tensor in current.items():
                 if not tensor.is_floating_point():
                     continue
-                base = self._initial_state[key].to(dtype=tensor.dtype)
+                base = base_state[key].to(device=tensor.device, dtype=tensor.dtype)
                 parts.append((tensor - base).reshape(-1).float().numpy())
 
             vec = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)

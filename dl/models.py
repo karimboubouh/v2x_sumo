@@ -17,6 +17,8 @@ Adapted from v2x_sim/fl_models.py.
 
 import torch
 import torch.nn as nn
+
+import config
 import torch.nn.functional as F
 
 # ── Dataset metadata ──────────────────────────────────────────────────────────
@@ -60,19 +62,22 @@ class DNN(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CNN(nn.Module):
-    """Single-block convolutional network."""
+    """CIFAR CNN used by the DPL experiments."""
 
     def __init__(self, in_ch: int, img: int, n_cls: int):
         super().__init__()
+        width = int(getattr(config, "CNN_CHANNELS", 16))
+        hidden = int(getattr(config, "CNN_HIDDEN", 64))
         self.features = nn.Sequential(
-            nn.Conv2d(in_ch, 16, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # img/2
+            nn.Conv2d(in_ch, width, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
         )
-        reduced = (img // 2) ** 2 * 16
+        reduced = (img // 2) * (img // 2) * width
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(reduced, 64), nn.ReLU(),
-            nn.Linear(64, n_cls),
+            nn.Linear(reduced, hidden), nn.ReLU(),
+            nn.Dropout(float(getattr(config, "CNN_DROPOUT", 0.0))),
+            nn.Linear(hidden, n_cls),
         )
 
     def forward(self, x):
@@ -154,7 +159,7 @@ class TransformerModel(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ResNet — Small residual network (ResNet-style)
+# ResNet — CIFAR-style residual network
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ResBlock(nn.Module):
@@ -180,19 +185,27 @@ class ResBlock(nn.Module):
 
 
 class ResNet(nn.Module):
-    """Small ResNet: stem -> 3 stages -> global avg pool -> FC."""
+    """CIFAR-style ResNet-20: stem -> 3 residual stages -> pool -> FC."""
 
     def __init__(self, in_ch: int, img: int, n_cls: int):
         super().__init__()
+        width = 32
         self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(in_ch, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(),
         )
-        self.layer1 = ResBlock(32, 64, stride=2)
-        self.layer2 = ResBlock(64, 128, stride=2)
-        self.layer3 = ResBlock(128, 128, stride=1)
+        self.layer1 = self._make_stage(width, width, blocks=3, stride=1)
+        self.layer2 = self._make_stage(width, width * 2, blocks=3, stride=2)
+        self.layer3 = self._make_stage(width * 2, width * 4, blocks=3, stride=2)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(128, n_cls)
+        self.fc = nn.Linear(width * 4, n_cls)
+
+    @staticmethod
+    def _make_stage(ch_in: int, ch_out: int, blocks: int, stride: int) -> nn.Sequential:
+        layers = [ResBlock(ch_in, ch_out, stride=stride)]
+        for _ in range(1, blocks):
+            layers.append(ResBlock(ch_out, ch_out, stride=1))
+        return nn.Sequential(*layers)
 
     def forward(self, x):
         x = self.stem(x)

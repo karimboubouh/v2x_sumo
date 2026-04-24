@@ -7,7 +7,7 @@ Each vehicle gets an independent PPO agent with:
 ```text
 _GATActorCritic
 |- _GATLayer   (single-head attention over ego + candidate neighbors)
-|- selector    (Bernoulli actor over candidate edges)
+|- selector    (Bernoulli actor over feasible peers)
 `- critic      (state-value head)
 ```
 
@@ -26,18 +26,15 @@ The algorithm also keeps three local state tables per vehicle:
 3. remaining energy ratio
 4. remaining bandwidth ratio
 5. previous-round latency slack
-6. accepted-neighbor ratio
 
 `env.neighbor_features(v, candidates)` now exposes:
 
 1. gradient alignment
-2. normalized distance
-3. normalized energy cost
-4. normalized bandwidth cost
-5. normalized latency cost
-6. relative mobility
-7. link type (`SL` or `IN`)
-8. trust score `q_ij`
+2. normalized energy cost
+3. normalized latency cost
+4. link type (`SL` or `IN`)
+5. trust score `q_ij`
+6. last robust score
 
 ## 2. Candidate discovery
 
@@ -45,7 +42,7 @@ DANTE discovers new neighbors over sidelink only.
 
 - PC5 neighbors come directly from physical discovery.
 - Previously helpful sidelink peers are retained locally.
-- Retained peers may be re-injected as Internet candidates if they stay within Internet range.
+- Retained peers may be re-injected as Internet candidates even after they leave PC5 range.
 
 This keeps the paper's decentralized logic while matching the intended "PC5 first, then keep good peers over Uu" behavior.
 
@@ -60,10 +57,10 @@ beta_ij  = softmax(attention([h_i ; v_ij]))
 c_i      = sum_j beta_ij * v_ij
 ```
 
-The actor samples one Bernoulli decision per candidate:
+The actor outputs one Bernoulli per feasible peer:
 
 ```text
-a_ij ~ Bernoulli(sigmoid(f([h_i ; c_i ; v_ij])))
+pi(a_ij = 1 | o_i) = sigmoid(f([h_i ; c_i ; v_ij]))
 ```
 
 The critic estimates:
@@ -72,24 +69,26 @@ The critic estimates:
 V(o_i) = g([h_i ; c_i])
 ```
 
-PPO stores the joint Bernoulli log-probability as a sum across candidates.
+PPO samples a per-candidate binary action over the full feasible set
+`new sidelink peers + retained Internet peers`.
 
 ## 4. Admissibility and subset selection
 
-After sampling, DANTE keeps only a budget-feasible subset.
+After PPO samples the feasible set, DANTE keeps only hard admissibility checks.
 
 - hard cap on the number of collaborators
 - hard per-round latency constraint
 - current residual energy budget
 - current residual bandwidth budget
 
-Among feasible subsets, DANTE keeps the one with the largest total predicted benefit:
+If the sampled set exceeds the active budget or cap, DANTE greedily keeps peers by:
 
 ```text
-benefit_ij = p_select_ij * max(q_ij * s_ij, 0)
+score_ij = beta_ij * max(q_ij * s_ij, 0) / (eps + comm_cost_ij)
 ```
 
-where `s_ij` is gradient alignment.
+with actor probability used only as a tie-break. There is no second
+validation-based set acceptance gate after PPO.
 
 ## 5. Robust aggregation
 
@@ -105,6 +104,13 @@ where:
 - `q_ij` is trust
 - `r_ij` is the robust score from the adaptive trimmed-mean filter
 
+The local self-weight follows the paper's scheduled `alpha_ii^(t)` idea rather
+than staying fixed:
+
+```text
+alpha_ii^(t) = linear_schedule(0.80 -> 0.50)
+```
+
 If every accepted peer fails the robust filter, DANTE falls back to pure local training.
 
 ## 6. Local training and trust update
@@ -114,29 +120,38 @@ After aggregation, the vehicle trains locally and evaluates the updated model on
 For each selected neighbor:
 
 ```text
-phi_ij = 1{robust_pass_ij} * 1{validation loss did not worsen}
+phi_ij = 1{robust_pass_ij} * 1{alpha_ij > 0} * 1{val_loss_delta > 0}
 q_ij <- (1 - rho) q_ij + rho phi_ij
 ```
 
 Retention behavior:
 
 - a helpful sidelink peer (`phi_ij = 1`) is promoted to the retained set
-- a retained Internet peer is dropped if it is offered but not selected
-- a retained peer is also dropped if it is selected and later gets `phi_ij = 0`
+- retained peers remain in memory while they stay addressable or useful
+- retained peers reappear over Internet when they are active, not visible on PC5, trusted, and robust
 
 ## 7. Reward
 
-DANTE now uses a validation-only stage payoff:
+DANTE reports a weighted normalized form of the paper stage payoff:
 
 ```text
-reward =
-    validation_loss_drop
-    - total_energy / active_energy_budget
-    - bandwidth / active_bandwidth_budget
-    - latency / active_latency_budget
+reported_reward =
+    normalized_validation_gain
+    - (
+        lambda_E * communication_energy / round_energy_budget
+        + lambda_B * bandwidth / round_bandwidth_budget
+        + lambda_T * latency / round_latency_budget
+      )
+
+where lambda_E = lambda_B = lambda_T = 0.10
+
+ppo_reward = reported_reward - ema(no_collab_reward)
 ```
 
-`total_energy` includes both communication energy induced by the chosen links and the local computation energy spent in the round.
+Computation energy is still reported in experiment totals, but the reported
+reward keeps only the communication-side stage payoff. PPO is trained on
+collaboration advantage relative to the running no-collaboration baseline so the
+policy is not rewarded for local learning progress it did not cause.
 
 ## 8. PPO update
 

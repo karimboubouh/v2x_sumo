@@ -90,14 +90,15 @@ class Vehicle:
         self.eval_loader = self.train_eval_loader
         self._inf_iter = _inf_loader(train_loader)
         self.n_classes = get_n_classes(config.DATASET)
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=config.LOCAL_LR
+        self.optimizer = self._build_optimizer()
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=float(getattr(config, "LABEL_SMOOTHING", 0.0))
         )
-        self.criterion = nn.CrossEntropyLoss()
 
         _init_sd = self.model.state_dict()
         self._shared_weights = clone_state_dict(_init_sd)
         self._ref_weights = clone_state_dict(_init_sd)
+        self._shared_update = self._zero_update_state(_init_sd)
         self.shared_weights_bytes = self._state_dict_nbytes(_init_sd)
 
         # Neighbor state
@@ -134,9 +135,9 @@ class Vehicle:
         self.sidelink_tx_energy_j = 0.0
         self.internet_tx_energy_j = 0.0
 
-        # Cached flattened first-layer parameters for cosine-similarity
+        # Cached compact parameter/update views for neighbor scoring
         self._param_vec: np.ndarray | None = None
-        self.last_grad_vec: np.ndarray = self._zero_param_vec()
+        self.last_update_vec: np.ndarray = self._zero_update_vec()
         self.last_sim_time = 0.0
         self._round_started_at = 0.0
         self._pending_transfers = []
@@ -146,6 +147,48 @@ class Vehicle:
         # Threading — starts SET so the vehicle is eligible immediately
         self.training_done = threading.Event()
         self.training_done.set()
+
+    def _build_optimizer(self):
+        optimizer_name = str(getattr(config, "LOCAL_OPTIMIZER", "adam")).strip().lower()
+        lr = float(config.LOCAL_LR)
+        if optimizer_name == "sgd":
+            return torch.optim.SGD(
+                self.model.parameters(),
+                lr=lr,
+                momentum=float(getattr(config, "LOCAL_MOMENTUM", 0.0)),
+                weight_decay=float(getattr(config, "LOCAL_WEIGHT_DECAY", 0.0)),
+                nesterov=bool(getattr(config, "LOCAL_NESTEROV", False)),
+            )
+        if optimizer_name == "adam":
+            return torch.optim.Adam(
+                self.model.parameters(),
+                lr=lr,
+                weight_decay=float(getattr(config, "LOCAL_WEIGHT_DECAY", 0.0)),
+            )
+        raise ValueError(
+            f"Unsupported LOCAL_OPTIMIZER={getattr(config, 'LOCAL_OPTIMIZER', None)!r}; "
+            "expected 'sgd' or 'adam'."
+        )
+
+    def reset_optimizer(self) -> None:
+        """Reset local optimizer state after externally loading aggregated weights."""
+        self.optimizer = self._build_optimizer()
+
+    def _scheduled_lr(self) -> float:
+        base_lr = float(config.LOCAL_LR)
+        schedule = str(getattr(config, "LOCAL_LR_SCHEDULE", "constant")).strip().lower()
+        if schedule != "cosine":
+            return base_lr
+        min_lr = float(getattr(config, "LOCAL_LR_MIN", base_lr))
+        max_rounds = max(int(getattr(config, "MAX_TR_ROUNDS", 1)), 1)
+        progress = min(max(float(self.tr_rounds) / max(max_rounds - 1, 1), 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + (base_lr - min_lr) * cosine
+
+    def _apply_lr_schedule(self) -> None:
+        lr = self._scheduled_lr()
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
 
     # ── SUMO integration ──────────────────────────────────────────────────────
 
@@ -176,15 +219,47 @@ class Vehicle:
             for p in list(self.model.parameters())[:2]
         ]).astype(np.float32, copy=False)
 
-    def _flatten_first_two_grads(self) -> np.ndarray:
+    def _flatten_all_grads(self) -> np.ndarray:
         parts = []
-        for param in list(self.model.parameters())[:2]:
+        for param in self.model.parameters():
             grad = param.grad
             if grad is None:
                 parts.append(np.zeros(param.numel(), dtype=np.float32))
             else:
                 parts.append(grad.detach().numpy().ravel().astype(np.float32, copy=False))
         return np.concatenate(parts).astype(np.float32, copy=False)
+
+    def _flatten_all_param_delta(self, reference_state: dict) -> np.ndarray:
+        parts = []
+        for name, param in self.model.state_dict().items():
+            if not param.is_floating_point():
+                continue
+            ref_tensor = reference_state.get(name, param)
+            delta = param.detach().cpu().numpy().ravel() - ref_tensor.detach().cpu().numpy().ravel()
+            parts.append(delta.astype(np.float32, copy=False))
+        return np.concatenate(parts).astype(np.float32, copy=False)
+
+    def _zero_update_vec(self) -> np.ndarray:
+        parts = []
+        for param in self.model.parameters():
+            parts.append(np.zeros(param.numel(), dtype=np.float32))
+        return np.concatenate(parts).astype(np.float32, copy=False)
+
+    def _zero_update_state(self, state_dict: dict) -> dict:
+        update = {}
+        for key, tensor in state_dict.items():
+            update[key] = torch.zeros_like(tensor) if tensor.is_floating_point() else tensor.clone()
+        return update
+
+    def _state_delta(self, current_state: dict, reference_state: dict) -> dict:
+        delta = {}
+        for key, tensor in current_state.items():
+            if not tensor.is_floating_point():
+                delta[key] = tensor.clone()
+                continue
+            ref_tensor = reference_state.get(key, tensor)
+            delta[key] = tensor.detach().clone().float() - ref_tensor.detach().clone().float()
+        return delta
 
     def _zero_param_vec(self) -> np.ndarray:
         return np.zeros_like(self._flatten_first_two_params(), dtype=np.float32)
@@ -196,47 +271,35 @@ class Vehicle:
                 self._param_vec = self._flatten_first_two_params()
         return self._param_vec
 
-    def get_grad_vec(self) -> np.ndarray:
-        """Return the most recent captured gradient vector for neighbor scoring."""
+    def get_update_vec(self) -> np.ndarray:
+        """Return the most recent round-level local update direction."""
         with self._lock:
-            return self.last_grad_vec.copy()
+            return self.last_update_vec.copy()
+
+    def get_grad_vec(self) -> np.ndarray:
+        """Backward-compatible alias for the latest round-level update vector."""
+        return self.get_update_vec()
 
     def own_features(self) -> np.ndarray:
         """
-        Compact state vector (7 features).
+        Compact state vector (5 features).
         [0] validation loss / 5
         [1] validation accuracy
         [2] remaining energy budget ratio
         [3] remaining bandwidth budget ratio
         [4] latency slack ratio from the last completed round
-        [5] accepted-neighbor ratio from the last committed collaboration set
-        [6] learned local baseline gain
         """
         budget_features = (1.0, 1.0, 1.0)
         budget_feature_fn = getattr(self._algo, "get_budget_features", None)
         if callable(budget_feature_fn):
             budget_features = tuple(float(x) for x in budget_feature_fn(self))
-        baseline_gain = 0.0
-        baseline_gain_fn = getattr(self._algo, "get_baseline_gain", None)
-        if callable(baseline_gain_fn):
-            baseline_gain = float(baseline_gain_fn(self))
-
-        max_collab = max(int(getattr(self._algo, "max_collab_neighbors", 1)), 1)
-        active_neighbors = sum(
-            1 for alpha in self.alphas.values()
-            if float(alpha) > 0.0
-        )
-        if active_neighbors <= 0:
-            active_neighbors = len(self.connections)
 
         return np.array([
-            float(np.clip(self.current_val_loss, 0.0, 5.0)) / 5.0,
-            float(np.clip(self.current_val_acc, 0.0, 1.0)),
+            float(np.clip(self.current_reward_loss, 0.0, 5.0)) / 5.0,
+            float(np.clip(self.current_reward_acc, 0.0, 1.0)),
             float(np.clip(budget_features[0], 0.0, 1.0)),
             float(np.clip(budget_features[1], 0.0, 1.0)),
             float(np.clip(budget_features[2], 0.0, 1.0)),
-            active_neighbors / max_collab,
-            float(np.clip(baseline_gain, -1.0, 1.0)),
         ], dtype=np.float32)
 
     # ── Background training round ─────────────────────────────────────────────
@@ -252,9 +315,10 @@ class Vehicle:
         try:
             self._publish_transfer_events()
             self._ref_weights = clone_state_dict(self.model.state_dict())
+            self._apply_lr_schedule()
             self.model.train()
             total_loss, total_correct, total_n = 0.0, 0, 0
-            last_grad_vec = self._zero_param_vec()
+            last_grad_vec = self._zero_update_vec()
 
             _bpr = config.BATCHES_PER_ROUND
             batch_iter = (
@@ -274,7 +338,7 @@ class Vehicle:
                         loss = loss + extra
 
                 loss.backward()
-                last_grad_vec = self._flatten_first_two_grads()
+                last_grad_vec = self._flatten_all_grads()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
 
@@ -322,14 +386,19 @@ class Vehicle:
                 self.tr_rounds += 1
                 round_n = self.tr_rounds
 
-                self._shared_weights = clone_state_dict(self.model.state_dict())
+                current_state = self.model.state_dict()
+                self._shared_weights = clone_state_dict(current_state)
+                self._shared_update = self._state_delta(current_state, self._ref_weights)
 
                 # Refresh param cache for neighbor feature computation
                 self._param_vec = self._flatten_first_two_params()
-                if np.all(np.isfinite(last_grad_vec)):
-                    self.last_grad_vec = last_grad_vec.astype(np.float32, copy=True)
+                round_update_vec = self._flatten_all_param_delta(self._ref_weights)
+                if np.all(np.isfinite(round_update_vec)):
+                    self.last_update_vec = round_update_vec.astype(np.float32, copy=True)
+                elif np.all(np.isfinite(last_grad_vec)):
+                    self.last_update_vec = last_grad_vec.astype(np.float32, copy=True)
                 else:
-                    self.last_grad_vec = self._zero_param_vec()
+                    self.last_update_vec = self._zero_update_vec()
                 self.computation_energy_j += computation_energy_j
 
             self.loss_hist.append(avg_loss)
@@ -343,7 +412,8 @@ class Vehicle:
             )
 
             if (
-                config.TARGET_ACCURACY <= 1.0
+                str(getattr(config, "STOP_ON", "rounds")).lower() == "train_acc"
+                and config.TARGET_ACCURACY <= 1.0
                 and avg_acc >= config.TARGET_ACCURACY
                 and not self._target_accuracy_announced
             ):
@@ -354,7 +424,10 @@ class Vehicle:
                     f"({avg_acc:.2%} >= {config.TARGET_ACCURACY:.2%})",
                 )
 
-            if config.TARGET_ACCURACY <= 1.0:
+            if (
+                str(getattr(config, "STOP_ON", "rounds")).lower() == "train_acc"
+                and config.TARGET_ACCURACY <= 1.0
+            ):
                 _finished = avg_acc >= config.TARGET_ACCURACY
             elif config.MAX_TR_ROUNDS > 0:
                 _finished = round_n >= config.MAX_TR_ROUNDS
@@ -390,6 +463,13 @@ class Vehicle:
                 return self._byzantine_weights(self._shared_weights)
             return clone_state_dict(self._shared_weights)
 
+    def get_shared_update(self) -> dict:
+        """Thread-safe copy of the most recent broadcast update delta."""
+        with self._lock:
+            if self.is_byzantine:
+                return self._byzantine_update(self._shared_update)
+            return clone_state_dict(self._shared_update)
+
     def _byzantine_weights(self, sd: dict) -> dict:
         """Return a state dict where every floating-point tensor is replaced
         by i.i.d. Gaussian noise with the same shape and dtype.  Non-floating
@@ -398,6 +478,16 @@ class Vehicle:
         for key, tensor in sd.items():
             if tensor.is_floating_point():
                 corrupted[key] = torch.randn_like(tensor)
+            else:
+                corrupted[key] = tensor.clone()
+        return corrupted
+
+    def _byzantine_update(self, update: dict) -> dict:
+        """Return an arbitrary floating-point update for Byzantine simulation."""
+        corrupted = {}
+        for key, tensor in update.items():
+            if tensor.is_floating_point():
+                corrupted[key] = torch.randn_like(tensor.float())
             else:
                 corrupted[key] = tensor.clone()
         return corrupted

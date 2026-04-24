@@ -8,19 +8,23 @@ COMMON_ARGS=(
   --headless
   --scenario khalifa_university
   --num-vehicles 50
-  --rounds 50
-  --target_acc 1.01
+  --rounds 150
+  --target_acc 0.90
   --dl-dataset CIFAR10
-  --dl-model CNN
-  --verbose debug
+  --dl-model ResNet
+  --verbose info
   --save-logs
 )
 
 declare -a EXPERIMENTS=()
 
-for algo in DANTE DPFL LocalOnly; do
+for algo in DANTE DPFL LocalOnly pFedGraph; do
 #for algo in DANTE DPFL IPPO pFedGraph FedAvg D-PSGD; do
-  run_cli_experiment "$algo main comparison" "${COMMON_ARGS[@]}" --dl-algorithm "$algo"
+  run_wrapped_experiment \
+    "$algo main comparison" \
+    $'config.TRAIN_AUGMENTATION_POLICY = "dataset_default"\nconfig.SHARED_INITIAL_MODEL = True\nconfig.LOCAL_OPTIMIZER = "sgd"\nconfig.LOCAL_LR = 5e-2\nconfig.LOCAL_MOMENTUM = 0.9\nconfig.LOCAL_WEIGHT_DECAY = 5e-4\nconfig.BATCHES_PER_ROUND = 16\nconfig.EVAL_BATCHES_PER_ROUND = 0' \
+    "${COMMON_ARGS[@]}" \
+    --dl-algorithm "$algo"
   if [[ "$algo" == "LocalOnly" ]]; then
     relabel_experiment "$LAST_EXPERIMENT_DIR" "Local Only"
   fi

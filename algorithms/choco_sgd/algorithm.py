@@ -24,18 +24,6 @@ from algorithms.choco_sgd.config import (
 from dl.helpers import clone_state_dict
 
 
-def _synchronize_initial_models(vehicles: list) -> dict:
-    """Align all vehicles to the same initialization, as assumed by the paper."""
-    anchor_state = clone_state_dict(vehicles[0].model.state_dict())
-    for vehicle in vehicles:
-        vehicle.model.load_state_dict(anchor_state)
-        vehicle._shared_weights = clone_state_dict(anchor_state)
-        vehicle._ref_weights = clone_state_dict(anchor_state)
-        vehicle.shared_weights_bytes = vehicle._state_dict_nbytes(anchor_state)
-        vehicle._param_vec = None
-    return anchor_state
-
-
 def _compress_tensor(tensor, mode: str, keep_ratio: float):
     """Apply the configured compression operator to one tensor."""
     if not tensor.is_floating_point():
@@ -86,7 +74,7 @@ class CHOCOSGDAlgorithm(DLAlgorithm):
         self.max_collab_neighbors = int(MAX_COLLAB_NEIGHBORS)
 
     def setup(self, vehicles: list) -> None:
-        initial_state = _synchronize_initial_models(vehicles)
+        initial_state = vehicles[0].model.state_dict() if vehicles else {}
         zero_public = {
             key: tensor.clone().zero_() if tensor.is_floating_point() else tensor.clone()
             for key, tensor in initial_state.items()

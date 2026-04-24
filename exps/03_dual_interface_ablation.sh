@@ -25,7 +25,7 @@ EXPERIMENTS+=("$LAST_EXPERIMENT_DIR")
 
 run_wrapped_experiment \
   "DANTE PC5 only" \
-  "from algorithms.dante import config as dante_config; dante_config.MAX_INTERNET_NEIGHBORS = 0; config.INTERNET_RANGE = 0.0" \
+  "from algorithms.dante import config as dante_config; dante_config.MAX_INTERNET_NEIGHBORS = 0" \
   "${COMMON_ARGS[@]}"
 relabel_experiment "$LAST_EXPERIMENT_DIR" "DANTE-PC5"
 EXPERIMENTS+=("$LAST_EXPERIMENT_DIR")

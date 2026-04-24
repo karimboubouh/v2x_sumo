@@ -30,7 +30,7 @@ class LoggingArtifactsTests(unittest.TestCase):
             args = parse_args()
         self.assertFalse(args.save_logs)
 
-    def test_logger_file_sink_writes_plain_filtered_text(self):
+    def test_logger_file_sink_writes_all_levels_even_when_console_filtered(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = os.path.join(tmpdir, "run.log")
             logger.set_level("info")
@@ -38,6 +38,7 @@ class LoggingArtifactsTests(unittest.TestCase):
             logger.log("hello world", "info")
             logger.log("details continue")
             logger.log("hidden debug", "debug")
+            logger.log("debug details continue")
             logger.stop_file_logging()
 
             with open(log_path, "r", encoding="utf-8") as fh:
@@ -45,7 +46,9 @@ class LoggingArtifactsTests(unittest.TestCase):
 
         self.assertEqual(lines[0], "[INFO] hello world")
         self.assertEqual(lines[1], f"{' ' * 10}details continue")
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[2], "[DEBUG] hidden debug")
+        self.assertEqual(lines[3], f"{' ' * 10}debug details continue")
+        self.assertEqual(len(lines), 4)
         self.assertNotIn("\033", "\n".join(lines))
 
     def test_prepare_and_save_experiment_reuse_same_folder_and_log_path(self):

@@ -8,7 +8,6 @@ and background training. Position updates come from SUMO TraCI
 Adapted from v2x_sim/env.py.
 """
 
-import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
@@ -29,6 +28,7 @@ from dl.helpers import (
     inet_tx_time_s,
     sl_tx_energy_j,
     sl_tx_time_s,
+    synchronize_vehicle_initial_models,
     tx_payload_bits,
 )
 from dl.vehicle import Vehicle
@@ -52,7 +52,7 @@ class DLEnvironment:
     Public attributes
     -----------------
     vehicles    : list of Vehicle
-    tr_round    : max completed training rounds across all vehicles
+    tr_round    : synchronized completed training round across all vehicles
     global_loss : avg current_loss across all vehicles
     global_acc  : avg current_acc across all vehicles
 
@@ -81,6 +81,8 @@ class DLEnvironment:
         """
         self.step_n = 0
         self.tr_round = 0
+        self.max_tr_round = 0
+        self.round_skew = 0
         self._event_stream = event_stream
         self._last_sim_time = 0.0
         self._wall_started = time.perf_counter()
@@ -135,6 +137,7 @@ class DLEnvironment:
             )
             for i in range(n)
         ]
+        self._apply_initial_model_policy()
 
         # Mark Byzantine adversaries (Gaussian-noise weight poisoners).
         byz_frac = float(getattr(config, "BYZANTINE_FRACTION", 0.0))
@@ -253,10 +256,10 @@ class DLEnvironment:
                 f" | {self.eval_label} loss={self.init_eval_loss:.4f} ± {self.init_eval_loss_std:.4f}"
                 f" | {self.eval_label} acc={self.init_eval_acc:.2%} ± {self.init_eval_acc_std:.2%}"
             )
-        print(
-            f" -> Initial model (before training) — loss={self.global_loss:.4f} | "
-            f"acc={self.global_acc:.2%}{_init_eval}",
-            file=sys.stderr,
+        logger.log(
+            f"Initial model (before training) | Loss: {self.global_loss:.4f} | "
+            f"Acc: {self.global_acc:.2%}{_init_eval}",
+            "result",
         )
 
         # ── Initial synchronous DPL training round ────────────────────────────
@@ -277,23 +280,26 @@ class DLEnvironment:
 
     # ── Topology ──────────────────────────────────────────────────────────────
 
+    def _apply_initial_model_policy(self) -> None:
+        """Optionally align all vehicles to one shared random initialization."""
+        if bool(getattr(config, "SHARED_INITIAL_MODEL", False)):
+            synchronize_vehicle_initial_models(self.vehicles)
+
     def neighbors_of(self, v: Vehicle) -> list:
         """
-        Return list of (Vehicle, distance_m, link_type) for all reachable
-        neighbors, combining sidelink and internet links.
+        Return list of (Vehicle, distance_m, link_type) candidates for vehicle
+        ``v``, combining physical sidelink discovery and internet relay links.
 
         Link preference is:
         1. use sidelink for close peers when the algorithm supports sidelink
-        2. otherwise fall back to internet for the same peer when internet is
-           supported and the peer passes the internet-quality filter
+        2. otherwise fall back to internet for any remaining peer when internet
+           is supported, prioritizing geographically closer peers first
 
         A peer appears at most once in the final candidate list.
         """
         v2x_range = float(config.COMM_RANGE)
-        inet_range = float(config.INTERNET_RANGE)
-        inet_thresh = float(config.INTERNET_QUALITY_THRESHOLD)
-        max_sl = int(getattr(self.algo, "max_sidelink_neighbors", 0))
-        max_inet = int(getattr(self.algo, "max_internet_neighbors", 0))
+        max_sl = max(int(getattr(self.algo, "max_sidelink_neighbors", 0)), 0)
+        max_inet = max(int(getattr(self.algo, "max_internet_neighbors", 0)), 0)
 
         close_neighbors = []
         internet_candidates = []
@@ -302,39 +308,24 @@ class DLEnvironment:
             if other.id == v.id:
                 continue
             dist = float(np.linalg.norm(v.pos - other.pos))
-            if dist > max(v2x_range, inet_range):
-                continue
 
             if dist <= v2x_range and max_sl > 0:
                 close_neighbors.append((other, dist))
-            elif dist <= inet_range and max_inet > 0:
-                quality = self._link_quality(v, other)
-                if quality >= inet_thresh:
-                    internet_candidates.append((other, dist, quality, LINK_INTERNET))
+            elif max_inet > 0:
+                internet_candidates.append((other, dist))
 
         close_neighbors.sort(key=lambda x: x[1])
         sidelink = [
             (other, dist, LINK_SIDELINK)
-            for other, dist in close_neighbors[:max(max_sl, 0)]
+            for other, dist in close_neighbors[:max_sl]
         ]
 
-        close_overflow = (
-            close_neighbors[max_sl:]
-            if max_sl > 0
-            else close_neighbors
-        )
         if max_inet > 0:
-            for other, dist in close_overflow:
-                if dist > inet_range:
-                    continue
-                quality = self._link_quality(v, other)
-                if quality >= inet_thresh:
-                    internet_candidates.append((other, dist, quality, LINK_INTERNET))
-
-        internet_candidates.sort(key=lambda x: x[2], reverse=True)
+            internet_candidates.extend(close_neighbors[max_sl:])
+        internet_candidates.sort(key=lambda x: x[1])
         internet = [
             (other, dist, LINK_INTERNET)
-            for other, dist, _, lt in internet_candidates[:max_inet]
+            for other, dist in internet_candidates[:max_inet]
         ]
 
         return sidelink + internet
@@ -360,42 +351,27 @@ class DLEnvironment:
             for other, dist in close_neighbors[:max_sl]
         ]
 
-    def _link_quality(self, v: Vehicle, other: Vehicle) -> float:
-        """
-        Quality score: cosine_similarity(first_layer_params) * accuracy_other.
-        """
-        p_v = v.get_param_vec()
-        p_o = other.get_param_vec()
-        cos_sim = float(np.clip(
-            np.dot(p_v, p_o) / (np.linalg.norm(p_v) * np.linalg.norm(p_o) + 1e-8),
-            0.0, 1.0,
-        ))
-        return cos_sim * float(np.clip(other.current_reward_acc, 0.0, 1.0))
-
     def neighbor_features(self, v: Vehicle, nbrs: list) -> np.ndarray:
         """Build the algorithm-specific neighbor feature matrix from V2X beacons."""
-        feature_dim = int(getattr(self.algo, "neighbor_feature_dim", 8))
+        feature_dim = int(getattr(self.algo, "neighbor_feature_dim", 6))
         if not nbrs:
             return np.zeros((0, feature_dim), dtype=np.float32)
 
         v2x_range = float(config.COMM_RANGE)
-        inet_range = float(config.INTERNET_RANGE)
         trust_score_fn = getattr(self.algo, "get_trust_score", None)
-        retention_value_fn = getattr(self.algo, "get_retention_value", None)
+        robust_score_fn = getattr(self.algo, "get_last_robust_score", None)
         energy_cost_fn = getattr(self.algo, "feature_energy_cost", None)
         bandwidth_cost_fn = getattr(self.algo, "feature_bandwidth_cost", None)
         latency_cost_fn = getattr(self.algo, "feature_latency_cost", None)
         feats = []
-        g_v = v.get_grad_vec()
-        grad_norm_v = np.linalg.norm(g_v)
-        payload_bits = max(float(tx_payload_bits()), 1.0)
-        max_collab = max(int(getattr(self.algo, "max_collab_neighbors", 1)), 1)
+        u_v = v.get_update_vec()
+        update_norm_v = np.linalg.norm(u_v)
         default_energy_ref = max(
             float(inet_tx_energy_j()),
             float(sl_tx_energy_j(v2x_range)),
             1e-8,
         )
-        default_bandwidth_ref = payload_bits * max_collab
+        default_bandwidth_ref = max(float(tx_payload_bits()), 1e-8)
         default_latency_ref = max(
             float(inet_tx_time_s()),
             float(sl_tx_time_s(v2x_range)),
@@ -403,14 +379,11 @@ class DLEnvironment:
         )
 
         for nbr, dist, link_type in nbrs:
-            g_n = nbr.get_grad_vec()
-            grad_align = float(np.clip(
-                np.dot(g_v, g_n) / (grad_norm_v * np.linalg.norm(g_n) + 1e-8),
+            u_n = nbr.get_update_vec()
+            update_align = float(np.clip(
+                np.dot(u_v, u_n) / (update_norm_v * np.linalg.norm(u_n) + 1e-8),
                 -1.0, 1.0,
             ))
-
-            ref_range = v2x_range if link_type == LINK_SIDELINK else inet_range
-            nd = float(np.clip(dist / max(ref_range, 1.0), 0.0, 1.0))
             tx_energy = (
                 float(sl_tx_energy_j(dist))
                 if link_type == LINK_SIDELINK
@@ -425,35 +398,27 @@ class DLEnvironment:
                 energy_cost = float(energy_cost_fn(v, link_type, dist))
             else:
                 energy_cost = float(np.clip(tx_energy / default_energy_ref, 0.0, 4.0))
-            if callable(bandwidth_cost_fn):
-                bandwidth_cost = float(bandwidth_cost_fn(v, link_type, dist))
-            else:
-                bandwidth_cost = float(np.clip(payload_bits / default_bandwidth_ref, 0.0, 4.0))
             if callable(latency_cost_fn):
                 latency_cost = float(latency_cost_fn(v, link_type, dist))
             else:
                 latency_cost = float(np.clip(tx_latency / default_latency_ref, 0.0, 4.0))
 
-            dh = abs(v.heading - nbr.heading)
-            rel_mobility = float(np.clip(min(dh, 2 * np.pi - dh) / np.pi, 0.0, 1.0))
             trust = 1.0
             if callable(trust_score_fn):
                 trust = float(np.clip(trust_score_fn(v, nbr.id), 0.0, 1.0))
-            retention_value = 0.0
-            if callable(retention_value_fn):
-                retention_value = float(np.clip(retention_value_fn(v, nbr.id), 0.0, 1.0))
-
-            feats.append([
-                grad_align,
-                nd,
+            robust_score = 1.0
+            if callable(robust_score_fn):
+                robust_score = float(np.clip(robust_score_fn(v.id, nbr.id), 0.0, 1.0))
+            row = [
+                update_align,
                 energy_cost,
-                bandwidth_cost,
                 latency_cost,
-                rel_mobility,
-                link_type,
+                float(link_type),
                 trust,
-                retention_value,
-            ])
+                robust_score,
+            ]
+
+            feats.append(row)
 
         return np.array(feats, dtype=np.float32)
 
@@ -462,14 +427,19 @@ class DLEnvironment:
     def _refresh_metrics(self):
         """Recompute global_loss, global_acc, and tr_round from all vehicles.
 
-        tr_round uses max so the status bar advances whenever *any* vehicle
-        completes a new round, rather than being pinned to the slowest vehicle.
+        DANTE is evaluated in communication rounds.  A reported round therefore
+        advances only when every vehicle has completed that local round.  The
+        scheduler below allows a small bounded lead so faster clients do not
+        waste energy racing far ahead of the evaluation frontier.
         """
         valid = [v.current_loss for v in self.vehicles
                  if np.isfinite(v.current_loss)]
         self.global_loss = float(np.mean(valid)) if valid else 0.0
         self.global_acc = float(np.mean([v.current_acc for v in self.vehicles]))
-        self.tr_round = max(v.tr_rounds for v in self.vehicles)
+        rounds = [int(v.tr_rounds) for v in self.vehicles]
+        self.tr_round = min(rounds) if rounds else 0
+        self.max_tr_round = max(rounds) if rounds else 0
+        self.round_skew = self.max_tr_round - self.tr_round
 
     def _collect_energy_totals(self) -> dict:
         """Return cumulative energy totals summed across all vehicles."""
@@ -700,15 +670,18 @@ class DLEnvironment:
     def get_progress_snapshot(self) -> dict:
         """Return a render-safe DPL progress summary for the dashboard."""
         self._poll_eval_future(self._last_sim_time)
+        self._refresh_metrics()
+        stop_reason = self.get_stop_reason()
+        if stop_reason is not None:
+            self._maybe_schedule_eval(self._last_sim_time, stop_reason=stop_reason)
+            self._poll_eval_future(self._last_sim_time)
 
         max_rounds = max(int(config.MAX_TR_ROUNDS), 1)
         elapsed = max(time.perf_counter() - self._wall_started, 0.0)
         avg_round_time = elapsed / max(self.tr_round, 1)
         rounds_remaining = max(max_rounds - self.tr_round, 0)
-        # ETA uses post-init training throughput for the same frontier-round metric
-        # shown in the progress bar. This is a heuristic because "round" here is
-        # the max completed round across vehicles, not a synchronized all-vehicles
-        # barrier round.
+        # ETA uses post-init throughput for the synchronized communication-round
+        # metric shown in the progress bar.
         if self._training_rounds_done > 0:
             training_elapsed = max(time.perf_counter() - self._train_wall_start, 1e-6)
             eta_round_time = training_elapsed / self._training_rounds_done
@@ -738,6 +711,8 @@ class DLEnvironment:
             "enabled": True,
             "algorithm": str(self.algo),
             "round": self.tr_round,
+            "max_vehicle_round": self.max_tr_round,
+            "round_skew": self.round_skew,
             "max_rounds": max_rounds,
             "progress": min(self.tr_round / max_rounds, 1.0),
             "round_time": self.last_round_time or avg_round_time,
@@ -799,6 +774,8 @@ class DLEnvironment:
             "ALGORITHM": config.ALGORITHM,
             "MAX_TR_ROUNDS": config.MAX_TR_ROUNDS,
             "TARGET_ACCURACY": config.TARGET_ACCURACY,
+            "STOP_ON": getattr(config, "STOP_ON", "rounds"),
+            "SEED": getattr(config, "SEED", None),
             "EVAL_ROUNDS": config.EVAL_ROUNDS,
             "EVAL_SPLIT": self.eval_split,
             "EVALUATION_MODE": self.evaluation_mode,
@@ -807,9 +784,18 @@ class DLEnvironment:
             "ASYNC_EVAL": self.async_eval,
             "DATASET": config.DATASET,
             "MODEL_ARCH": config.MODEL_ARCH,
+            "SHARED_INITIAL_MODEL": getattr(config, "SHARED_INITIAL_MODEL", False),
             "LOCAL_LR": config.LOCAL_LR,
+            "LOCAL_LR_SCHEDULE": getattr(config, "LOCAL_LR_SCHEDULE", "constant"),
+            "LOCAL_LR_MIN": getattr(config, "LOCAL_LR_MIN", config.LOCAL_LR),
+            "LABEL_SMOOTHING": getattr(config, "LABEL_SMOOTHING", 0.0),
             "BATCH_SIZE": config.BATCH_SIZE,
             "BATCHES_PER_ROUND": config.BATCHES_PER_ROUND,
+            "MAX_ROUND_SKEW": getattr(config, "MAX_ROUND_SKEW", 1),
+            "TRAIN_AUGMENTATION_POLICY": getattr(config, "TRAIN_AUGMENTATION_POLICY", "none"),
+            "CNN_DROPOUT": getattr(config, "CNN_DROPOUT", 0.0),
+            "CNN_CHANNELS": getattr(config, "CNN_CHANNELS", 16),
+            "CNN_HIDDEN": getattr(config, "CNN_HIDDEN", 64),
             "DATA_ALPHA": config.DATA_ALPHA,
             "VALIDATION_FRACTION": config.VALIDATION_FRACTION,
             "KAPPA": config.KAPPA,
@@ -817,8 +803,6 @@ class DLEnvironment:
             "CPU_CYCLES_PER_SAMPLE": config.CPU_CYCLES_PER_SAMPLE,
             "COMPRESSION_RATIO": config.COMPRESSION_RATIO,
             "COMM_RANGE": config.COMM_RANGE,
-            "INTERNET_RANGE": config.INTERNET_RANGE,
-            "INTERNET_QUALITY_THRESHOLD": config.INTERNET_QUALITY_THRESHOLD,
             "SL_BANDWIDTH_HZ": config.SL_BANDWIDTH_HZ,
             "SL_TX_POWER_W": config.SL_TX_POWER_W,
             "SL_SNR_AT_MAX_RANGE_DB": config.SL_SNR_AT_MAX_RANGE_DB,
@@ -838,6 +822,8 @@ class DLEnvironment:
             "reward_history": list(self.reward_history),
             "summary": {
                 "final_round": self.tr_round,
+                "max_vehicle_round": snapshot.get("max_vehicle_round", self.tr_round),
+                "round_skew": snapshot.get("round_skew", 0),
                 "final_train_loss": self.global_loss,
                 "final_train_acc": self.global_acc,
                 "eval_split": self.eval_split,
@@ -904,27 +890,56 @@ class DLEnvironment:
             )
         return value
 
-    def _vehicle_is_done(self, v: Vehicle) -> bool:
-        """True when a vehicle has hit its local training stop condition.
+    def _vehicle_reached_target(self, v: Vehicle) -> bool:
+        """True when a vehicle has reached the configured local target."""
+        return (
+            str(getattr(config, "STOP_ON", "rounds")).strip().lower() == "train_acc"
+            and config.TARGET_ACCURACY <= 1.0
+            and v.current_acc >= config.TARGET_ACCURACY
+        )
 
-        Modes are mutually exclusive:
-          TARGET_ACCURACY < 1.0  → accuracy mode: stop on accuracy, ignore MAX_TR_ROUNDS
-          TARGET_ACCURACY ≥ 1.0  → rounds mode:   stop on MAX_TR_ROUNDS, ignore accuracy
-          MAX_TR_ROUNDS = 0      → no round cap (only meaningful in rounds mode; in
-                                   accuracy mode MAX_TR_ROUNDS is already ignored)
+    def _vehicle_reached_round_cap(self, v: Vehicle) -> bool:
+        """True when a vehicle has reached the configured training-round cap."""
+        return config.MAX_TR_ROUNDS > 0 and v.tr_rounds >= config.MAX_TR_ROUNDS
+
+    def _vehicle_is_done(self, v: Vehicle) -> bool:
+        """True when either local stop condition has been met.
+
+        Accuracy and round count are independent stop conditions.  A finite
+        round cap must remain active even when target-accuracy early stopping is
+        enabled, otherwise asynchronous training can continue past ``--rounds``
+        when the target is not reached.
         """
-        if config.TARGET_ACCURACY < 1.0:
-            return v.current_acc >= config.TARGET_ACCURACY
-        if config.MAX_TR_ROUNDS > 0:
-            return v.tr_rounds >= config.MAX_TR_ROUNDS
-        return False  # both sentinels disabled — never auto-stops
+        return self._vehicle_reached_target(v) or self._vehicle_reached_round_cap(v)
+
+    def _eval_reached_target(self) -> bool:
+        """True when configured evaluation accuracy has reached the target."""
+        return (
+            str(getattr(config, "STOP_ON", "rounds")).strip().lower() == "eval_acc"
+            and config.TARGET_ACCURACY <= 1.0
+            and self.eval_acc is not None
+            and float(self.eval_acc) >= float(config.TARGET_ACCURACY)
+        )
 
     def get_stop_reason(self) -> str | None:
         """Human-readable explanation when a DPL stop condition has been met."""
-        if all(self._vehicle_is_done(v) for v in self.vehicles):
-            if config.TARGET_ACCURACY < 1.0:
-                return f"all vehicles reached target accuracy ({config.TARGET_ACCURACY:.2%})"
+        stop_mode = str(getattr(config, "STOP_ON", "rounds")).strip().lower()
+        if self._eval_reached_target():
+            return (
+                f"{self.eval_label.lower()} reached target accuracy "
+                f"({float(self.eval_acc):.2%} >= {config.TARGET_ACCURACY:.2%})"
+            )
+
+        if all(self._vehicle_reached_round_cap(v) for v in self.vehicles):
             return f"all vehicles completed {config.MAX_TR_ROUNDS} training rounds"
+
+        if stop_mode == "train_acc" and all(self._vehicle_is_done(v) for v in self.vehicles):
+            if all(self._vehicle_reached_target(v) for v in self.vehicles):
+                return f"all vehicles reached target accuracy ({config.TARGET_ACCURACY:.2%})"
+            return (
+                f"all vehicles reached target accuracy ({config.TARGET_ACCURACY:.2%}) "
+                f"or completed {config.MAX_TR_ROUNDS} training rounds"
+            )
         return None
 
     def is_done(self) -> bool:
@@ -1123,11 +1138,17 @@ class DLEnvironment:
         self._poll_eval_future(sim_time)
         prev_tr_round = self.tr_round
         transitions = {}
+        rewards = {}
 
         # 1. Update positions from SUMO
         for v in self.vehicles:
             if v.sumo_id in vehicle_states:
                 v.update_from_sumo(vehicle_states[v.sumo_id], sim_time)
+
+        # RL algorithms whose aggregation feedback belongs to the just-finished
+        # local round must consume it before the next selection can overwrite it.
+        if bool(getattr(self.algo, "finalize_rewards_before_selection", False)):
+            rewards.update(self.algo.post_step(self.vehicles, {}, self.step_n))
 
         # 2. Select neighbors (algorithm decides)
         for v in self.vehicles:
@@ -1166,14 +1187,22 @@ class DLEnvironment:
         self._maybe_schedule_eval(sim_time, stop_reason=stop_reason)
 
         if stop_reason is None:
+            round_frontier = min((v.tr_rounds for v in self.vehicles), default=0)
+            max_round_skew = max(int(getattr(config, "MAX_ROUND_SKEW", 1)), 1)
             for v in self.vehicles:
-                if v.training_done.is_set() and not self._vehicle_is_done(v):
+                if (
+                    v.training_done.is_set()
+                    and not self._vehicle_is_done(v)
+                    and not self._vehicle_reached_round_cap(v)
+                    and int(v.tr_rounds) < int(round_frontier) + max_round_skew
+                ):
                     v.prepare_training_round(sim_time, self._build_peer_transfers(v))
                     v.training_done.clear()
                     self.executor.submit(v.train_local)
 
         # 5. Rewards (no-op for non-RL algorithms)
-        rewards = self.algo.post_step(self.vehicles, transitions, self.step_n)
+        post_rewards = self.algo.post_step(self.vehicles, transitions, self.step_n)
+        rewards.update(post_rewards)
         self._record_reward_metrics(rewards)
 
         new_eval_data = self._last_eval_round > prev_eval_round

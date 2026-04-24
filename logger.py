@@ -58,7 +58,7 @@ def set_level(level: str):
 
 
 def start_file_logging(path: str) -> None:
-    """Begin mirroring logger.log(...) output to a plain-text file."""
+    """Begin mirroring all logger.log(...) output to a plain-text file."""
     global _file_handle, _file_path
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with _bar_lock:
@@ -106,9 +106,7 @@ def log(message: str, type: str = None):
             type = "info"
         _last_type = type
         level_info = _LEVELS[type]
-
-        if level_info["severity"] < _min_severity:
-            return
+        emit_to_console = level_info["severity"] >= _min_severity
 
         color = level_info["color"]
         label = level_info["label"]
@@ -117,14 +115,15 @@ def log(message: str, type: str = None):
 
     else:
         # Continuation: inherit last type's color/filter, indent to align
-        if _LEVELS[_last_type]["severity"] < _min_severity:
-            return
+        emit_to_console = _LEVELS[_last_type]["severity"] >= _min_severity
         color = _LEVELS[_last_type]["color"]
         text = f"{color}{' ' * _INDENT}{message}{_RESET}"
         file_text = f"{' ' * _INDENT}{message}"
 
     with _bar_lock:
         _write_file_log_line(file_text)
+        if not emit_to_console:
+            return
         if _bar_active and _bar_tty:
             # Erase bar line, print log line, redraw bar underneath
             sys.stdout.write(f"\r\033[K{text}\n")

@@ -280,12 +280,104 @@ def _warn_mixed_evaluation_modes(experiments: list[dict], labels: list[str]) -> 
         print(warning, file=sys.stderr)
 
 
+def _normalized_algo_name(experiment: dict) -> str:
+    return re.sub(
+        r"[^a-z0-9]+",
+        "",
+        str(experiment.get("metadata", {}).get("algorithm", "")).strip().lower(),
+    )
+
+
+def _comparison_summary_lines(experiments: list[dict], labels: list[str]) -> tuple[list[str], list[str]]:
+    lines = ["Comparison summary"]
+    warnings = []
+    by_algo = {
+        _normalized_algo_name(experiment): experiment
+        for experiment in experiments
+    }
+
+    for label, experiment in zip(labels, experiments):
+        summary = dict(experiment.get("summary", {}))
+        energy_totals = dict(experiment.get("energy_totals", {}))
+        line = (
+            f"- {label}: final test acc {100.0 * float(summary.get('final_test_acc', 0.0)):.2f}%"
+            f", rounds-to-target {summary.get('rounds_to_target')}"
+            f", TX energy {float(energy_totals.get('total_tx_energy_j', 0.0)):.2f} J"
+        )
+        diagnostics = dict(experiment.get("diagnostics", {}))
+        if diagnostics:
+            late_reward = diagnostics.get("late_round_mean_reward")
+            late_adv = diagnostics.get("late_round_collaboration_advantage")
+            useful_rate = diagnostics.get("useful_selection_rate")
+            retained_reuse = diagnostics.get("retained_positive_reuse_rate")
+            if late_reward is not None:
+                line += f", late reward {float(late_reward):+.4f}"
+            if late_adv is not None:
+                line += f", late collab adv {float(late_adv):+.4f}"
+            if useful_rate is not None:
+                line += f", useful selection {100.0 * float(useful_rate):.1f}%"
+            if retained_reuse is not None:
+                line += f", retained positive reuse {100.0 * float(retained_reuse):.1f}%"
+        lines.append(line)
+
+    dante = by_algo.get("dante")
+    local_only = by_algo.get("localonly")
+    if dante is not None and local_only is not None:
+        dante_acc = float(dante.get("summary", {}).get("final_test_acc", 0.0))
+        local_acc = float(local_only.get("summary", {}).get("final_test_acc", 0.0))
+        if dante_acc < local_acc:
+            warnings.append(
+                "WARNING: DANTE finished below Local Only on final personalized test accuracy."
+            )
+
+    if dante is not None:
+        diagnostics = dict(dante.get("diagnostics", {}))
+        late_reward = float(diagnostics.get("late_round_mean_reward", 0.0))
+        late_adv = float(diagnostics.get("late_round_collaboration_advantage", 0.0))
+        selected_total = int(diagnostics.get("selected_total_peers", 0))
+        selected_internet = int(diagnostics.get("selected_internet", 0))
+        retained_offered = int(diagnostics.get("retained_offered", 0))
+        if selected_total == 0:
+            warnings.append(
+                "WARNING: DANTE selected zero peers; this is a degenerate no-collaboration run."
+            )
+        if selected_internet == 0:
+            warnings.append(
+                "WARNING: DANTE selected zero Internet peers; retention/Uu reuse did not activate."
+            )
+        if retained_offered == 0:
+            warnings.append(
+                "WARNING: DANTE offered zero retained peers; SL-to-Uu retention did not activate."
+            )
+        if late_reward < 0.0:
+            warnings.append(
+                f"WARNING: DANTE late-round mean reward is negative ({late_reward:+.4f})."
+            )
+        if late_adv <= 0.0:
+            warnings.append(
+                f"WARNING: DANTE late-round collaboration advantage is non-positive ({late_adv:+.4f})."
+            )
+        retained_selected = int(diagnostics.get("retained_selected", 0))
+        retained_skipped = int(diagnostics.get("retained_skipped", 0))
+        retained_positive_reuse = float(diagnostics.get("retained_positive_reuse_rate", 0.0))
+        if retained_skipped > retained_selected and retained_positive_reuse < 0.5:
+            warnings.append(
+                "WARNING: DANTE retained-peer positive reuse is low while skipped retained peers remain high."
+            )
+
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
+    return lines, warnings
+
+
 def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
     """Plot comparison figures for multiple saved experiments."""
     pickle_paths = [_resolve_pickle_path(folder) for folder in experiment_folders]
     experiments = [load_experiment(path) for path in pickle_paths]
     labels = _unique_algorithm_labels(experiments)
     output_dir = _comparison_dir(experiments)
+    summary_lines, summary_warnings = _comparison_summary_lines(experiments, labels)
 
     _warn_mixed_evaluation_modes(experiments, labels)
 
@@ -402,6 +494,12 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
 
     if not plotted_ppo_rounds or not plotted_ppo_time:
         print("Skipping PPO comparison plots for non-PPO selections.")
+
+    summary_text = "\n".join(summary_lines) + "\n"
+    (Path(output_dir) / "comparison_summary.txt").write_text(summary_text, encoding="utf-8")
+    print(summary_text.rstrip())
+    if summary_warnings:
+        print("\n".join(summary_warnings), file=sys.stderr)
 
     plt.show(block=block)
     print(f"Comparison figures saved to: {output_dir}")

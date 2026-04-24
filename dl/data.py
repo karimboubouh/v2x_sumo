@@ -7,16 +7,16 @@ per-vehicle non-IID shards using a Dirichlet distribution.
 Adapted from v2x_sim/fl_data.py.
 """
 
+import config
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-import config
 
 
 # ── Transforms ────────────────────────────────────────────────────────────────
 
-_TRANSFORMS = {
+_EVAL_TRANSFORMS = {
     "MNIST": transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)),
@@ -37,6 +37,30 @@ _TRANSFORMS = {
     ]),
 }
 
+_DATASET_DEFAULT_AUGMENTATIONS = {
+    "MNIST": [
+        transforms.RandomCrop(28, padding=2),
+    ],
+    "FEMNIST": [
+        transforms.RandomCrop(28, padding=2),
+    ],
+    "CIFAR10": [
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+    ],
+    "CIFAR100": [
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+    ],
+}
+
+_DATASET_DEFAULT_AUGMENTATION_DESCRIPTIONS = {
+    "MNIST": "RandomCrop(28, padding=2)",
+    "FEMNIST": "RandomCrop(28, padding=2)",
+    "CIFAR10": "RandomCrop(32, padding=4) + RandomHorizontalFlip()",
+    "CIFAR100": "RandomCrop(32, padding=4) + RandomHorizontalFlip()",
+}
+
 
 def _build_femnist(root: str, train: bool, download: bool, transform):
     """Use torchvision EMNIST byclass split as the FEMNIST-compatible source."""
@@ -55,6 +79,74 @@ _BUILDERS = {
     "CIFAR10": datasets.CIFAR10,
     "CIFAR100": datasets.CIFAR100,
 }
+
+
+def _get_eval_transform(dataset_name: str):
+    """Return the deterministic transform used for evaluation and test splits."""
+    return _EVAL_TRANSFORMS[dataset_name]
+
+
+def _get_train_transform(dataset_name: str):
+    """Return the training transform based on the configured augmentation policy."""
+    policy = str(getattr(config, "TRAIN_AUGMENTATION_POLICY", "none")).strip().lower()
+    eval_transform = _get_eval_transform(dataset_name)
+    if policy == "none":
+        return eval_transform
+    if policy == "dataset_default":
+        return transforms.Compose([
+            *_DATASET_DEFAULT_AUGMENTATIONS[dataset_name],
+            *list(eval_transform.transforms),
+        ])
+    raise ValueError(
+        "Unsupported TRAIN_AUGMENTATION_POLICY "
+        f"{getattr(config, 'TRAIN_AUGMENTATION_POLICY', None)!r}. "
+        "Expected 'none' or 'dataset_default'."
+    )
+
+
+def describe_train_augmentation(dataset_name: str) -> str:
+    """Return a human-readable description of the active training augmentation policy."""
+    policy = str(getattr(config, "TRAIN_AUGMENTATION_POLICY", "none")).strip().lower()
+    if policy == "none":
+        return "none"
+    if policy == "dataset_default":
+        return (
+            "dataset_default: "
+            f"{_DATASET_DEFAULT_AUGMENTATION_DESCRIPTIONS[dataset_name]}"
+        )
+    raise ValueError(
+        "Unsupported TRAIN_AUGMENTATION_POLICY "
+        f"{getattr(config, 'TRAIN_AUGMENTATION_POLICY', None)!r}. "
+        "Expected 'none' or 'dataset_default'."
+    )
+
+
+def _build_dataset(
+    dataset_name: str,
+    *,
+    root: str,
+    train: bool,
+    download: bool,
+    transform,
+):
+    """Instantiate a torchvision dataset builder with a specific transform view."""
+    builder = _BUILDERS[dataset_name]
+    return builder(
+        root=root,
+        train=train,
+        download=download,
+        transform=transform,
+    )
+
+
+def _loader_generator(offset: int = 0):
+    """Return a per-loader generator when global seeding is enabled."""
+    seed = getattr(config, "SEED", None)
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(offset))
+    return generator
 
 
 def _get_labels(dataset) -> np.ndarray:
@@ -198,11 +290,24 @@ def partition_dataset(dataset_name: str, n_vehicles: int,
             shared_test_loader,
         )
     """
-    tf = _TRANSFORMS[dataset_name]
-    cls = _BUILDERS[dataset_name]
+    train_tf = _get_train_transform(dataset_name)
+    eval_tf = _get_eval_transform(dataset_name)
 
-    full_dataset = cls(root=data_root, train=True, download=True, transform=tf)
-    labels = _get_labels(full_dataset)
+    train_dataset = _build_dataset(
+        dataset_name,
+        root=data_root,
+        train=True,
+        download=True,
+        transform=train_tf,
+    )
+    train_eval_dataset = _build_dataset(
+        dataset_name,
+        root=data_root,
+        train=True,
+        download=True,
+        transform=eval_tf,
+    )
+    labels = _get_labels(train_eval_dataset)
     n_classes = int(labels.max()) + 1
 
     class_indices = {c: np.where(labels == c)[0].tolist() for c in range(n_classes)}
@@ -226,25 +331,43 @@ def partition_dataset(dataset_name: str, n_vehicles: int,
     for v in range(n_vehicles):
         indices = list(vehicle_indices[v])
         if not indices:
-            indices = np.random.choice(len(full_dataset), 50, replace=False).tolist()
+            fallback_count = min(50, len(train_eval_dataset))
+            indices = (
+                np.random.choice(len(train_eval_dataset), fallback_count, replace=False).tolist()
+                if fallback_count > 0
+                else []
+            )
         np.random.shuffle(indices)
         client_reference_indices.append(list(indices))
         train_indices, val_indices = _split_train_validation_indices(indices)
 
-        train_subset = Subset(full_dataset, train_indices)
-        val_subset = Subset(full_dataset, val_indices)
+        train_subset = Subset(train_dataset, train_indices)
+        train_eval_subset = Subset(train_eval_dataset, train_indices)
+        val_subset = Subset(train_eval_dataset, val_indices)
 
         train_loaders.append(
-            DataLoader(train_subset, batch_size=batch_size, shuffle=True, drop_last=False)
+            DataLoader(
+                train_subset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=False,
+                generator=_loader_generator(1000 + v),
+            )
         )
         train_eval_loaders.append(
-            DataLoader(train_subset, batch_size=256, shuffle=False, drop_last=False)
+            DataLoader(train_eval_subset, batch_size=256, shuffle=False, drop_last=False)
         )
         val_loaders.append(
             DataLoader(val_subset, batch_size=256, shuffle=False, drop_last=False)
         )
 
-    test_ds = cls(root=data_root, train=False, download=True, transform=tf)
+    test_ds = _build_dataset(
+        dataset_name,
+        root=data_root,
+        train=False,
+        download=True,
+        transform=eval_tf,
+    )
     test_labels = _get_labels(test_ds)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
 

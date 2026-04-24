@@ -37,7 +37,7 @@ A real-time **Vehicle-to-Vehicle (V2V) communication simulator** built on top of
 - **Physics-based V2V link model** — log-distance path loss, RSSI, SNR, and delivery probability
 - **Decentralized Personalized Learning** — each vehicle trains a personalized PyTorch model on its own non-IID data partition, without sharing raw data
 - **Three DPL algorithms** — FedAvg (static graph baseline), D-PSGD (Metropolis-Hastings gossip), DPFL (Greedy Graph Construction for personalization)
-- **Two wireless link types** — 5G PC5 sidelink (D2D, short range) and Internet relay (long range, quality-filtered)
+- **Two wireless link types** — 5G PC5 sidelink (D2D, short range) and Internet relay (cloud-routed, network-wide)
 - **Background training** — training runs in a ThreadPoolExecutor, never blocking the render loop
 - **Five UAE road scenarios** — marina, highway, coastal, campus, circuit
 - **Fully gated behind `--dl`** — without the flag the app is a pure V2V simulator with zero PyTorch overhead (the `--dl` flag name is kept for brevity in the CLI)
@@ -308,10 +308,10 @@ When `--dl` is passed:
 
 | Type | Constant | Range | Use case |
 |---|---|---|---|
-| 5G PC5 Sidelink | `LINK_SIDELINK = 0.0` | <= 250 m | Direct D2D, low latency |
-| Internet relay | `LINK_INTERNET = 1.0` | <= 2000 m | Cloud-routed, quality-filtered |
+| 5G PC5 Sidelink | `LINK_SIDELINK = 0.0` | <= `COMM_RANGE` | Direct D2D, low latency |
+| Internet relay | `LINK_INTERNET = 1.0` | Network-wide | Cloud-routed, proximity-prioritized when capped |
 
-Internet links are only established when their quality score (cosine similarity of model parameters x neighbor accuracy) exceeds `INTERNET_QUALITY_THRESHOLD` (default `0.45`).
+Internet links are not distance- or quality-gated. For dynamic algorithms that use the default environment discovery path, every peer not already taken as a sidelink candidate is internet-eligible, and the environment trims internet candidates nearest-first using `MAX_INTERNET_NEIGHBORS`.
 
 ### Algorithms
 
@@ -620,13 +620,12 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 |---|---|---|
 | `COMM_RANGE` | `250` | Sidelink D2D range in meters |
 | `MAX_SIDELINK_NEIGHBORS` | `5` | Max sidelink candidates kept after distance ranking |
-| `INTERNET_RANGE` | `2000` | Max distance for internet relay links |
-| `MAX_INTERNET_NEIGHBORS` | `3` | Max internet candidates kept after quality ranking |
+| `MAX_INTERNET_NEIGHBORS` | `3` | Max internet candidates kept after proximity ranking |
 | `MAX_COLLAB_NEIGHBORS` | `5` | Max peers an FL algorithm may aggregate with |
-| `INTERNET_QUALITY_THRESHOLD` | `0.45` | Minimum quality score to accept an internet peer |
 | `LOCAL_LR` | `1e-3` | Adam learning rate |
 | `BATCH_SIZE` | `32` | Mini-batch size |
 | `BATCHES_PER_ROUND` | `2` | Mini-batches processed per DPL training round |
+| `SHARED_INITIAL_MODEL` | `False` | `True` = all vehicles clone one shared random init; `False` = each vehicle keeps its own initial weights |
 | `DATA_ALPHA` | `0.3` | Dirichlet alpha (lower = more non-IID data) |
 | `MAX_TR_ROUNDS` | `100` | Hard stop after this many training rounds |
 | `TARGET_ACCURACY` | `1.01` | Stop when accuracy exceeds this (`> 1.0` = disabled) |
@@ -650,6 +649,8 @@ python main.py --scenario dubai_marina --dl --dl-algorithm RingGossip
 ## Logging
 
 The logger writes colored output to stdout. Control the minimum level with `--verbose` / `-v`:
+
+For DPL runs, `--save-logs` writes the plain-text run log to disk and captures all log levels, including `debug`, regardless of the console `--verbose` setting.
 
 | Level | Color | Typical use |
 |---|---|---|

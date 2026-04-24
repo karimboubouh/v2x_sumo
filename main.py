@@ -20,6 +20,12 @@ from simulation.sumo_manager import SumoManager
 
 def main():
     args = parse_args()
+    config.SEED = None if args.seed is None or int(args.seed) < 0 else int(args.seed)
+    config.STOP_ON = args.stop_on
+    if config.SEED is not None:
+        from dl.helpers import set_global_seed
+
+        set_global_seed(config.SEED)
     logger.set_level(args.verbose)
     if not args.headless:
         from dashboard.app import DashboardApp
@@ -83,8 +89,10 @@ def main():
         logger.log(
             "DPL stop: "
             f"rounds={args.rounds} | "
-            f"target_acc={'off' if args.target_acc > 1.0 else f'{args.target_acc:.2%}'}"
+            f"target_acc={'off' if args.target_acc > 1.0 else f'{args.target_acc:.2%}'} | "
+            f"mode={args.stop_on}"
         )
+        logger.log(f"Seed: {'off' if config.SEED is None else config.SEED}", "info")
     else:
         logger.log("DPL: off")
 
@@ -139,7 +147,7 @@ def main():
         # ── DL initialization (only when --dl is passed) ──────────────
         dl_env = None
         if args.dl:
-            from dl.data import partition_dataset
+            from dl.data import describe_train_augmentation, partition_dataset
             from dl.env import DLEnvironment
 
             config.ALGORITHM = args.dl_algorithm
@@ -147,6 +155,7 @@ def main():
             config.MODEL_ARCH = args.dl_model
             config.MAX_TR_ROUNDS = args.rounds
             config.TARGET_ACCURACY = args.target_acc
+            config.STOP_ON = args.stop_on
 
             logger.log(f"Partitioning {args.dl_dataset} (non-IID) for {args.num_vehicles} vehicles...", "info")
             sumo_ids = [f"mv_{i}" for i in range(args.num_vehicles)]
@@ -171,6 +180,10 @@ def main():
             logger.log(
                 f"DPL ready: {args.dl_algorithm} | {args.dl_dataset}/{args.dl_model} | {args.num_vehicles} vehicles",
                 "success",
+            )
+            logger.log(
+                f"Train augmentation: {describe_train_augmentation(config.DATASET)}",
+                "info",
             )
             logger.log(
                 f"Evaluation: {dl_env.eval_label} split | mode={dl_env.evaluation_mode}",

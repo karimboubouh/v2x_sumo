@@ -5,6 +5,7 @@ Adapted from v2x_sim/helpers.py.
 """
 
 import math
+import random
 
 import numpy as np
 import torch
@@ -12,6 +13,21 @@ import torch.nn as nn
 
 import config
 from dl.models import build_model
+
+
+def set_global_seed(seed: int | None) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for reproducible experiments."""
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 
 def _resolve_eval_batch_limit() -> int | None:
@@ -123,6 +139,23 @@ def eval_vehicles(vehicles, eval_loaders) -> dict:
 def clone_state_dict(state_dict: dict) -> dict:
     """Clone a model state_dict using tensor.clone() instead of deepcopy."""
     return {k: v.clone() for k, v in state_dict.items()}
+
+
+def synchronize_vehicle_initial_models(vehicles: list) -> dict:
+    """Clone the first vehicle's initial weights across every vehicle."""
+    if not vehicles:
+        return {}
+
+    anchor_state = clone_state_dict(vehicles[0].model.state_dict())
+    for vehicle in vehicles:
+        vehicle.model.load_state_dict(anchor_state)
+        vehicle._shared_weights = clone_state_dict(anchor_state)
+        vehicle._ref_weights = clone_state_dict(anchor_state)
+        if hasattr(vehicle, "_zero_update_state"):
+            vehicle._shared_update = vehicle._zero_update_state(anchor_state)
+        vehicle.shared_weights_bytes = vehicle._state_dict_nbytes(anchor_state)
+        vehicle._param_vec = None
+    return anchor_state
 
 
 def _inf_loader(loader):

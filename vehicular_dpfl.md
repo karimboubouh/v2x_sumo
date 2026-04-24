@@ -60,10 +60,10 @@ Link modes
   Sidelink Direct 5G-NR V2X sidelink (PC5 interface). Available when
             distance ≤ V2X_RANGE. Low latency, low cost.
 
-  Internet Indirect 5G uplink → cloud → downlink path. Available when
-            V2X_RANGE < distance ≤ INTERNET_RANGE and the neighbor's
-            quality score exceeds INTERNET_QUALITY_THRESHOLD. Higher
-            transmission cost but keeps high-quality distant neighbors.
+  Internet Indirect 5G uplink → cloud → downlink path. Available for
+            any peer not already selected over sidelink. Higher
+            transmission cost, with nearer peers prioritized when the
+            per-step internet candidate budget is exceeded.
         
 
 Two types of V2X links are modelled:
@@ -74,12 +74,13 @@ Two types of V2X links are modelled:
     Closer vehicles → higher SNR → higher throughput → less energy.
 
   Internet (link_type = 1)
-    5G uplink → cloud → downlink path (Uu interface).  Available when
-    V2X_RANGE < d ≤ INTERNET_RANGE  AND  the neighbor's quality score
-    (cosine_sim × accuracy) ≥ INTERNET_QUALITY_THRESHOLD.
+    5G uplink → cloud → downlink path (Uu interface). Available for
+    any peer not already selected over sidelink; peer-to-peer distance
+    does not gate eligibility.
     TX cost is fixed (vehicle-to-vehicle distance is irrelevant — the link
     goes UE → nearest BS → cloud → BS → UE).
-    Capped at MAX_INTERNET_NEIGHBORS per vehicle per step.
+    Capped at MAX_INTERNET_NEIGHBORS per vehicle per step, with nearer
+    peers prioritized when trimming the candidate set.
 ```
 
 

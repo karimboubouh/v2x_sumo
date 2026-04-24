@@ -52,7 +52,7 @@ def parse_args():
         action="store_true",
         default=config.SAVE_LOGS,
         dest="save_logs",
-        help="Save plain logger output into out/<experiment_id>/run.log for DPL runs",
+        help="Save all plain logger output into out/<experiment_id>/run.log for DPL runs, regardless of --verbose",
     )
     parser.add_argument(
         "--headless",
@@ -65,6 +65,12 @@ def parse_args():
         metavar="PKL",
         dest="plot_experiment",
         help="Load a saved DPL experiment pickle, regenerate the plots, and show them",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=config.SEED,
+        help=f"Reproducibility seed; pass a negative value to leave RNGs unseeded (default: {config.SEED})",
     )
     # ── Decentralized Personalized Learning ────────────────────────────────
     parser.add_argument(
@@ -106,5 +112,12 @@ def parse_args():
         default=config.TARGET_ACCURACY,
         metavar="TARGET_ACC",
         help=f"Target accuracy for automatic stop (default: {config.TARGET_ACCURACY})",
+    )
+    parser.add_argument(
+        "--stop-on",
+        default=config.STOP_ON,
+        choices=["rounds", "train_acc", "eval_acc"],
+        dest="stop_on",
+        help=f"DPL stop criterion: rounds, train_acc, or eval_acc (default: {config.STOP_ON})",
     )
     return parser.parse_args()
