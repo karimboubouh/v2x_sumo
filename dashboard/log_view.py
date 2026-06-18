@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from itertools import islice
 
 from PySide6.QtCore import Qt, QTimer, QRect, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
@@ -110,7 +111,7 @@ class _LogCanvas(QWidget):
         start = max(n_total - n_visible - self._scroll_offset, 0)
         end   = min(start + n_visible, n_total)
 
-        visible = list(self._entries)[start:end]
+        visible = list(islice(self._entries, start, end))
 
         painter.setFont(self.font())
         y = 4

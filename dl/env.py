@@ -750,14 +750,17 @@ class DLEnvironment:
 
         self._dispatch_pending_eval(sim_time)
 
+    def service_background_eval(self, sim_time: float | None = None, stop_reason: str | None = None) -> None:
+        """Poll/schedule evaluation jobs without building a progress snapshot."""
+        self._poll_eval_future(sim_time)
+        if stop_reason is not None:
+            self._maybe_schedule_eval(self._last_sim_time if sim_time is None else sim_time, stop_reason=stop_reason)
+            self._poll_eval_future(sim_time)
+
     def get_progress_snapshot(self) -> dict:
         """Return a render-safe DPL progress summary for the dashboard."""
-        self._poll_eval_future(self._last_sim_time)
         self._refresh_metrics()
         stop_reason = self.get_stop_reason()
-        if stop_reason is not None:
-            self._maybe_schedule_eval(self._last_sim_time, stop_reason=stop_reason)
-            self._poll_eval_future(self._last_sim_time)
 
         max_rounds = max(int(config.MAX_TR_ROUNDS), 1)
         elapsed = max(time.perf_counter() - self._wall_started, 0.0)
@@ -1329,5 +1332,4 @@ class DLEnvironment:
             "done": stop_reason is not None,
             "stop_reason": stop_reason,
             **self._count_active_collaboration_links(),
-            "training_status": self.get_progress_snapshot(),
         }

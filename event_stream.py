@@ -33,3 +33,8 @@ class EventStream:
         with self._lock:
             n = min(max_items, len(self._events))
             return [self._events.popleft() for _ in range(n)]
+
+    def depth(self) -> int:
+        """Return the current buffered event count."""
+        with self._lock:
+            return len(self._events)

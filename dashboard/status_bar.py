@@ -6,6 +6,7 @@ import time
 
 import psutil
 
+import config
 from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import QWidget, QSizePolicy
@@ -28,6 +29,7 @@ class StatusWidget(QWidget):
         self._cpu  = 0.0
         self._mem_mb = 0.0
         self._gpu: float | None = None
+        self._sample_gpu_enabled = bool(getattr(config, "STATUS_SAMPLE_GPU", False))
 
         self._elapsed_frozen: float | None = None
 
@@ -55,7 +57,7 @@ class StatusWidget(QWidget):
     def _sample_metrics(self) -> None:
         self._cpu    = self._process.cpu_percent()
         self._mem_mb = self._process.memory_info().rss / (1024 * 1024)
-        self._gpu    = self._sample_gpu()
+        self._gpu    = self._sample_gpu() if self._sample_gpu_enabled else None
         self.update()
 
     @staticmethod

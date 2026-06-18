@@ -186,6 +186,8 @@ BYZANTINE_LIE_Z: float = 1.0
 
 # ── Concurrency ──────────────────────────────────────────
 N_TRAIN_WORKERS = 8
+TORCH_NUM_THREADS = 1
+TORCH_NUM_INTEROP_THREADS = 1
 
 # ── Logging ──────────────────────────────────────────────
 LOG_LEVEL = "info"  # Console logging: minimum level (debug | info | success | result | warning | error)
@@ -207,6 +209,7 @@ STATUS_BAR_HEIGHT = 56  # Bottom status bar height (pixels)
 
 # ── Rendering ────────────────────────────────────────────
 FPS = 120  # Main-loop render cap in frames per second
+UI_FPS = 60  # Dashboard refresh rate when simulation runs in a worker thread
 DPI_SCALE = 1.0  # Manual DPI hint (1.0 = auto; 2.0 forces HiDPI scaling tweaks)
 FL_LABEL_MIN_ZOOM = 3.0  # Minimum zoom multiple at which α labels appear on DL links
 
@@ -214,4 +217,6 @@ FL_LABEL_MIN_ZOOM = 3.0  # Minimum zoom multiple at which α labels appear on DL
 THEME_MODE = "system"  # "dark", "light", or "system"
 FONT_SIZE_LOG = 12  # Base font size for the log panel (pt)
 FONT_SIZE_MAP = 11  # Base font size for map UI elements
-LOG_MAX_LINES = None  # Keep the full message log from the start of the simulation
+LOG_MAX_LINES = 2000  # Bounded dashboard log; use --save-logs for full run logs
+LOG_DRAIN_HZ = 10  # Max dashboard log-drain frequency
+STATUS_SAMPLE_GPU = False  # macOS ioreg sampling is too expensive for the GUI thread

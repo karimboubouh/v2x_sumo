@@ -2,7 +2,6 @@
 
 import argparse
 import config
-from algorithms import get_available_algorithms
 
 
 def parse_args():
@@ -72,6 +71,39 @@ def parse_args():
         default=config.SEED,
         help=f"Reproducibility seed; pass a negative value to leave RNGs unseeded (default: {config.SEED})",
     )
+    parser.add_argument(
+        "--perf-log",
+        action="store_true",
+        help="Log lightweight runtime performance metrics every few seconds",
+    )
+    parser.add_argument(
+        "--ui-fps",
+        type=int,
+        default=config.UI_FPS,
+        metavar="FPS",
+        help=f"Dashboard refresh rate when graphics are enabled (default: {config.UI_FPS})",
+    )
+    parser.add_argument(
+        "--train-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override DPL training worker threads; dashboard mode defaults to a conservative CPU cap",
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Override torch intra-op threads for DPL runs (default: {config.TORCH_NUM_THREADS})",
+    )
+    parser.add_argument(
+        "--torch-interop-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Override torch inter-op threads for DPL runs (default: {config.TORCH_NUM_INTEROP_THREADS})",
+    )
     # ── Decentralized Personalized Learning ────────────────────────────────
     parser.add_argument(
         "--dl",
@@ -81,7 +113,6 @@ def parse_args():
     parser.add_argument(
         "--dl-algorithm",
         default=config.ALGORITHM,
-        choices=get_available_algorithms(),
         dest="dl_algorithm",
         help=f"DPL algorithm (default: {config.ALGORITHM})",
     )
@@ -121,3 +152,18 @@ def parse_args():
         help=f"DPL stop criterion: rounds, train_acc, or eval_acc (default: {config.STOP_ON})",
     )
     return parser.parse_args()
+
+
+def validate_args(args) -> None:
+    """Validate options whose choices require delayed optional imports."""
+    if not getattr(args, "dl", False):
+        return
+
+    from algorithms import get_available_algorithms
+
+    available = get_available_algorithms()
+    if args.dl_algorithm not in available:
+        choices = ", ".join(available)
+        raise ValueError(
+            f"Unknown DPL algorithm {args.dl_algorithm!r}. Available: {choices}"
+        )

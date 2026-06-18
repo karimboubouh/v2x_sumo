@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -85,6 +86,7 @@ class DashboardApp:
         training_status=None,
         vehicle_overlays=None,
         log_links=None,
+        process_events: bool = True,
     ) -> bool:
         """
         Push one simulation frame to the dashboard and process Qt events.
@@ -103,8 +105,81 @@ class DashboardApp:
             log_links       = log_links,
         )
 
-        self._app.processEvents()
+        if process_events:
+            self._app.processEvents()
         return not self._closed
+
+    def run_with_runtime(self, runtime, event_stream, ui_fps: int, event_drain_batch: int) -> int:
+        """Run Qt's native event loop while polling a background runtime."""
+        if self._app is None:
+            raise RuntimeError("DashboardApp.initialize() must be called before run_with_runtime().")
+
+        interval_ms = max(int(1000 / max(int(ui_fps), 1)), 1)
+        log_interval = 1.0 / max(int(getattr(config, "LOG_DRAIN_HZ", 10)), 1)
+        state = {
+            "version": -1,
+            "last_frame_at": None,
+            "last_log_at": 0.0,
+            "marked_done": False,
+        }
+
+        timer = QTimer()
+        timer.setInterval(interval_ms)
+
+        def _tick() -> None:
+            now = time.perf_counter()
+            if self._closed:
+                runtime.stop()
+                self._app.quit()
+                return
+
+            runtime.set_paused(self.paused)
+            version, frame = runtime.frame_buffer.latest()
+            if frame is None:
+                if not runtime.is_alive():
+                    self._app.quit()
+                return
+
+            messages = []
+            if now - state["last_log_at"] >= log_interval:
+                messages = event_stream.drain(max_items=event_drain_batch)
+                state["last_log_at"] = now
+
+            if frame.simulation_done and not state["marked_done"]:
+                self.mark_simulation_done(frame.overlay_text or "SIMULATION DONE")
+                state["marked_done"] = True
+
+            should_render = version != state["version"] or bool(messages)
+            if should_render:
+                render_started = time.perf_counter()
+                self.render(
+                    frame.vehicle_states,
+                    frame.render_links,
+                    messages,
+                    frame.sim_time,
+                    training_status=frame.training_status,
+                    vehicle_overlays=frame.vehicle_overlays,
+                    log_links=frame.log_links,
+                    process_events=False,
+                )
+                runtime.perf.record("render_s", time.perf_counter() - render_started)
+                state["version"] = version
+
+            if state["last_frame_at"] is not None:
+                runtime.perf.record("ui_frame_s", now - state["last_frame_at"])
+            state["last_frame_at"] = now
+            runtime.perf.set_latest(event_backlog=event_stream.depth())
+            runtime.perf.maybe_log()
+
+            if not runtime.is_alive():
+                self._app.quit()
+
+        timer.timeout.connect(_tick)
+        timer.start()
+        try:
+            return self._app.exec()
+        finally:
+            timer.stop()
 
     # ── Simulation done ───────────────────────────────────────────────────────
 

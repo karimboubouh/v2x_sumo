@@ -480,23 +480,6 @@ class MapWidget(QGraphicsView):
         self.setViewportUpdateMode(prev_update_mode)
         self.viewport().update()  # single repaint for the whole compound transform
 
-    def _scale_view_under_mouse(self, factor: float) -> None:
-        """Scale using Qt's native under-mouse anchor.
-
-        This path is substantially cheaper than manually re-positioning the
-        scrollbars on every wheel delta, which matters during continuous zoom.
-        """
-        new_zoom = self._zoom_level() * factor
-        if not (0.2 <= new_zoom <= 50.0):
-            return
-        prev_anchor = self.transformationAnchor()
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        try:
-            self.scale(factor, factor)
-        finally:
-            self.setTransformationAnchor(prev_anchor)
-        self.viewport().update()
-
     def reset_view(self) -> None:
         if self._base_transform:
             self.setTransform(self._base_transform)
@@ -567,7 +550,7 @@ class MapWidget(QGraphicsView):
         if delta == 0:
             return
         factor = 1.12 if delta > 0 else 1.0 / 1.12
-        self._scale_view_under_mouse(factor)
+        self._scale_view(factor, event.position().toPoint())
         event.accept()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
