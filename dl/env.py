@@ -139,16 +139,20 @@ class DLEnvironment:
         ]
         self._apply_initial_model_policy()
 
-        # Mark Byzantine adversaries (Gaussian-noise weight poisoners).
+        # Mark Byzantine adversaries.
         byz_frac = float(getattr(config, "BYZANTINE_FRACTION", 0.0))
         n_byz = int(round(byz_frac * n))
+        self.byzantine_ids = []
         if n_byz > 0:
             import random as _random
             byz_ids = _random.sample(range(n), n_byz)
+            self.byzantine_ids = sorted(int(i) for i in byz_ids)
             for i in byz_ids:
                 self.vehicles[i].is_byzantine = True
             logger.log(
-                f"Byzantine vehicles ({n_byz}/{n}, {byz_frac*100:.0f}%): "
+                f"Byzantine vehicles ({n_byz}/{n}, {byz_frac*100:.0f}%, "
+                f"{getattr(config, 'BYZANTINE_ATTACK', 'gaussian')}, "
+                f"start round {getattr(config, 'BYZANTINE_START_ROUND', 0)}): "
                 + ", ".join(str(i) for i in sorted(byz_ids)),
                 "warning",
             )
@@ -464,21 +468,37 @@ class DLEnvironment:
         """Return directed active collaboration-link counts by link type."""
         sidelink = 0
         internet = 0
+        byzantine = 0
+        byzantine_sidelink = 0
+        byzantine_internet = 0
 
         for vehicle in self.vehicles:
             for nid in vehicle.connections:
                 if float(vehicle.alphas.get(nid, 0.0)) <= 0.0:
                     continue
+                peer_is_byzantine = (
+                    0 <= int(nid) < len(self.vehicles)
+                    and bool(self.vehicles[int(nid)].is_byzantine)
+                )
                 link_type = vehicle.link_types.get(nid)
                 if link_type == LINK_SIDELINK:
                     sidelink += 1
+                    if peer_is_byzantine:
+                        byzantine_sidelink += 1
                 elif link_type == LINK_INTERNET:
                     internet += 1
+                    if peer_is_byzantine:
+                        byzantine_internet += 1
+                if peer_is_byzantine:
+                    byzantine += 1
 
         return {
             "sidelink_links": int(sidelink),
             "internet_links": int(internet),
             "total_links": int(sidelink + internet),
+            "byzantine_links": int(byzantine),
+            "byzantine_sidelink_links": int(byzantine_sidelink),
+            "byzantine_internet_links": int(byzantine_internet),
         }
 
     def _record_train_metrics(self) -> None:
@@ -494,9 +514,72 @@ class DLEnvironment:
             "time": elapsed,
             "loss": self.global_loss,
             "acc": self.global_acc,
+            "byzantine_active": self._byzantine_attack_active(),
+            "byzantine_count": len(getattr(self, "byzantine_ids", [])),
             **links,
             **energies,
         })
+
+    def _byzantine_attack_active(self) -> bool:
+        if float(getattr(config, "BYZANTINE_FRACTION", 0.0)) <= 0.0:
+            return False
+        start_round = max(int(getattr(config, "BYZANTINE_START_ROUND", 0)), 0)
+        return int(self.tr_round) >= start_round
+
+    @staticmethod
+    def _attack_name() -> str:
+        raw = str(getattr(config, "BYZANTINE_ATTACK", "gaussian")).strip().lower()
+        aliases = {
+            "noise": "gaussian",
+            "gaussian_noise": "gaussian",
+            "signflip": "sign_flip",
+            "sign-flip": "sign_flip",
+            "little_is_enough": "lie",
+            "little-is-enough": "lie",
+        }
+        return aliases.get(raw, raw)
+
+    def _prepare_byzantine_attacks(self) -> None:
+        """Prepare round-specific Byzantine payloads before aggregation."""
+        byzantine = [v for v in self.vehicles if v.is_byzantine]
+        if not byzantine:
+            return
+
+        attack = self._attack_name()
+        if not self._byzantine_attack_active() or attack not in {"lie", "sign_flip"}:
+            for vehicle in byzantine:
+                vehicle.set_byzantine_lie_update(None)
+            return
+
+        honest_updates = [v.get_shared_update() for v in self.vehicles if not v.is_byzantine]
+        if not honest_updates:
+            return
+
+        z = float(getattr(config, "BYZANTINE_LIE_Z", 1.0))
+        sign_scale = float(getattr(config, "BYZANTINE_SIGN_FLIP_SCALE", 5.0))
+        attack_update = {}
+        first = honest_updates[0]
+        for key, tensor in first.items():
+            if not tensor.is_floating_point():
+                attack_update[key] = tensor.clone()
+                continue
+            stacked = torch.stack([
+                update[key].float()
+                for update in honest_updates
+                if key in update and update[key].is_floating_point()
+            ])
+            mean = stacked.mean(dim=0)
+            if attack == "sign_flip":
+                attack_update[key] = -sign_scale * mean
+            else:
+                std = stacked.std(dim=0, unbiased=False)
+                # The simulator aggregates model-update deltas.  A harmful LIE
+                # payload therefore moves to the opposite side of the honest update
+                # cloud, rather than amplifying the honest descent direction.
+                attack_update[key] = mean - z * std * torch.sign(mean)
+
+        for vehicle in byzantine:
+            vehicle.set_byzantine_lie_update(attack_update)
 
     def _capture_eval_snapshot(self) -> tuple[list[dict], object]:
         """Return (weight_snapshots, loaders) for honest (non-Byzantine) vehicles.
@@ -810,6 +893,12 @@ class DLEnvironment:
             "INET_TX_POWER_W": config.INET_TX_POWER_W,
             "INET_SNR_DB": config.INET_SNR_DB,
             "N_TRAIN_WORKERS": config.N_TRAIN_WORKERS,
+            "BYZANTINE_FRACTION": getattr(config, "BYZANTINE_FRACTION", 0.0),
+            "BYZANTINE_ATTACK": getattr(config, "BYZANTINE_ATTACK", "gaussian"),
+            "BYZANTINE_START_ROUND": getattr(config, "BYZANTINE_START_ROUND", 0),
+            "BYZANTINE_GAUSSIAN_STD": getattr(config, "BYZANTINE_GAUSSIAN_STD", 1.0),
+            "BYZANTINE_SIGN_FLIP_SCALE": getattr(config, "BYZANTINE_SIGN_FLIP_SCALE", 5.0),
+            "BYZANTINE_LIE_Z": getattr(config, "BYZANTINE_LIE_Z", 1.0),
         }
         experiment_cfg.update(self.algo_config)
         return {
@@ -845,6 +934,13 @@ class DLEnvironment:
                 "stop_reason": snapshot["stop_reason"],
             },
             "diagnostics": algo_diagnostics,
+            "attack": {
+                "enabled": float(getattr(config, "BYZANTINE_FRACTION", 0.0)) > 0.0,
+                "fraction": float(getattr(config, "BYZANTINE_FRACTION", 0.0)),
+                "attack": getattr(config, "BYZANTINE_ATTACK", "gaussian"),
+                "start_round": int(getattr(config, "BYZANTINE_START_ROUND", 0)),
+                "byzantine_ids": list(getattr(self, "byzantine_ids", [])),
+            },
             "energy_totals": self._collect_energy_totals(),
             "vehicles": [
                 {
@@ -1169,6 +1265,8 @@ class DLEnvironment:
             )
             if t is not None:
                 transitions[v.id] = t
+
+        self._prepare_byzantine_attacks()
 
         # 3. Aggregate neighbor models
         for v in self.vehicles:

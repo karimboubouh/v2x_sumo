@@ -4,3 +4,6 @@ PySide6
 psutil
 torch
 torchvision
+requests
+pygame
+pillow

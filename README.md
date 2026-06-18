@@ -111,11 +111,15 @@ pip install -r requirements.txt
 
 `requirements.txt`:
 ```
-pygame>=2.5.0
-psutil>=5.9.0
-requests>=2.28.0
-torch>=2.0.0
-torchvision>=0.15.0
+numpy
+matplotlib
+PySide6
+psutil
+requests
+pygame
+pillow
+torch
+torchvision
 ```
 
 > **Note:** `torch` and `torchvision` are only *used* when `--dl` is passed. If you don't need the DPL component, the app runs fine without them installed.

@@ -23,12 +23,11 @@ They are designed around the current simulator and plotting workflow:
   `DANTE` across representative road scenarios.
 - `06_non_iid_sweep.sh`
   `DANTE` under increasing data heterogeneity.
+- `07_byzantine_attack.sh`
+  `DANTE` and `DPFL` under a 20% LIE Byzantine model-poisoning attack starting at round 20.
 
 ## Notes
 
 - These scripts assume SUMO and the Python dependencies are already installed.
-- They run in headless mode and disable early stopping with `--target_acc 1.01`
-  so comparisons use the same round budget.
-- The current codebase does not yet expose a proper Byzantine attack injector,
-  so robustness-under-attack experiments are not scripted here.
+- They run in headless mode with `--rounds 200` and `--target_acc 0.98`.
 - The PPO-based methods now report on the `test` split for fair paper figures.

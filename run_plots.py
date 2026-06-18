@@ -17,12 +17,12 @@ _PAPER_RC = {
     "font.family": "serif",
     "font.serif": ["Times New Roman", "DejaVu Serif"],
     "mathtext.fontset": "stix",
-    "font.size": 9,
-    "axes.titlesize": 9,
-    "axes.labelsize": 9,
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
-    "legend.fontsize": 8,
+    "font.size": 12,
+    "axes.titlesize": 12,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
     "legend.framealpha": 0.85,
     "axes.spines.top": False,
     "axes.spines.right": False,
@@ -148,6 +148,10 @@ def _eval_history(experiment: dict) -> list[dict]:
     )
 
 
+def _train_history(experiment: dict) -> list[dict]:
+    return sorted(experiment.get("train_history", []), key=lambda p: p["round"])
+
+
 def _reward_history(experiment: dict) -> list[dict]:
     return sorted(experiment.get("reward_history", []), key=lambda p: p["step"])
 
@@ -163,11 +167,15 @@ def _reward_rounds(experiment: dict) -> list[float]:
         return []
 
     train_history = sorted(experiment.get("train_history", []), key=lambda p: p["round"])
-    if len(train_history) < 2:
+    round_history = sorted(
+        [point for point in [*train_history, *_eval_history(experiment)] if "time" in point and "round" in point],
+        key=lambda point: point["time"],
+    )
+    if len(round_history) < 2:
         return [point["step"] for point in rewards]
 
-    train_times = np.asarray([point["time"] for point in train_history], dtype=float)
-    train_rounds = np.asarray([point["round"] for point in train_history], dtype=float)
+    train_times = np.asarray([point["time"] for point in round_history], dtype=float)
+    train_rounds = np.asarray([point["round"] for point in round_history], dtype=float)
     reward_times = np.asarray([point["time"] for point in rewards], dtype=float)
 
     unique_times, unique_idx = np.unique(train_times, return_index=True)
@@ -180,6 +188,64 @@ def _reward_rounds(experiment: dict) -> list[float]:
 
 def _eval_std_history(experiment: dict, key: str) -> list[float]:
     return [point.get(key, 0.0) for point in _eval_history(experiment)]
+
+
+def _has_attack_metadata(experiments: list[dict]) -> bool:
+    return any(_attack_metadata(experiment) is not None for experiment in experiments)
+
+
+def _attack_metadata(experiment: dict) -> dict | None:
+    attack = dict(experiment.get("attack", {}))
+    cfg = dict(experiment.get("config", {}))
+    fraction = float(attack.get("fraction", cfg.get("BYZANTINE_FRACTION", 0.0)) or 0.0)
+    if fraction <= 0.0:
+        return None
+    start_round = int(attack.get("start_round", cfg.get("BYZANTINE_START_ROUND", 0)) or 0)
+    if start_round <= 0:
+        return None
+    return {"attack": attack.get("attack", cfg.get("BYZANTINE_ATTACK", "byzantine")), "start_round": start_round}
+
+
+def _round_to_time(experiment: dict, round_value: int) -> float | None:
+    round_history = sorted(
+        [
+            point
+            for point in [*experiment.get("train_history", []), *_eval_history(experiment)]
+            if "time" in point and "round" in point
+        ],
+        key=lambda point: point["round"],
+    )
+    if not round_history:
+        return None
+    rounds = np.asarray([point["round"] for point in round_history], dtype=float)
+    times = np.asarray([point["time"] for point in round_history], dtype=float)
+    unique_rounds, unique_idx = np.unique(rounds, return_index=True)
+    unique_times = times[unique_idx]
+    if len(unique_rounds) < 2:
+        return float(unique_times[0])
+    return float(np.interp(float(round_value), unique_rounds, unique_times))
+
+
+def _mark_attack_start(ax, experiments: list[dict], axis: str) -> None:
+    marks = []
+    attack_names = set()
+    for experiment in experiments:
+        attack = _attack_metadata(experiment)
+        if attack is None:
+            continue
+        attack_names.add(str(attack["attack"]).upper())
+        if axis == "round":
+            marks.append(float(attack["start_round"]))
+        else:
+            start_time = _round_to_time(experiment, int(attack["start_round"]))
+            if start_time is not None:
+                marks.append(float(start_time))
+    if not marks:
+        return
+
+    label = f"{'/'.join(sorted(attack_names))} attack starts" if attack_names else "Attack starts"
+    low = min(marks)
+    ax.axvline(low, color="#D55E00", lw=1.1, ls="--", alpha=0.85, label=label)
 
 
 def _plot_line_comparison(
@@ -196,6 +262,7 @@ def _plot_line_comparison(
     std_getter=None,
     percent: bool = False,
     include_filter=None,
+    attack_axis: str | None = None,
 ) -> bool:
     """Plot one overlay figure across experiments and save it."""
     fig, ax = plt.subplots()
@@ -239,9 +306,10 @@ def _plot_line_comparison(
         plt.close(fig)
         return False
 
-    ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    if attack_axis is not None:
+        _mark_attack_start(ax, experiments, attack_axis)
     if percent:
         ax.yaxis.set_major_formatter(
             matplotlib.ticker.PercentFormatter(1.0, decimals=0)
@@ -249,6 +317,47 @@ def _plot_line_comparison(
     ax.legend()
     _save_figure(fig, Path(output_dir) / filename)
     return True
+
+
+def _plot_energy_comparison(
+    experiments: list[dict],
+    labels: list[str],
+    output_dir: str,
+    filename: str,
+    *,
+    include_computation: bool,
+) -> None:
+    """Plot energy bars with or without computation energy."""
+    fig_energy, ax_energy = plt.subplots()
+    energy_values = []
+    bar_colors = []
+    for idx, (label, experiment) in enumerate(zip(labels, experiments)):
+        energy_totals = dict(experiment.get("energy_totals", {}))
+        tx_energy = float(energy_totals.get("total_tx_energy_j", 0.0))
+        energy_value = tx_energy
+        if include_computation:
+            energy_value += float(energy_totals.get("computation_energy_j", 0.0))
+        energy_values.append(energy_value)
+        algo = experiment.get("metadata", {}).get("algorithm", label)
+        bar_colors.append(_algo_color(algo, idx))
+
+    bars = ax_energy.bar(labels, energy_values, color=bar_colors, width=0.55,
+                         edgecolor="white", linewidth=0.8)
+    for bar, val in zip(bars, energy_values):
+        ax_energy.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() * 1.02 if val > 0 else 0.02,
+            f"{val:.2f} J",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    ylabel = "Energy (J)" if include_computation else "Communication Energy (J)"
+    ax_energy.set_ylabel(ylabel)
+    ax_energy.tick_params(axis="x", rotation=15)
+    ax_energy.set_ylim(top=max(energy_values) * 1.18 if any(energy_values) else 1.0)
+    _save_figure(fig_energy, Path(output_dir) / filename)
 
 
 def _warn_mixed_evaluation_modes(experiments: list[dict], labels: list[str]) -> None:
@@ -394,6 +503,7 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
             lambda exp: [point["acc"] for point in _eval_history(exp)],
             std_getter=lambda exp: _eval_std_history(exp, "acc_std"),
             percent=True,
+            attack_axis="round",
         )
 
         _plot_line_comparison(
@@ -408,6 +518,7 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
             lambda exp: [point["acc"] for point in _eval_history(exp)],
             std_getter=lambda exp: _eval_std_history(exp, "acc_std"),
             percent=True,
+            attack_axis="time",
         )
 
         _plot_line_comparison(
@@ -421,6 +532,7 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
             lambda exp: [point["round"] for point in _eval_history(exp)],
             lambda exp: [point["loss"] for point in _eval_history(exp)],
             std_getter=lambda exp: _eval_std_history(exp, "loss_std"),
+            attack_axis="round",
         )
 
         _plot_line_comparison(
@@ -434,14 +546,70 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
             lambda exp: [point["time"] for point in _eval_history(exp)],
             lambda exp: [point["loss"] for point in _eval_history(exp)],
             std_getter=lambda exp: _eval_std_history(exp, "loss_std"),
+            attack_axis="time",
         )
+
+        if _has_attack_metadata(experiments):
+            _plot_line_comparison(
+                experiments,
+                labels,
+                output_dir,
+                "attack_train_accuracy_vs_rounds_comparison",
+                "",
+                "Training Rounds",
+                "Training Accuracy",
+                lambda exp: [point["round"] for point in _train_history(exp)],
+                lambda exp: [point["acc"] for point in _train_history(exp)],
+                percent=True,
+                attack_axis="round",
+            )
+
+            _plot_line_comparison(
+                experiments,
+                labels,
+                output_dir,
+                "attack_train_accuracy_vs_time_comparison",
+                "",
+                "Time (s)",
+                "Training Accuracy",
+                lambda exp: [point["time"] for point in _train_history(exp)],
+                lambda exp: [point["acc"] for point in _train_history(exp)],
+                percent=True,
+                attack_axis="time",
+            )
+
+            _plot_line_comparison(
+                experiments,
+                labels,
+                output_dir,
+                "attack_train_loss_vs_rounds_comparison",
+                "",
+                "Training Rounds",
+                "Training Loss",
+                lambda exp: [point["round"] for point in _train_history(exp)],
+                lambda exp: [point["loss"] for point in _train_history(exp)],
+                attack_axis="round",
+            )
+
+            _plot_line_comparison(
+                experiments,
+                labels,
+                output_dir,
+                "attack_train_loss_vs_time_comparison",
+                "",
+                "Time (s)",
+                "Training Loss",
+                lambda exp: [point["time"] for point in _train_history(exp)],
+                lambda exp: [point["loss"] for point in _train_history(exp)],
+                attack_axis="time",
+            )
 
         plotted_ppo_rounds = _plot_line_comparison(
             experiments,
             labels,
             output_dir,
             "ppo_vs_rounds_comparison",
-            "PPO Reward vs Rounds",
+            "",
             "Rounds",
             "Avg. PPO Reward",
             _reward_rounds,
@@ -454,7 +622,7 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
             labels,
             output_dir,
             "ppo_vs_time_comparison",
-            "PPO Reward vs Time",
+            "",
             "Time (s)",
             "Avg. PPO Reward",
             lambda exp: [point["time"] for point in _reward_history(exp)],
@@ -462,35 +630,20 @@ def plot_multi(experiment_folders: list[str], block: bool = True) -> None:
             include_filter=_is_ppo_experiment,
         )
 
-        # Total energy comparison
-        fig_energy, ax_energy = plt.subplots()
-        energy_values = []
-        bar_colors = []
-        for idx, (label, experiment) in enumerate(zip(labels, experiments)):
-            energy_totals = dict(experiment.get("energy_totals", {}))
-            total_energy = float(energy_totals.get("computation_energy_j", 0.0))
-            total_energy += float(energy_totals.get("total_tx_energy_j", 0.0))
-            energy_values.append(total_energy)
-            algo = experiment.get("metadata", {}).get("algorithm", label)
-            bar_colors.append(_algo_color(algo, idx))
-
-        bars = ax_energy.bar(labels, energy_values, color=bar_colors, width=0.55,
-                             edgecolor="white", linewidth=0.8)
-        for bar, val in zip(bars, energy_values):
-            ax_energy.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() * 1.02 if val > 0 else 0.02,
-                f"{val:.2f} J",
-                ha="center",
-                va="bottom",
-                fontsize=7,
-            )
-
-        ax_energy.set_title("Total Energy Comparison")
-        ax_energy.set_ylabel("Energy (J)")
-        ax_energy.tick_params(axis="x", rotation=15)
-        ax_energy.set_ylim(top=max(energy_values) * 1.18 if any(energy_values) else 1.0)
-        _save_figure(fig_energy, Path(output_dir) / "energy_comparison")
+        _plot_energy_comparison(
+            experiments,
+            labels,
+            output_dir,
+            "energy_comparison",
+            include_computation=True,
+        )
+        _plot_energy_comparison(
+            experiments,
+            labels,
+            output_dir,
+            "communication_energy_comparison",
+            include_computation=False,
+        )
 
     if not plotted_ppo_rounds or not plotted_ppo_time:
         print("Skipping PPO comparison plots for non-PPO selections.")

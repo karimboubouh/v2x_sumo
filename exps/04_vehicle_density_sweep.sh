@@ -6,14 +6,15 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 BASE_ARGS=(
   --dl
   --headless
-  --speed 0
-  --scenario dubai_marina
-  --rounds 150
-  --target_acc 1.01
-  --dl-dataset MNIST
-  --dl-model DNN
+  --scenario khalifa_university
+  --rounds 200
+  --stop-on eval_acc
+  --target_acc 0.80
+  --dl-dataset CIFAR10
+  --dl-model CNN
   --dl-algorithm DANTE
   --verbose result
+  --save-logs
 )
 
 declare -a EXPERIMENTS=()
@@ -29,5 +30,6 @@ run_comparison "vehicle density sweep" "${EXPERIMENTS[@]}"
 copy_figure "$LAST_COMPARISON_DIR" "accuracy_vs_rounds_comparison" "density_accuracy_vs_rounds_comparison"
 copy_figure "$LAST_COMPARISON_DIR" "accuracy_vs_time_comparison" "density_accuracy_vs_time_comparison"
 copy_figure "$LAST_COMPARISON_DIR" "energy_comparison" "density_energy_comparison"
+copy_figure "$LAST_COMPARISON_DIR" "communication_energy_comparison" "density_communication_energy_comparison"
 
 echo "Vehicle-density figures are ready in paper/assets/."

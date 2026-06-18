@@ -36,21 +36,18 @@ DATASET_META = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DNN(nn.Module):
-    """Multi-layer perceptron: flat → 200 → n_cls.
-
-    200 hidden units is the community standard for MNIST FL/DPL benchmarks
-    (McMahan et al. 2017 FedAvg, Li et al. FedProx, etc.).
-    Dropout(0.2) regularizes against overfitting to non-IID local distributions.
-    """
+    """Lightweight multi-layer perceptron for MNIST/FEMNIST DPL runs."""
 
     def __init__(self, in_ch: int, img: int, n_cls: int):
         super().__init__()
         flat = in_ch * img * img
+        hidden = int(getattr(config, "DNN_HIDDEN", 32))
+        dropout = float(getattr(config, "DNN_DROPOUT", 0.30))
         self.net = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(flat, 200), nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(200, n_cls),
+            nn.Linear(flat, hidden), nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_cls),
         )
 
     def forward(self, x):

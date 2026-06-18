@@ -5,9 +5,10 @@ difference is attributable solely to the removal of the graph attention
 encoder and the switch to uniform aggregation weights.
 """
 
-# Feature dimensions consumed by the IPPO encoder.
-OWN_DIM: int = 7
-NBR_DIM: int = 9
+# Feature dimensions consumed by the IPPO encoder. IPPO intentionally shares
+# the same simulator feature contract as DANTE; only the encoder changes.
+OWN_DIM: int = 5
+NBR_DIM: int = 6
 
 # Personalized aggregation: fraction of the local model retained each round.
 # ``None`` disables fixed self-retention and gives the local model one

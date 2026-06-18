@@ -20,6 +20,7 @@ os.environ.setdefault(
 
 import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 
 # ── Style (from plots_reference) ──────────────────────────────────────────────
 _TEST_COLOR    = "#0072B2"   # solid  — test metric
@@ -36,12 +37,12 @@ _PAPER_RC = {
     "font.family": "serif",
     "font.serif": ["Times New Roman", "DejaVu Serif"],
     "mathtext.fontset": "stix",
-    "font.size": 9,
-    "axes.titlesize": 9,
-    "axes.labelsize": 9,
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
-    "legend.fontsize": 8,
+    "font.size": 12,
+    "axes.titlesize": 12,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
     "legend.framealpha": 0.85,
     "axes.spines.top": False,
     "axes.spines.right": False,
@@ -266,7 +267,10 @@ def save_experiment(experiment: dict, out_root: str | None = None) -> dict:
 
 def _save_figure(fig, path: str) -> str:
     fig.tight_layout()
-    fig.savefig(path, dpi=160, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    root, ext = os.path.splitext(path)
+    if ext.lower() != ".pdf":
+        fig.savefig(f"{root}.pdf", bbox_inches="tight")
     return path
 
 
@@ -276,6 +280,88 @@ def _prepare_series(history: list, x_key: str, y_key: str) -> tuple[list, list]:
 
 def _series_with_default(history: list, key: str, default: float = 0.0) -> list[float]:
     return [point.get(key, default) for point in history]
+
+
+def _reward_round_axis(train_history: list, eval_history: list, reward_history: list) -> list[float]:
+    """Map reward timestamps onto the training-round axis."""
+    if not reward_history:
+        return []
+
+    round_history = sorted(
+        [point for point in [*train_history, *eval_history] if "time" in point and "round" in point],
+        key=lambda point: point["time"],
+    )
+    if len(round_history) < 2:
+        return [point["step"] for point in reward_history]
+
+    train_times = np.asarray([point["time"] for point in round_history], dtype=float)
+    train_rounds = np.asarray([point["round"] for point in round_history], dtype=float)
+    reward_times = np.asarray([point["time"] for point in reward_history], dtype=float)
+
+    unique_times, unique_idx = np.unique(train_times, return_index=True)
+    unique_rounds = train_rounds[unique_idx]
+    if len(unique_times) < 2 or unique_times[-1] <= unique_times[0]:
+        return [point["step"] for point in reward_history]
+
+    return list(np.interp(reward_times, unique_times, unique_rounds))
+
+
+def _attack_metadata(experiment: dict) -> dict | None:
+    attack = dict(experiment.get("attack", {}))
+    cfg = dict(experiment.get("config", {}))
+    fraction = float(attack.get("fraction", cfg.get("BYZANTINE_FRACTION", 0.0)) or 0.0)
+    if fraction <= 0.0:
+        return None
+    start_round = int(attack.get("start_round", cfg.get("BYZANTINE_START_ROUND", 0)) or 0)
+    if start_round <= 0:
+        return None
+    return {
+        "attack": attack.get("attack", cfg.get("BYZANTINE_ATTACK", "byzantine")),
+        "start_round": start_round,
+    }
+
+
+def _round_to_time(train_history: list, eval_history: list, round_value: int) -> float | None:
+    round_history = sorted(
+        [point for point in [*train_history, *eval_history] if "time" in point and "round" in point],
+        key=lambda point: point["round"],
+    )
+    if not round_history:
+        return None
+    rounds = np.asarray([point["round"] for point in round_history], dtype=float)
+    times = np.asarray([point["time"] for point in round_history], dtype=float)
+    unique_rounds, unique_idx = np.unique(rounds, return_index=True)
+    unique_times = times[unique_idx]
+    if len(unique_rounds) < 2:
+        return float(unique_times[0])
+    return float(np.interp(float(round_value), unique_rounds, unique_times))
+
+
+def _mark_attack_start(
+    ax,
+    experiment: dict,
+    axis: str,
+    train_history: list,
+    eval_history: list,
+) -> None:
+    attack = _attack_metadata(experiment)
+    if attack is None:
+        return
+    start_round = int(attack["start_round"])
+    x_value = start_round
+    if axis == "time":
+        start_time = _round_to_time(train_history, eval_history, start_round)
+        if start_time is None:
+            return
+        x_value = start_time
+    ax.axvline(
+        x_value,
+        color="#D55E00",
+        lw=1.1,
+        ls="--",
+        alpha=0.85,
+        label=f"{str(attack['attack']).upper()} attack starts",
+    )
 
 
 def plot_experiment(
@@ -307,7 +393,8 @@ def plot_experiment(
     eval_acc_std = _series_with_default(eval_history, "acc_std")
     eval_loss_std = _series_with_default(eval_history, "loss_std")
     reward_history = list(experiment.get("reward_history", []))
-    reward_steps, reward_values = _prepare_series(reward_history, "step", "reward")
+    _, reward_values = _prepare_series(reward_history, "step", "reward")
+    reward_rounds = _reward_round_axis(train_history, eval_history, reward_history)
     reward_times, _ = _prepare_series(reward_history, "time", "reward")
 
     fig, ax = plt.subplots(figsize=(_W2, _H * 2))
@@ -322,9 +409,9 @@ def plot_experiment(
             alpha=0.10,
             linewidth=0.0,
         )
-    ax.set_title(f"Mean Per-Vehicle Accuracy vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Accuracy")
+    _mark_attack_start(ax, experiment, "round", train_history, eval_history)
     ax.legend(loc="lower right")
     figures["accuracy_vs_rounds"] = _save_figure(
         fig,
@@ -343,9 +430,9 @@ def plot_experiment(
             alpha=0.10,
             linewidth=0.0,
         )
-    ax.set_title(f"Mean Per-Vehicle Accuracy vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Accuracy")
+    _mark_attack_start(ax, experiment, "time", train_history, eval_history)
     ax.legend(loc="lower right")
     figures["accuracy_vs_time"] = _save_figure(
         fig,
@@ -364,9 +451,9 @@ def plot_experiment(
             alpha=0.10,
             linewidth=0.0,
         )
-    ax.set_title(f"Mean Per-Vehicle Loss vs Rounds\n{title}")
     ax.set_xlabel("Rounds")
     ax.set_ylabel("Loss")
+    _mark_attack_start(ax, experiment, "round", train_history, eval_history)
     ax.legend(loc="upper right")
     figures["loss_vs_rounds"] = _save_figure(
         fig,
@@ -385,9 +472,9 @@ def plot_experiment(
             alpha=0.10,
             linewidth=0.0,
         )
-    ax.set_title(f"Mean Per-Vehicle Loss vs Time\n{title}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Loss")
+    _mark_attack_start(ax, experiment, "time", train_history, eval_history)
     ax.legend(loc="upper right")
     figures["loss_vs_time"] = _save_figure(
         fig,
@@ -407,8 +494,7 @@ def plot_experiment(
                   edgecolor="white", linewidth=0.8)
     for bar, val in zip(bars, energy_values):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
-                f"{val:.2f} J", ha="center", va="bottom", fontsize=7)
-    ax.set_title(f"Energy Totals Across All Vehicles\n{title}")
+                f"{val:.2f} J", ha="center", va="bottom", fontsize=9)
     ax.set_ylabel("Energy (J)")
     ax.tick_params(axis="x", rotation=15)
     ax.set_ylim(top=max(energy_values) * 1.18 if any(energy_values) else 1)
@@ -421,11 +507,10 @@ def plot_experiment(
         smooth = _ema(reward_values)
 
         fig, ax = plt.subplots(figsize=(_W2, _H * 2))
-        ax.plot(reward_steps, reward_values, color=_PPO_COLOR, lw=0.6, alpha=0.35, label="Raw reward")
-        ax.plot(reward_steps, smooth, color=_PPO_COLOR, lw=1.8, label="EMA (α=0.3)")
+        ax.plot(reward_rounds, reward_values, color=_PPO_COLOR, lw=0.6, alpha=0.35, label="Raw reward")
+        ax.plot(reward_rounds, smooth, color=_PPO_COLOR, lw=1.8, label="EMA (α=0.3)")
         ax.axhline(0.0, color="k", lw=0.5, ls="--", alpha=0.4)
-        ax.set_title(f"PPO Reward vs Steps\n{title}")
-        ax.set_xlabel("Simulation Step")
+        ax.set_xlabel("Training Rounds")
         ax.set_ylabel("Avg. PPO Reward")
         ax.legend()
         figures["ppo_reward_vs_steps"] = _save_figure(
@@ -437,7 +522,6 @@ def plot_experiment(
         ax.plot(reward_times, reward_values, color=_PPO_COLOR, lw=0.6, alpha=0.35, label="Raw reward")
         ax.plot(reward_times, smooth, color=_PPO_COLOR, lw=1.8, label="EMA (α=0.3)")
         ax.axhline(0.0, color="k", lw=0.5, ls="--", alpha=0.4)
-        ax.set_title(f"PPO Reward vs Time\n{title}")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Avg. PPO Reward")
         ax.legend()

@@ -107,6 +107,7 @@ class Vehicle:
         self.link_types = {}           # {nid: LINK_SIDELINK | LINK_INTERNET}
         self.static_neighbors = []     # populated by FedAvg setup()
         self.is_byzantine = False
+        self._byzantine_lie_update = None
 
         # Reference to the active DLAlgorithm (injected by DLEnvironment)
         self._algo = None
@@ -452,44 +453,90 @@ class Vehicle:
             self._pending_transfers = []
             self.training_done.set()
 
+    def _byzantine_attack_name(self) -> str:
+        raw = str(getattr(config, "BYZANTINE_ATTACK", "gaussian")).strip().lower()
+        aliases = {
+            "noise": "gaussian",
+            "gaussian_noise": "gaussian",
+            "signflip": "sign_flip",
+            "sign-flip": "sign_flip",
+            "little_is_enough": "lie",
+            "little-is-enough": "lie",
+        }
+        return aliases.get(raw, raw)
+
+    def _byzantine_attack_active(self) -> bool:
+        start_round = max(int(getattr(config, "BYZANTINE_START_ROUND", 0)), 0)
+        return bool(self.is_byzantine) and int(self.tr_rounds) >= start_round
+
+    def set_byzantine_lie_update(self, update: dict | None) -> None:
+        """Install the current LIE attack update prepared by the environment."""
+        with self._lock:
+            self._byzantine_lie_update = (
+                None if update is None else clone_state_dict(update)
+            )
+
     def get_shared_weights(self) -> dict:
         """Thread-safe copy of the weights broadcast over V2X.
 
-        Byzantine vehicles send Gaussian-noise weights instead of their real
-        model to poison the aggregation of any neighbor that selects them.
+        Byzantine vehicles send poisoned weights after the configured attack
+        start round to poison the aggregation of any neighbor that selects them.
         """
         with self._lock:
-            if self.is_byzantine:
+            if self._byzantine_attack_active():
                 return self._byzantine_weights(self._shared_weights)
             return clone_state_dict(self._shared_weights)
 
     def get_shared_update(self) -> dict:
         """Thread-safe copy of the most recent broadcast update delta."""
         with self._lock:
-            if self.is_byzantine:
+            if self._byzantine_attack_active():
                 return self._byzantine_update(self._shared_update)
             return clone_state_dict(self._shared_update)
 
     def _byzantine_weights(self, sd: dict) -> dict:
-        """Return a state dict where every floating-point tensor is replaced
-        by i.i.d. Gaussian noise with the same shape and dtype.  Non-floating
-        tensors (e.g. BatchNorm num_batches_tracked) are cloned unchanged."""
+        """Return a poisoned model-state broadcast for Byzantine simulation."""
+        attack = self._byzantine_attack_name()
+        if attack == "gaussian":
+            std = float(getattr(config, "BYZANTINE_GAUSSIAN_STD", 1.0))
+            corrupted = {}
+            for key, tensor in sd.items():
+                if tensor.is_floating_point():
+                    corrupted[key] = torch.randn_like(tensor.float()) * std
+                else:
+                    corrupted[key] = tensor.clone()
+            return corrupted
+
+        poisoned_update = self._byzantine_update(self._state_delta(sd, self._ref_weights))
         corrupted = {}
         for key, tensor in sd.items():
-            if tensor.is_floating_point():
-                corrupted[key] = torch.randn_like(tensor)
-            else:
+            if not tensor.is_floating_point():
                 corrupted[key] = tensor.clone()
+                continue
+            ref_tensor = self._ref_weights.get(key, tensor)
+            attack_tensor = poisoned_update.get(key)
+            if attack_tensor is None or not attack_tensor.is_floating_point():
+                corrupted[key] = tensor.clone()
+            else:
+                corrupted[key] = ref_tensor.float() + attack_tensor.float()
         return corrupted
 
     def _byzantine_update(self, update: dict) -> dict:
-        """Return an arbitrary floating-point update for Byzantine simulation."""
+        """Return a poisoned update for Byzantine simulation."""
+        attack = self._byzantine_attack_name()
+        if attack in {"lie", "sign_flip"} and self._byzantine_lie_update is not None:
+            return clone_state_dict(self._byzantine_lie_update)
+
         corrupted = {}
+        std = float(getattr(config, "BYZANTINE_GAUSSIAN_STD", 1.0))
+        sign_scale = float(getattr(config, "BYZANTINE_SIGN_FLIP_SCALE", 5.0))
         for key, tensor in update.items():
-            if tensor.is_floating_point():
-                corrupted[key] = torch.randn_like(tensor.float())
-            else:
+            if not tensor.is_floating_point():
                 corrupted[key] = tensor.clone()
+            elif attack == "sign_flip":
+                corrupted[key] = -sign_scale * tensor.float()
+            else:
+                corrupted[key] = torch.randn_like(tensor.float()) * std
         return corrupted
 
     def add_transmission_energy(self, link_type: float, energy_j: float) -> None:

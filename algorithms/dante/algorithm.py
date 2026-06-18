@@ -854,7 +854,7 @@ class DANTEAlgorithm(DLAlgorithm):
         sigma = float(np.median(positive)) if positive.size else float(np.max(distances))
         sigma = max(sigma, _EPS)
         scores = np.exp(-distances / sigma).astype(np.float32, copy=False)
-        passes = scores >= _ROBUST_PASS_THRESHOLD
+        passes = scores > np.float32(_ROBUST_PASS_THRESHOLD)
         return scores, passes
 
     def select_neighbors(self, v, candidates: list, env) -> tuple:
@@ -1177,7 +1177,7 @@ class DANTEAlgorithm(DLAlgorithm):
         sigma = float(np.median(positive)) if positive.size else float(np.max(distances))
         sigma = max(sigma, _EPS)
         scores = np.exp(-distances / sigma).astype(np.float32, copy=False)
-        passes = scores >= _ROBUST_PASS_THRESHOLD
+        passes = scores > np.float32(_ROBUST_PASS_THRESHOLD)
         if (
             self._disable_robust_rejection_without_byzantine
             and float(getattr(config, "BYZANTINE_FRACTION", 0.0)) <= 0.0
@@ -1310,6 +1310,12 @@ class DANTEAlgorithm(DLAlgorithm):
             1.0,
         )
         selection_quality = np.maximum(geometry_quality, warmup_floor * robust_scores)
+        if float(getattr(config, "BYZANTINE_FRACTION", 0.0)) > 0.0:
+            adversarial_direction = alignments <= 0.0
+            extreme_scale = norm_ratios < 0.05
+            reject_mask = adversarial_direction | extreme_scale
+            robust_passes = robust_passes & ~reject_mask
+            selection_quality = np.where(reject_mask, 0.0, selection_quality)
         effective_scores = (
             base_weights
             * trusts

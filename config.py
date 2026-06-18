@@ -132,8 +132,8 @@ CPU_CYCLES_PER_SAMPLE = 1e7  # L_k — CPU cycles per training sample
 ALGORITHM = "DANTE"  # name of any algorithm in algorithms/<name>/algorithm.py
 
 # ── Dataset & model ──────────────────────────────────────
-DATASET = "CIFAR10"  # MNIST | FEMNIST | CIFAR10 | CIFAR100
-MODEL_ARCH = "CNN"  # DNN | CNN | LSTM | Transformer | ResNet
+DATASET = "MNIST"  # MNIST | FEMNIST | CIFAR10 | CIFAR100
+MODEL_ARCH = "DNN"  # DNN | CNN | LSTM | Transformer | ResNet
 SHARED_INITIAL_MODEL = True  # True = all vehicles share random init; False = keep per-vehicle initial weights
 DATA_ALPHA = 0.5  # Dirichlet alpha for non-IID (0.1=very non-IID, 10.0~IID)
 VALIDATION_FRACTION = 0.2  # fraction of each client's shard held out for validation
@@ -146,14 +146,16 @@ LOCAL_WEIGHT_DECAY = 5e-4
 LOCAL_LR_SCHEDULE = "cosine"  # constant | cosine
 LOCAL_LR_MIN = 1e-2
 LABEL_SMOOTHING = 0.1
-BATCH_SIZE = 64
-BATCHES_PER_ROUND = 48  # mini-batches per DPL training round (N×BATCH_SIZE samples/round); 0 or None = full epoch
+BATCH_SIZE = 32
+BATCHES_PER_ROUND = 8  # mini-batches per DPL training round (N×BATCH_SIZE samples/round); 0 or None = full epoch
 MAX_ROUND_SKEW = 1  # maximum local-round lead allowed over the slowest vehicle
 TRAIN_AUGMENTATION_POLICY = "dataset_default"  # none | dataset_default; augmentation applies only to local training batches
 COMPRESSION_RATIO = 0.1  # γ — fraction of model params transmitted (1.0 = full model)
 CNN_DROPOUT = 0.10
 CNN_CHANNELS = 32
 CNN_HIDDEN = 128
+DNN_HIDDEN = 32
+DNN_DROPOUT = 0.30
 SEED = 42  # Reproducibility seed for Python, NumPy, and PyTorch. Set to None to disable explicit seeding.
 
 # ── Evaluation & termination ─────────────────────────────
@@ -171,6 +173,11 @@ MAX_TR_ROUNDS = 200
 # model, poisoning the aggregation of any neighbor that selects them.
 # Set to 0.0 to disable (default). Example: 0.2 = 20% of vehicles.
 BYZANTINE_FRACTION: float = 0.0
+BYZANTINE_ATTACK: str = "gaussian"  # gaussian | sign_flip | lie
+BYZANTINE_START_ROUND: int = 0
+BYZANTINE_GAUSSIAN_STD: float = 1.0
+BYZANTINE_SIGN_FLIP_SCALE: float = 5.0
+BYZANTINE_LIE_Z: float = 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -178,13 +185,11 @@ BYZANTINE_FRACTION: float = 0.0
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Concurrency ──────────────────────────────────────────
-N_TRAIN_WORKERS = 20
+N_TRAIN_WORKERS = 8
 
 # ── Logging ──────────────────────────────────────────────
 LOG_LEVEL = "info"  # Console logging: minimum level (debug | info | success | result | warning | error)
-SAVE_LOGS = (
-    False  # Save plain logger output into out/<experiment_id>/run.log during DPL runs
-)
+SAVE_LOGS = False  # Save plain logger output into out/<experiment_id>/run.log
 TRACI_LOGS = False  # Show SUMO/TraCI internal error and warning messages in the console
 
 
@@ -201,18 +206,12 @@ LOG_PANEL_HEIGHT = 220
 STATUS_BAR_HEIGHT = 56  # Bottom status bar height (pixels)
 
 # ── Rendering ────────────────────────────────────────────
-FPS = 60  # Main-loop render cap in frames per second
+FPS = 120  # Main-loop render cap in frames per second
 DPI_SCALE = 1.0  # Manual DPI hint (1.0 = auto; 2.0 forces HiDPI scaling tweaks)
 FL_LABEL_MIN_ZOOM = 3.0  # Minimum zoom multiple at which α labels appear on DL links
 
-# ── Fonts & logs ─────────────────────────────────────────
+# ── Theme & logs ─────────────────────────────────────────
+THEME_MODE = "system"  # "dark", "light", or "system"
 FONT_SIZE_LOG = 12  # Base font size for the log panel (pt)
-FONT_SIZE_MAP = (
-    11  # Base font size for map UI elements (HUD, legend, zoom controls, etc.)
-)
+FONT_SIZE_MAP = 11  # Base font size for map UI elements
 LOG_MAX_LINES = None  # Keep the full message log from the start of the simulation
-
-# ── Theme ────────────────────────────────────────────────
-THEME_MODE = (
-    "system"  # "dark", "light", or "system" (auto-detect from macOS appearance)
-)

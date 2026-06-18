@@ -5,6 +5,13 @@ EXPS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$EXPS_DIR/.." && pwd)"
 OUT_DIR="$REPO_ROOT/out"
 PAPER_ASSETS_DIR="$REPO_ROOT/paper/assets"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  PYTHON_EXE="$PYTHON_BIN"
+elif [[ -x "$REPO_ROOT/venv/bin/python3" ]]; then
+  PYTHON_EXE="$REPO_ROOT/venv/bin/python3"
+else
+  PYTHON_EXE="python"
+fi
 
 mkdir -p "$OUT_DIR" "$PAPER_ASSETS_DIR"
 
@@ -15,7 +22,7 @@ warn_if_zero_link_experiment() {
   local experiment_dir="$1"
   local label="${2:-}"
 
-  python - "$experiment_dir/experiment.pkl" "$label" <<'PY'
+  "$PYTHON_EXE" - "$experiment_dir/experiment.pkl" "$label" <<'PY'
 import pickle
 import re
 import sys
@@ -68,15 +75,126 @@ snapshot_comparisons() {
 detect_new_path() {
   local before="$1"
   local after="$2"
-  local newest
 
-  newest="$(comm -13 "$before" "$after" | tail -n1 || true)"
-  if [[ -n "$newest" ]]; then
-    printf '%s\n' "$newest"
-    return
-  fi
+  "$PYTHON_EXE" - "$before" "$after" <<'PY'
+import os
+import sys
 
-  tail -n1 "$after" || true
+before_path, after_path = sys.argv[1], sys.argv[2]
+with open(before_path, encoding="utf-8") as fh:
+    before = {line.strip() for line in fh if line.strip()}
+with open(after_path, encoding="utf-8") as fh:
+    after = {line.strip() for line in fh if line.strip()}
+
+candidates = sorted(after - before) or sorted(after)
+if not candidates:
+    raise SystemExit(0)
+
+print(max(candidates, key=lambda path: os.path.getmtime(path)))
+PY
+}
+
+detect_new_experiment_path() {
+  local before="$1"
+  local after="$2"
+  shift 2
+
+  "$PYTHON_EXE" - "$before" "$after" "$@" <<'PY'
+import os
+import pickle
+import sys
+
+before_path, after_path, *cli_args = sys.argv[1:]
+with open(before_path, encoding="utf-8") as fh:
+    before = {line.strip() for line in fh if line.strip()}
+with open(after_path, encoding="utf-8") as fh:
+    after = {line.strip() for line in fh if line.strip()}
+
+candidates = sorted(after - before)
+if not candidates:
+    candidates = sorted(after)
+
+value_options = {
+    "--scenario": ("scenario", str),
+    "--num-vehicles": ("num_vehicles", int),
+    "--rounds": ("rounds", int),
+    "--target_acc": ("target_acc", float),
+    "--dl-algorithm": ("dl_algorithm", str),
+    "--dl-dataset": ("dl_dataset", str),
+    "--dl-model": ("dl_model", str),
+}
+
+expected = {}
+idx = 0
+while idx < len(cli_args):
+    token = cli_args[idx]
+    option, sep, inline_value = token.partition("=")
+    if option in value_options:
+        key, caster = value_options[option]
+        if sep:
+            raw_value = inline_value
+        else:
+            idx += 1
+            if idx >= len(cli_args):
+                break
+            raw_value = cli_args[idx]
+        expected[key] = caster(raw_value)
+    idx += 1
+
+def load_experiment(path: str) -> dict | None:
+    try:
+        with open(os.path.join(path, "experiment.pkl"), "rb") as fh:
+            return pickle.load(fh)
+    except Exception:
+        return None
+
+def observed_values(experiment: dict) -> dict:
+    metadata = dict(experiment.get("metadata", {}))
+    args = dict(metadata.get("args", {}))
+    observed = dict(args)
+    observed.setdefault("scenario", metadata.get("scenario"))
+    observed.setdefault("num_vehicles", metadata.get("num_vehicles"))
+    observed.setdefault("dl_algorithm", metadata.get("algorithm"))
+    observed.setdefault("dl_dataset", metadata.get("dataset"))
+    observed.setdefault("dl_model", metadata.get("model"))
+    return observed
+
+def values_match(key: str, expected_value, observed_value) -> bool:
+    if observed_value is None:
+        return False
+    if key in {"num_vehicles", "rounds"}:
+        return int(observed_value) == int(expected_value)
+    if key == "target_acc":
+        return abs(float(observed_value) - float(expected_value)) <= 1e-12
+    return str(observed_value) == str(expected_value)
+
+matches = []
+for path in candidates:
+    experiment = load_experiment(path)
+    if experiment is None:
+        continue
+    observed = observed_values(experiment)
+    if all(values_match(key, value, observed.get(key)) for key, value in expected.items()):
+        matches.append(path)
+
+if matches:
+    print(max(matches, key=lambda path: os.path.getmtime(os.path.join(path, "experiment.pkl"))))
+    raise SystemExit(0)
+
+if len(candidates) == 1:
+    print(candidates[0])
+    raise SystemExit(0)
+
+candidate_names = "\n  ".join(os.path.basename(path) for path in candidates) or "(none)"
+expected_text = ", ".join(f"{key}={value!r}" for key, value in sorted(expected.items()))
+print(
+    "Failed to identify the experiment created by this run.\n"
+    f"Expected metadata: {expected_text}\n"
+    f"New candidates:\n  {candidate_names}",
+    file=sys.stderr,
+)
+raise SystemExit(2)
+PY
 }
 
 run_cli_experiment() {
@@ -91,11 +209,11 @@ run_cli_experiment() {
   echo "==> Running: $label"
   (
     cd "$REPO_ROOT"
-    python main.py "$@"
+    "$PYTHON_EXE" main.py "$@"
   )
 
   snapshot_experiments >"$after"
-  LAST_EXPERIMENT_DIR="$(detect_new_path "$before" "$after")"
+  LAST_EXPERIMENT_DIR="$(detect_new_experiment_path "$before" "$after" "$@")"
   rm -f "$before" "$after"
 
   if [[ -z "$LAST_EXPERIMENT_DIR" ]]; then
@@ -122,7 +240,7 @@ run_wrapped_experiment() {
     cd "$REPO_ROOT"
     EXPS_REPO_ROOT="$REPO_ROOT" \
     EXPS_OVERRIDES="$overrides" \
-    python - "$@" <<'PY'
+    "$PYTHON_EXE" - "$@" <<'PY'
 import os
 import sys
 
@@ -144,7 +262,7 @@ PY
   )
 
   snapshot_experiments >"$after"
-  LAST_EXPERIMENT_DIR="$(detect_new_path "$before" "$after")"
+  LAST_EXPERIMENT_DIR="$(detect_new_experiment_path "$before" "$after" "$@")"
   rm -f "$before" "$after"
 
   if [[ -z "$LAST_EXPERIMENT_DIR" ]]; then
@@ -160,7 +278,7 @@ relabel_experiment() {
   local experiment_dir="$1"
   local new_label="$2"
 
-  python - "$experiment_dir/experiment.pkl" "$new_label" <<'PY'
+  "$PYTHON_EXE" - "$experiment_dir/experiment.pkl" "$new_label" <<'PY'
 import pickle
 import sys
 
@@ -187,7 +305,7 @@ run_comparison() {
   echo "==> Building comparison: $label"
   (
     cd "$REPO_ROOT"
-    MPLBACKEND=Agg python run_plots.py "$@"
+    MPLBACKEND=Agg "$PYTHON_EXE" run_plots.py "$@"
   )
 
   snapshot_comparisons >"$after"
