@@ -170,6 +170,10 @@ cython_debug/
 #.idea/
 v2x_sim/
 
+# Root-level Markdown notes/reports; keep the main project README tracked.
+/*.md
+!/README.md
+
 # Generated manuscript and presentation artifacts
 paper/
 presentation/
