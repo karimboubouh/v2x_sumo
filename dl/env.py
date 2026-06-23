@@ -72,6 +72,7 @@ class DLEnvironment:
         test_loader=None,
         local_test_loaders=None,
         event_stream=None,
+        run_initial_round: bool = True,
     ):
         """
         Args:
@@ -266,7 +267,17 @@ class DLEnvironment:
             "result",
         )
 
-        # ── Initial synchronous DPL training round ────────────────────────────
+        self._training_rounds_done = 0  # rounds completed in main loop (excludes init)
+        self._train_wall_start = time.perf_counter()
+        self._initial_training_done = False
+        if run_initial_round:
+            self.run_initial_training_round()
+
+    def run_initial_training_round(self) -> None:
+        """Run the initial local training round that used to execute in __init__."""
+        if self._initial_training_done:
+            return
+
         futs = []
         for v in self.vehicles:
             v.prepare_training_round(0.0, [])
@@ -281,6 +292,7 @@ class DLEnvironment:
         self._maybe_schedule_eval(0.0, stop_reason=self.get_stop_reason())
         self._training_rounds_done = 0  # rounds completed in main loop (excludes init)
         self._train_wall_start = time.perf_counter()  # wall clock after all init overhead
+        self._initial_training_done = True
 
     # ── Topology ──────────────────────────────────────────────────────────────
 

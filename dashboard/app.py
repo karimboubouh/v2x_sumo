@@ -86,6 +86,9 @@ class DashboardApp:
         training_status=None,
         vehicle_overlays=None,
         log_links=None,
+        ui_fps: float | None = None,
+        sim_hz: float | None = None,
+        source_wall_time: float | None = None,
         process_events: bool = True,
     ) -> bool:
         """
@@ -103,6 +106,9 @@ class DashboardApp:
             training_status = training_status,
             vehicle_overlays= vehicle_overlays or {},
             log_links       = log_links,
+            ui_fps          = ui_fps,
+            sim_hz          = sim_hz,
+            source_wall_time= source_wall_time,
         )
 
         if process_events:
@@ -121,6 +127,7 @@ class DashboardApp:
             "last_frame_at": None,
             "last_log_at": 0.0,
             "marked_done": False,
+            "ui_fps": 0.0,
         }
 
         timer = QTimer()
@@ -160,13 +167,22 @@ class DashboardApp:
                     training_status=frame.training_status,
                     vehicle_overlays=frame.vehicle_overlays,
                     log_links=frame.log_links,
+                    ui_fps=state["ui_fps"],
+                    sim_hz=frame.sim_hz,
+                    source_wall_time=frame.source_wall_time,
                     process_events=False,
                 )
                 runtime.perf.record("render_s", time.perf_counter() - render_started)
                 state["version"] = version
 
             if state["last_frame_at"] is not None:
-                runtime.perf.record("ui_frame_s", now - state["last_frame_at"])
+                ui_dt = now - state["last_frame_at"]
+                runtime.perf.record("ui_frame_s", ui_dt)
+                inst_ui_fps = 1.0 / max(ui_dt, 1e-6)
+                if state["ui_fps"] <= 0.0:
+                    state["ui_fps"] = inst_ui_fps
+                else:
+                    state["ui_fps"] = state["ui_fps"] * 0.85 + inst_ui_fps * 0.15
             state["last_frame_at"] = now
             runtime.perf.set_latest(event_backlog=event_stream.depth())
             runtime.perf.maybe_log()

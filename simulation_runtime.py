@@ -9,7 +9,15 @@ from typing import Callable
 
 import config
 import logger
-from runtime_state import FrameSnapshot, LatestFrameBuffer, PerfStats
+from runtime_state import (
+    DPLSnapshot,
+    FrameSnapshot,
+    LatestDPLBuffer,
+    LatestFrameBuffer,
+    LatestMobilityBuffer,
+    MobilitySnapshot,
+    PerfStats,
+)
 
 
 class SimulationRuntime:
@@ -35,9 +43,12 @@ class SimulationRuntime:
         self._paused = False
         self._pause_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._mobility_thread: threading.Thread | None = None
+        self._dpl_thread: threading.Thread | None = None
         self._prepared = False
         self._cleaned = False
         self._exception: BaseException | None = None
+        self._exception_lock = threading.Lock()
 
         self.sumo = None
         self.comm = None
@@ -45,6 +56,8 @@ class SimulationRuntime:
         self.net_bounds = None
         self.edge_shapes = None
 
+        self.mobility_buffer = LatestMobilityBuffer()
+        self.dpl_buffer = LatestDPLBuffer()
         self.training_status = None
         self.vehicle_states = {}
         self.render_links = []
@@ -52,6 +65,7 @@ class SimulationRuntime:
         self.vehicle_overlays = None
         self.sim_time = 0.0
         self.step_count = 0
+        self.sim_hz = 0.0
 
         self._dl_initialized = False
         self._dl_complete_logged = False
@@ -59,9 +73,12 @@ class SimulationRuntime:
         self._last_logged_eval_round = -1
         self._final_eval_logged = False
         self._last_status_step = -1
+        self._last_dpl_processed_step = 0
+        self._last_dpl_snapshot_at = 0.0
         self._last_training_snapshot_at = 0.0
         self._last_overlay_snapshot_at = 0.0
         self._last_frame_publish_at = 0.0
+        self._last_sim_step_wall_at = 0.0
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -108,19 +125,10 @@ class SimulationRuntime:
             if not self._prepared:
                 self.prepare()
             logger.enable_progress_bar()
-            self._initialize_dl_if_needed()
-            if self.dl_env is not None and self.dl_env.is_done():
-                self._finish_dl(
-                    self.dl_env.get_stop_reason(),
-                    avg_loss=self.dl_env.global_loss,
-                    avg_acc=self.dl_env.global_acc,
-                    tr_round=self.dl_env.tr_round,
-                )
-
-            self._run_loop()
+            self._start_workers()
+            self._join_workers()
         except BaseException as exc:
-            self._exception = exc
-            logger.log(str(exc), "error")
+            self._record_exception(exc)
             traceback.print_exc()
         finally:
             self.cleanup()
@@ -133,7 +141,8 @@ class SimulationRuntime:
             self._thread.join(timeout=timeout)
 
     def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        threads = [self._thread, self._mobility_thread, self._dpl_thread]
+        return any(thread is not None and thread.is_alive() for thread in threads)
 
     @property
     def exception(self) -> BaseException | None:
@@ -147,10 +156,54 @@ class SimulationRuntime:
         with self._pause_lock:
             return bool(self._paused)
 
+    def _record_exception(self, exc: BaseException) -> None:
+        with self._exception_lock:
+            if self._exception is None:
+                self._exception = exc
+                logger.log(str(exc), "error")
+        self.stop()
+
+    def _worker_entry(self, name: str, target) -> None:
+        try:
+            target()
+        except BaseException as exc:
+            self._record_exception(exc)
+            logger.log(f"{name} worker failed: {exc}", "error")
+            traceback.print_exc()
+
+    def _start_workers(self) -> None:
+        if self._mobility_thread is None or not self._mobility_thread.is_alive():
+            self._mobility_thread = threading.Thread(
+                target=lambda: self._worker_entry("Mobility", self._run_mobility_loop),
+                name="SimulationRuntime-Mobility",
+                daemon=True,
+            )
+            self._mobility_thread.start()
+
+        if self.args.dl and (self._dpl_thread is None or not self._dpl_thread.is_alive()):
+            self._publish_dpl_snapshot(lifecycle="initializing")
+            self._dpl_thread = threading.Thread(
+                target=lambda: self._worker_entry("DPL", self._run_dpl_loop),
+                name="SimulationRuntime-DPL",
+                daemon=True,
+            )
+            self._dpl_thread.start()
+
+    def _join_workers(self) -> None:
+        workers = [thread for thread in (self._mobility_thread, self._dpl_thread) if thread is not None]
+        while not self._stop_event.is_set():
+            if all(not thread.is_alive() for thread in workers):
+                break
+            time.sleep(0.05)
+
+        for thread in workers:
+            thread.join(timeout=1.0)
+
     def cleanup(self) -> None:
         if self._cleaned:
             return
         self._cleaned = True
+        self.stop()
         logger.clear_progress_bar()
         logger.log("Cleaning up...", "info")
         if self.dl_env is not None:
@@ -163,7 +216,7 @@ class SimulationRuntime:
 
     # ── Initialization ──────────────────────────────────────────────────────
 
-    def _initialize_dl_if_needed(self) -> None:
+    def _initialize_dl_if_needed(self, *, defer_initial_round: bool = False) -> None:
         if self._dl_initialized or not self.args.dl:
             return
         self._dl_initialized = True
@@ -199,8 +252,10 @@ class SimulationRuntime:
             test_loader=test_loader,
             local_test_loaders=local_test_loaders,
             event_stream=self._viz_stream,
+            run_initial_round=not defer_initial_round,
         )
         self._refresh_training_status(force=True)
+        self._publish_dpl_snapshot(lifecycle="ready")
         logger.log(
             f"DPL ready: {self.args.dl_algorithm} | {self.args.dl_dataset}/{self.args.dl_model} | "
             f"{self.args.num_vehicles} vehicles",
@@ -230,9 +285,35 @@ class SimulationRuntime:
                 self.training_status.get("eval_acc_std", self.training_status.get("test_acc_std")),
             )
 
-    # ── Main loop ───────────────────────────────────────────────────────────
+    def _run_initial_dl_training_round(self) -> None:
+        if self.dl_env is None:
+            return
+        vehicle_count = len(getattr(self.dl_env, "vehicles", []) or [])
+        status = dict(self.training_status or {})
+        status.update(
+            {
+                "enabled": True,
+                "algorithm": str(getattr(self.dl_env, "algo", self.args.dl_algorithm)),
+                "round": int(getattr(self.dl_env, "tr_round", 0)),
+                "max_rounds": max(int(config.MAX_TR_ROUNDS), 1),
+                "progress": 0.0,
+                "active_trainers": vehicle_count,
+                "vehicle_count": vehicle_count,
+                "dpl_lifecycle": "initial_training",
+            }
+        )
+        self.training_status = status
+        self._publish_dpl_snapshot(lifecycle="initial_training")
+        logger.log("DPL initial training round running in background...", "info")
+        started = time.perf_counter()
+        self.dl_env.run_initial_training_round()
+        self.perf.record("dl_step_s", time.perf_counter() - started)
+        self._refresh_training_status(force=True)
+        self._publish_dpl_snapshot(lifecycle="running")
 
-    def _run_loop(self) -> None:
+    # ── Mobility loop ───────────────────────────────────────────────────────
+
+    def _run_mobility_loop(self) -> None:
         speed_mult = self.args.speed
         sim_accumulator = 0.0
         last_frame_time = time.perf_counter()
@@ -247,15 +328,13 @@ class SimulationRuntime:
             did_step = False
 
             if self._is_paused():
-                self._service_completed_dl()
                 time.sleep(0.02)
             elif speed_mult == 0:
                 budget = 0.1 if self.args.headless else unlimited_sim_budget
                 burst_deadline = time.perf_counter() + budget
                 while not self._stop_event.is_set():
                     did_step = True
-                    if self._advance_simulation_step():
-                        break
+                    self._advance_mobility_step()
                     if time.perf_counter() >= burst_deadline:
                         break
             else:
@@ -264,23 +343,27 @@ class SimulationRuntime:
                 while sim_accumulator >= config.SIM_STEP_LENGTH and not self._stop_event.is_set():
                     sim_accumulator -= config.SIM_STEP_LENGTH
                     did_step = True
-                    if self._advance_simulation_step():
-                        break
-                if not did_step:
-                    self._service_completed_dl()
+                    self._advance_mobility_step()
 
-            self.log_links = self.comm.get_active_links() if self.comm is not None else []
-            self._refresh_training_status(force=False)
-            self._refresh_render_overlays(force=False)
             self._publish_frame(force=did_step)
-            self._maybe_finalize_completed_dl()
 
             if now - last_bar_update >= 0.1:
+                _, frame = self.frame_buffer.latest()
+                training_status = frame.training_status if frame is not None else None
+                link_count = (
+                    len(frame.render_links)
+                    if frame is not None
+                    else len(self.render_links if self.args.dl else self.log_links)
+                )
+                if training_status is None:
+                    _, dpl_snapshot_for_bar = self.dpl_buffer.latest()
+                    if dpl_snapshot_for_bar is not None:
+                        training_status = dpl_snapshot_for_bar.training_status
                 logger.update_progress_bar(
-                    self.training_status,
+                    training_status,
                     self.sim_time,
                     len(self.vehicle_states),
-                    len(self.render_links),
+                    link_count,
                     self.step_count,
                 )
                 last_bar_update = now
@@ -291,36 +374,125 @@ class SimulationRuntime:
                 and self.step_count != self._last_status_step
             ):
                 stats = self.comm.get_stats() if self.comm is not None else {"sent": 0, "delivered": 0}
+                link_count = len(self.render_links) if self.args.dl else len(self.log_links)
                 logger.log(
                     f"Step {self.step_count} | Time: {self.sim_time:.0f}s | "
                     f"Vehicles: {len(self.vehicle_states)} | "
-                    f"Links: {len(self.render_links)} | "
+                    f"Links: {link_count} | "
                     f"Msgs sent: {stats['sent']} delivered: {stats['delivered']}",
                     "result",
                 )
                 self._last_status_step = self.step_count
 
+            _, dpl_snapshot = self.dpl_buffer.latest()
+            dpl_lag_steps = 0
+            dpl_status_age_s = 0.0
+            active_trainers = 0
+            if dpl_snapshot is not None:
+                now_for_age = time.perf_counter()
+                dpl_lag_steps = max(
+                    int(self.step_count)
+                    - int(getattr(dpl_snapshot, "processed_step_count", 0)),
+                    0,
+                )
+                dpl_status_age_s = max(now_for_age - getattr(dpl_snapshot, "wall_time", now_for_age), 0.0)
+                active_trainers = int((getattr(dpl_snapshot, "training_status", None) or {}).get("active_trainers", 0))
             self.perf.set_latest(
                 event_backlog=self.event_stream.depth() if self.event_stream is not None else 0,
-                active_trainers=(self.training_status or {}).get("active_trainers", 0),
+                active_trainers=active_trainers,
+                sim_hz=self.sim_hz,
+                dpl_lag_steps=dpl_lag_steps,
+                dpl_status_age_s=dpl_status_age_s,
             )
             self.perf.maybe_log()
 
             if not did_step and not self._stop_event.is_set():
                 time.sleep(0.001)
 
-    def _advance_simulation_step(self) -> bool:
+    def _advance_mobility_step(self) -> None:
         started = time.perf_counter()
         self.vehicle_states = self.sumo.step(headless=self.args.headless)
         self.sim_time = self.sumo.get_sim_time()
         if not self.args.headless:
             self.comm.update(self.vehicle_states, self.sim_time)
+            self.log_links = self.comm.get_active_links()
+        else:
+            self.log_links = []
         self.step_count += 1
-        dl_done = self._run_dl_step(self.vehicle_states, self.sim_time)
+        now = time.perf_counter()
+        if self._last_sim_step_wall_at > 0.0:
+            interval = max(now - self._last_sim_step_wall_at, 1e-6)
+            inst_hz = 1.0 / interval
+            self.sim_hz = inst_hz if self.sim_hz <= 0.0 else self.sim_hz * 0.85 + inst_hz * 0.15
+        self._last_sim_step_wall_at = now
+        self.mobility_buffer.publish(
+            MobilitySnapshot(
+                vehicle_states=self.vehicle_states,
+                comm_links=self.log_links,
+                sim_time=self.sim_time,
+                step_count=self.step_count,
+                sim_hz=self.sim_hz,
+                wall_time=now,
+            )
+        )
         self.perf.record("sim_step_s", time.perf_counter() - started)
-        return dl_done
 
     # ── DPL ─────────────────────────────────────────────────────────────────
+
+    def _run_dpl_loop(self) -> None:
+        self._publish_dpl_snapshot(lifecycle="initializing")
+        self._initialize_dl_if_needed(defer_initial_round=True)
+        if self._stop_event.is_set() or self.dl_env is None:
+            return
+
+        self._run_initial_dl_training_round()
+        if self.dl_env.is_done():
+            self._finish_dl(
+                self.dl_env.get_stop_reason(),
+                avg_loss=self.dl_env.global_loss,
+                avg_acc=self.dl_env.global_acc,
+                tr_round=self.dl_env.tr_round,
+            )
+
+        last_mobility_version = 0
+        while not self._stop_event.is_set():
+            if self._dl_complete_logged:
+                self._service_completed_dl()
+                if time.perf_counter() - self._last_dpl_snapshot_at >= 0.25:
+                    self._refresh_training_status(force=False)
+                    self._publish_dpl_snapshot(lifecycle="finalizing")
+                self._maybe_finalize_completed_dl()
+                if self._plots_generated:
+                    self.stop()
+                    break
+                time.sleep(0.05)
+                continue
+
+            mobility_version, mobility = self.mobility_buffer.wait_for_newer(
+                last_mobility_version,
+                timeout=0.05,
+            )
+            if mobility_version <= last_mobility_version:
+                if time.perf_counter() - self._last_dpl_snapshot_at >= 0.25:
+                    self._refresh_training_status(force=False)
+                    self._publish_dpl_snapshot(lifecycle="running")
+                continue
+
+            last_mobility_version = mobility_version
+            if mobility is None or not getattr(mobility, "vehicle_states", None):
+                continue
+
+            self._last_dpl_processed_step = int(mobility.step_count)
+            dl_done = self._run_dl_step(mobility.vehicle_states, mobility.sim_time)
+            self._refresh_training_status(force=dl_done)
+            self._refresh_render_overlays(force=dl_done)
+            self._publish_dpl_snapshot(lifecycle="finalizing" if dl_done else "running")
+
+    def _latest_mobility_step_count(self) -> int:
+        _, mobility = self.mobility_buffer.latest()
+        if mobility is None:
+            return int(self.step_count)
+        return int(getattr(mobility, "step_count", self.step_count))
 
     def _run_dl_step(self, current_vehicle_states, current_sim_time) -> bool:
         if self.dl_env is None or not current_vehicle_states:
@@ -567,6 +739,127 @@ class SimulationRuntime:
 
     # ── Frame publishing ────────────────────────────────────────────────────
 
+    def _pending_training_status(self, lifecycle: str) -> dict:
+        return {
+            "enabled": True,
+            "algorithm": self.args.dl_algorithm,
+            "round": 0,
+            "max_vehicle_round": 0,
+            "round_skew": 0,
+            "max_rounds": max(int(getattr(self.args, "rounds", config.MAX_TR_ROUNDS)), 1),
+            "progress": 0.0,
+            "round_time": 0.0,
+            "avg_round_time": 0.0,
+            "estimated_round_time": 0.0,
+            "elapsed_time": 0.0,
+            "remaining_time": 0.0,
+            "rounds_remaining": max(int(getattr(self.args, "rounds", config.MAX_TR_ROUNDS)), 1),
+            "train_loss": 0.0,
+            "train_acc": 0.0,
+            "active_trainers": 0,
+            "done_vehicles": 0,
+            "vehicle_count": int(getattr(self.args, "num_vehicles", 0) or 0),
+            "target_acc": float(getattr(self.args, "target_acc", config.TARGET_ACCURACY)),
+            "done": False,
+            "stop_reason": None,
+            "dpl_lifecycle": lifecycle,
+        }
+
+    def _publish_dpl_snapshot(self, lifecycle: str = "running") -> None:
+        if not self.args.dl:
+            return
+
+        latest_step_count = self._latest_mobility_step_count()
+        processed_step_count = int(self._last_dpl_processed_step)
+        lag_steps = max(latest_step_count - processed_step_count, 0)
+        status = dict(self.training_status or self._pending_training_status(lifecycle))
+        status["dpl_lifecycle"] = lifecycle
+        status["dpl_lag_steps"] = lag_steps
+        status["dpl_status_age_s"] = 0.0
+
+        render_links = None if self.dl_env is None else list(self.render_links or [])
+        vehicle_overlays = None if self.dl_env is None else dict(self.vehicle_overlays or {})
+
+        self.dpl_buffer.publish(
+            DPLSnapshot(
+                training_status=status,
+                render_links=render_links,
+                vehicle_overlays=vehicle_overlays,
+                lifecycle=lifecycle,
+                processed_step_count=processed_step_count,
+                latest_step_count=latest_step_count,
+                simulation_done=self._dl_complete_logged,
+                overlay_text="SIMULATION DONE" if self._dl_complete_logged else None,
+                wall_time=time.perf_counter(),
+            )
+        )
+        self._last_dpl_snapshot_at = time.perf_counter()
+
+    def _current_mobility_snapshot(self) -> MobilitySnapshot:
+        _, mobility = self.mobility_buffer.latest()
+        if mobility is not None:
+            return mobility
+        return MobilitySnapshot(
+            vehicle_states=self.vehicle_states,
+            comm_links=self.log_links,
+            sim_time=self.sim_time,
+            step_count=self.step_count,
+            sim_hz=self.sim_hz,
+            wall_time=time.perf_counter(),
+        )
+
+    def _compose_frame(
+        self,
+        mobility: MobilitySnapshot | None = None,
+        dpl_snapshot: DPLSnapshot | None = None,
+        *,
+        now: float | None = None,
+    ) -> FrameSnapshot:
+        now = time.perf_counter() if now is None else now
+        mobility = mobility or self._current_mobility_snapshot()
+        if dpl_snapshot is None:
+            _, dpl_snapshot = self.dpl_buffer.latest()
+
+        render_links = list(mobility.comm_links or [])
+        training_status = None
+        vehicle_overlays = None
+        simulation_done = False
+        overlay_text = None
+
+        if self.args.dl:
+            if dpl_snapshot is None:
+                training_status = self._pending_training_status("initializing")
+            else:
+                age_s = max(now - dpl_snapshot.wall_time, 0.0)
+                lag_steps = max(
+                    int(mobility.step_count) - int(dpl_snapshot.processed_step_count),
+                    0,
+                )
+                training_status = dict(dpl_snapshot.training_status or {})
+                training_status["dpl_lifecycle"] = dpl_snapshot.lifecycle
+                training_status["dpl_lag_steps"] = lag_steps
+                training_status["dpl_status_age_s"] = age_s
+                if dpl_snapshot.render_links:
+                    render_links.extend(dpl_snapshot.render_links)
+                vehicle_overlays = dpl_snapshot.vehicle_overlays
+                simulation_done = bool(dpl_snapshot.simulation_done)
+                overlay_text = dpl_snapshot.overlay_text
+
+        return FrameSnapshot(
+            vehicle_states=mobility.vehicle_states,
+            render_links=render_links,
+            log_links=list(mobility.comm_links or []),
+            training_status=training_status,
+            vehicle_overlays=vehicle_overlays,
+            sim_time=mobility.sim_time,
+            step_count=mobility.step_count,
+            sim_hz=mobility.sim_hz,
+            source_wall_time=mobility.wall_time,
+            frame_wall_time=now,
+            simulation_done=simulation_done,
+            overlay_text=overlay_text,
+        )
+
     def _publish_frame(self, force: bool) -> None:
         if self.args.headless:
             return
@@ -574,16 +867,6 @@ class SimulationRuntime:
         interval = 1.0 / max(int(getattr(self.args, "ui_fps", config.UI_FPS)), 1)
         if not force and now - self._last_frame_publish_at < interval:
             return
-        frame = FrameSnapshot(
-            vehicle_states=self.vehicle_states,
-            render_links=self.render_links,
-            log_links=self.log_links,
-            training_status=self.training_status,
-            vehicle_overlays=self.vehicle_overlays,
-            sim_time=self.sim_time,
-            step_count=self.step_count,
-            simulation_done=self._dl_complete_logged,
-            overlay_text="SIMULATION DONE" if self._dl_complete_logged else None,
-        )
+        frame = self._compose_frame(now=now)
         self.frame_buffer.publish(frame)
         self._last_frame_publish_at = now

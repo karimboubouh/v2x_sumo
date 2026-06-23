@@ -176,6 +176,9 @@ class StatusWidget(QWidget):
         segs: list[tuple[str, str]] = [("Runtime: ", self._fmt_dur(elapsed))]
 
         if ts and ts.get("enabled"):
+            lifecycle = str(ts.get("dpl_lifecycle", "") or "").replace("_", " ").strip()
+            if lifecycle and lifecycle not in {"running"}:
+                segs.append(("DPL: ", lifecycle.title()))
             algo = ts.get("algorithm")
             if algo:
                 segs.append(("Algo: ", str(algo)))
@@ -190,6 +193,9 @@ class StatusWidget(QWidget):
                 segs.append(("Target: ", f"{tgt:.2%}"))
             if "PPO" in str(algo or ""):
                 segs.append(("Reward: ", f"{ts.get('avg_reward', 0.0):+.3f}"))
+            lag_steps = int(ts.get("dpl_lag_steps", 0) or 0)
+            if lag_steps > 0:
+                segs.append(("DPL lag: ", f"{lag_steps} steps"))
         else:
             segs.append(("DPL: ", "disabled"))
 

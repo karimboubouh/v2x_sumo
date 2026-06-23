@@ -1,4 +1,4 @@
-"""Thread-safe runtime state shared between simulation and dashboard."""
+"""Thread-safe runtime state shared between simulation, DPL, and dashboard."""
 
 from __future__ import annotations
 
@@ -13,6 +13,37 @@ import logger
 
 
 @dataclass(slots=True)
+class MobilitySnapshot:
+    """Latest true SUMO mobility state.
+
+    This state is authoritative for communication/DPL and is never visually
+    extrapolated in-place.
+    """
+
+    vehicle_states: dict = field(default_factory=dict)
+    comm_links: list = field(default_factory=list)
+    sim_time: float = 0.0
+    step_count: int = 0
+    sim_hz: float = 0.0
+    wall_time: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(slots=True)
+class DPLSnapshot:
+    """Latest DPL state cached for dashboard composition."""
+
+    training_status: dict | None = None
+    render_links: list | None = None
+    vehicle_overlays: dict | None = None
+    lifecycle: str = "disabled"
+    processed_step_count: int = 0
+    latest_step_count: int = 0
+    simulation_done: bool = False
+    overlay_text: str | None = None
+    wall_time: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(slots=True)
 class FrameSnapshot:
     vehicle_states: dict = field(default_factory=dict)
     render_links: list = field(default_factory=list)
@@ -21,27 +52,50 @@ class FrameSnapshot:
     vehicle_overlays: dict | None = None
     sim_time: float = 0.0
     step_count: int = 0
+    sim_hz: float = 0.0
+    source_wall_time: float = field(default_factory=time.perf_counter)
+    frame_wall_time: float = field(default_factory=time.perf_counter)
     simulation_done: bool = False
     overlay_text: str | None = None
 
 
-class LatestFrameBuffer:
-    """Single-slot frame buffer: new frames overwrite stale UI frames."""
+class LatestStateBuffer:
+    """Single-slot state buffer: new snapshots overwrite stale snapshots."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._condition = threading.Condition(threading.Lock())
         self._version = 0
-        self._frame: FrameSnapshot | None = None
+        self._value = None
 
-    def publish(self, frame: FrameSnapshot) -> int:
-        with self._lock:
+    def publish(self, value) -> int:
+        with self._condition:
             self._version += 1
-            self._frame = frame
+            self._value = value
+            self._condition.notify_all()
             return self._version
 
-    def latest(self) -> tuple[int, FrameSnapshot | None]:
-        with self._lock:
-            return self._version, self._frame
+    def latest(self) -> tuple[int, object | None]:
+        with self._condition:
+            return self._version, self._value
+
+    def wait_for_newer(self, version: int, timeout: float | None = None) -> tuple[int, object | None]:
+        """Wait until a newer value is available, then return the latest one."""
+        with self._condition:
+            if self._version <= version:
+                self._condition.wait(timeout=timeout)
+            return self._version, self._value
+
+
+class LatestFrameBuffer(LatestStateBuffer):
+    """Single-slot frame buffer for UI snapshots."""
+
+
+class LatestMobilityBuffer(LatestStateBuffer):
+    """Single-slot mobility buffer for DPL consumption."""
+
+
+class LatestDPLBuffer(LatestStateBuffer):
+    """Single-slot DPL buffer for dashboard composition."""
 
 
 class PerfStats:
@@ -119,12 +173,15 @@ class PerfStats:
 
         parts = [
             f"ui_fps={ui_fps:.1f}",
+            f"sim_hz={float(latest.get('sim_hz', 0.0) or 0.0):.1f}",
             f"frame_p50={frame_p50:.1f}ms",
             f"frame_p95={frame_p95:.1f}ms",
             f"sim_step={avg_ms('sim_step_s'):.1f}ms",
             f"dl_step={avg_ms('dl_step_s'):.1f}ms",
             f"snapshot={avg_ms('snapshot_s'):.1f}ms",
             f"render={avg_ms('render_s'):.1f}ms",
+            f"dpl_lag_steps={int(latest.get('dpl_lag_steps', 0) or 0)}",
+            f"dpl_status_age={float(latest.get('dpl_status_age_s', 0.0) or 0.0):.1f}s",
             f"event_backlog={int(latest.get('event_backlog', 0) or 0)}",
             f"active_trainers={int(latest.get('active_trainers', 0) or 0)}",
         ]

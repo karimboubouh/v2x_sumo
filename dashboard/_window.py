@@ -197,6 +197,9 @@ class MainWindow(QMainWindow):
         training_status: dict | None = None,
         vehicle_overlays: dict | None = None,
         log_links: list | None = None,
+        ui_fps: float | None = None,
+        sim_hz: float | None = None,
+        source_wall_time: float | None = None,
     ) -> None:
         # Dismiss loading overlay on first real data
         if vehicle_states and self._overlay.isVisible():
@@ -207,6 +210,9 @@ class MainWindow(QMainWindow):
             active_links or [],
             sim_time,
             vehicle_overlays or {},
+            ui_fps=ui_fps,
+            sim_hz=sim_hz,
+            source_wall_time=source_wall_time,
         )
         if new_messages:
             self._log_widget.add_messages(

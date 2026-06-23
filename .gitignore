@@ -173,6 +173,7 @@ v2x_sim/
 # Root-level Markdown notes/reports; keep the main project README tracked.
 /*.md
 !/README.md
+steps.md
 
 # Generated manuscript and presentation artifacts
 paper/

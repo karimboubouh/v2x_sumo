@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from copy import copy
 
 from PySide6.QtCore import Qt, QRect, QRectF, QPointF, QTimer
 from PySide6.QtGui import (
@@ -351,7 +352,8 @@ class MapWidget(QGraphicsView):
         self._sim_time: float = 0.0
         self._vehicle_count: int = 0
         self._avg_speed: float = 0.0
-        self._fps: float = 0.0
+        self._ui_fps: float = 0.0
+        self._sim_hz: float = 0.0
         self._last_frame_sample: float | None = None
         self._paused: bool = False
         self._overlay_text: str | None = None
@@ -418,31 +420,64 @@ class MapWidget(QGraphicsView):
         active_links: list,
         sim_time: float,
         vehicle_overlays: dict,
+        ui_fps: float | None = None,
+        sim_hz: float | None = None,
+        source_wall_time: float | None = None,
     ) -> None:
         zoom_level = self._zoom_level()
         now = time.perf_counter()
-        if self._last_frame_sample is not None:
+        if ui_fps is not None and ui_fps > 0.0:
+            self._ui_fps = float(ui_fps)
+        elif self._last_frame_sample is not None:
             dt = max(now - self._last_frame_sample, 1e-6)
             inst_fps = 1.0 / dt
-            if self._fps <= 0.0:
-                self._fps = inst_fps
+            if self._ui_fps <= 0.0:
+                self._ui_fps = inst_fps
             else:
-                self._fps = self._fps * 0.85 + inst_fps * 0.15
+                self._ui_fps = self._ui_fps * 0.85 + inst_fps * 0.15
         self._last_frame_sample = now
+        if sim_hz is not None:
+            self._sim_hz = max(float(sim_hz), 0.0)
 
-        self._vehicle_states = vehicle_states
+        display_states = self._extrapolated_vehicle_states(vehicle_states, source_wall_time, now)
+        self._vehicle_states = display_states
         self._active_links   = active_links
         self._sim_time       = sim_time
-        if vehicle_states:
-            self._vehicle_count = len(vehicle_states)
-            speeds = [v.speed * 3.6 for v in vehicle_states.values()]
+        if display_states:
+            self._vehicle_count = len(display_states)
+            speeds = [v.speed * 3.6 for v in display_states.values()]
             self._avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
         else:
             self._vehicle_count = 0
             self._avg_speed = 0.0
-        self._vehicles.update_data(vehicle_states, vehicle_overlays, zoom_level)
-        self._links.update_data(active_links, vehicle_states, zoom_level)
+        self._vehicles.update_data(display_states, vehicle_overlays, zoom_level)
+        self._links.update_data(active_links, display_states, zoom_level)
         self.viewport().update(self._hud_viewport_rect())
+
+    def _extrapolated_vehicle_states(
+        self,
+        vehicle_states: dict,
+        source_wall_time: float | None,
+        now: float,
+    ) -> dict:
+        if not vehicle_states or source_wall_time is None or self._paused:
+            return vehicle_states
+        dt = min(max(now - float(source_wall_time), 0.0), float(config.SIM_STEP_LENGTH))
+        if dt <= 1e-6:
+            return vehicle_states
+
+        display_states = {}
+        for vid, state in vehicle_states.items():
+            speed = max(float(getattr(state, "speed", 0.0) or 0.0), 0.0)
+            if speed <= 0.0:
+                display_states[vid] = state
+                continue
+            angle_rad = math.radians(float(getattr(state, "angle", 0.0) or 0.0))
+            rendered = copy(state)
+            rendered.x = float(state.x) + math.sin(angle_rad) * speed * dt
+            rendered.y = float(state.y) + math.cos(angle_rad) * speed * dt
+            display_states[vid] = rendered
+        return display_states
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
@@ -496,7 +531,7 @@ class MapWidget(QGraphicsView):
         self.viewport().update()
 
     def _hud_viewport_rect(self) -> QRect:
-        return QRect(0, 0, int(320 * self._dpi), int(150 * self._dpi))
+        return QRect(0, 0, int(340 * self._dpi), int(170 * self._dpi))
 
     # ── Zoom level helper ─────────────────────────────────────────────────────
 
@@ -614,7 +649,8 @@ class MapWidget(QGraphicsView):
             ("Time",       f"{self._sim_time:.0f} s"),
             ("Vehicles",   f"{self._vehicle_count}"),
             ("Avg speed",  f"{self._avg_speed:.0f} km/h"),
-            ("FPS",        f"{self._fps:.0f}" if self._fps > 0.0 else "—"),
+            ("UI FPS",     f"{self._ui_fps:.0f}" if self._ui_fps > 0.0 else "—"),
+            ("Sim Hz",     f"{self._sim_hz:.1f}" if self._sim_hz > 0.0 else "—"),
             ("Zoom",       f"{self._zoom_level():.1f}×"),
         ]
 
